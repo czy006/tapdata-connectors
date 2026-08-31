@@ -1,242 +1,263 @@
-# Implementation Plan：Paimon Connector 微批提交与多表 at-least-once
+# Implementation Plan：Paimon Spill 与异步资源生命周期根治（Spec V5）
 
 ## 1. 计划状态
 
-- 阶段：Spec-driven Development Phase 2（Plan）。
-- 状态：Draft，待用户审阅批准后进入 Phase 3/4；本计划不授权修改生产代码。
-- 事实源：[Paimon Connector 微批提交与多表 at-least-once Spec](../connectors/paimon-connector/docs/paimon-micro-batch-commit-at-least-once-spec.md)。
-- 当前 Connector 基线：`ddb1e7d7bb3c94468447fcfca9d0fb283062703c`。
-- 历史 Feature 基线：`821ff7e33633a54e6abb5f0919d505d42e1098a5`。
-- 锁定引擎基线：`f91bfe4a66ea99362440ca87c36b4c1883ca4cd9`。
-- 允许范围：`connectors/paimon-connector/` 及本次计划/验证文档。
-- 禁止范围：Tapdata 引擎、PDK/common-lib、Apache Paimon、其他 Connector、公共 PDK API及依赖版本。
+- 阶段：Spec-driven Development Phase 2；当前仅修订 Spec 与实施计划，不授权修改生产代码。
+- 事实源：`connectors/paimon-plus-connector/src/doc/paimon-spill-compaction-lifecycle-root-fix-spec.md`（DRAFT v5）。
+- Connector 基线：当前 `develop`；Paimon 基线：`1.3.2` / upstream commit `c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`；Hadoop 基线：`3.3.6`。
+- 现有工作区：保留用户已有 `pom.xml`、`.run/` 和 Connector 文档变更，不覆盖、不清理。
+- 执行约束：严格按 `tasks/todo.md` 的依赖实施；每项最多修改 5 个文件，RED/GREEN 与证据未完成时不得越过门禁。
 
 ## 2. 目标与完成定义
 
-在不改变 Tapdata 引擎的前提下，以方案 B 恢复 Paimon Connector 的 CDC 微批：同表跨 `writeRecords` 累计，默认按 `100000` 条或 `30000ms` 提交；无后续写入时由后台线程按表级 deadline 提交；DDL 前 drain 目标表，停止时 drain 全表；多表、多 sourceLane 的数据 snapshot 必须先于覆盖它的 offset callback。
+根治同一故障族：父操作在 lazy/static child、compaction、maintenance、reader、spill 文件或 Hadoop raw FileSystem 仍可能运行/被借用时提前返回，上层随后关闭 IO 或删除目录，形成 use-after-close / delete-before-use。
 
-实现完成必须同时满足：
+完成必须同时满足：
 
-1. 小 batch 不再每次创建 Paimon snapshot；数量、调用内时间和后台时间三种触发均有测试。
-2. Paimon commit 成功前不推进覆盖其数据的 CDC offset；跨表调用顺序不影响结果。
-3. 复用当前 `PaimonTableWriteContext` 的 stable commit user、pending messages、identifier 和 state store，不恢复旧 writer/committer。
-4. initial 不参与 CDC 阈值，但其 writer buffer 对 DDL/stop drain 可见。
-5. scheduler、写入、DDL、callback、stop 的并发与失败均遵循 Spec 的生命周期、锁序和粘滞故障合同。
-6. 纯 INITIAL_SYNC 按 `DEC-02` 验收：完成前重启允许更早/最坏从头重放和 append-only 重复，但逐事件证明不丢数据。
-7. 非微批行为通过既有定向测试和 function-context diff 证明没有改变。
+1. Paimon lazy并发API返回显式`AutoCloseable` structured iterator/operation；read scope是唯一owner，所有success/failure/early-stop/interrupt路径执行`closeAndDrain()`。
+2. `FAILED_DRAINED`只证明runnable已退出，不代表业务成功；仅maintenance SUCCESS且无`maintainError`、writer/committer均成功时允许关闭IO/spill/lease。
+3. active termination wait与terminal retained严格分离；前者继续同一operation join，后者不在同进程重试未知部分close。
+4. Factory、STOP、DDL、read和write使用同一proof/lease模型，无逆序close旁路、自等待或伪造proof。
+5. Hadoop owned mode在Catalog创建/首次probe前启用；probe无遗失handle，first access single-flight，close/create线性化，禁止production反射与broad cache close。
+6. patched Maven制品形成可解析的effective-POM闭包，不混装upstream/patched API/Common/Core。
+7. deterministic real-spill、五种BucketMode、read/DDL/STOP并发、安全删除、性能与发布证据全部通过。
 
-## 3. 当前代码事实与改动落点
+## 3. 源码证据基线
 
-| 现状 | 源码锚点 | 计划落点 |
-| --- | --- | --- |
-| `ASYNC_OFFSET_CONTRACT_VERIFIED=false` 关闭 scheduler，并使 CDC 每次提交 | `PaimonService.java:82-87,272-320,1276-1285` | 在安全状态机、提交 helper 和 callback 接线完成后删除固定旁路；不得直接改为 `true`。 |
-| 当前按表 context、表锁、pending commit 和 sticky failure 已存在 | `PaimonService.java:108-165,1191-1208,1339-1377`；`PaimonTableWriteContext.java:185-247` | 保留并复用；新增协调状态不拥有 Paimon writer/committer。 |
-| DDL drain 只检查 CDC 共用 count，count 为零直接跳过 | `PaimonService.java:986-1015,2329-2363` | 分离全阶段 `bufferedRecordCount` 与 CDC `accumulatedRecordCount`。 |
-| `close()` 先 `flushAll()` 再关闭 context，但没有统一 ingress/scheduler/callback 线性化 | `PaimonService.java:3288-3325` | 新生命周期 gate；有序 shutdown、全局 drain、异常聚合和幂等 close。 |
-| callback setter 丢弃 callback，`processControl` 是 no-op；旧 `firstOffsetByTable`、`committedOffsetTables`、`offsetCallbackLock`、getter、写入收集分支、提交调用点和 `commitCallback` 仍完整存在但不可达 | `PaimonService.java:140-153,210-214,1116-1147,1179-1208,1227-1248,1261-1318,1339-1369,2329-2363,3327-3382`；`PaimonConnector.java:484-488` | 完整删除旧表序 callback 机器及调用点；以 Heartbeat generation 屏障替代。不得只恢复 setter 赋值。 |
-| `spec.json` 没有 `flush_offset_callback`；`PaimonConfig.java` 注释和三种 JSON placeholder 仍写 `10000` | `PaimonConfig.java:87-97`；`spec.json:11-20,491-542,694-697,751-754,808-811` | 激活切片中恢复且只恢复一个 capability；Java 注释和三种配置文案统一为 `100000`。 |
+| 事实 | Paimon/Hadoop 位置 | 对 Plan 的约束 |
+|---|---|---|
+| lazy helper返回普通Iterator/Iterable | `paimon-api/.../ThreadPoolUtils.java:78-168` | 必须增加显式structured handle并审计全部consumer |
+| manifest scan使用lazy helper | `paimon-core/.../operation/AbstractFileStoreScan.java:335-409` | read scope必须拥有handle并`closeAndDrain()` |
+| deletion自有`allOf().get()` | `paimon-core/.../operation/FileDeletionBase.java:456-470` | 普通failure已等all-of；修interrupt与multi-error aggregation |
+| maintenance先close commit、再`shutdownNow` | `paimon-core/.../table/sink/TableCommitImpl.java:348-411` | 改为graceful lifecycle outcome；`maintainError`非空即retained |
+| bootstrap必经`ParallelExecution` | `paimon-core/.../crosspartition/IndexBootstrap.java:72-125` | 生产调用count=0；使用version-locked sequential adapter |
+| async ORC reader使用static pool | `paimon-core/.../io/KeyValueFileReaderFactory.java:98-104,268-279`、`.../utils/AsyncRecordReader.java:37-110` | false时本次factory不构造AsyncRecordReader、不提交Future |
+| access probe创建后丢失实例 | `paimon-common/.../fs/FileIO.java:609-619` | 复用validated FileIO或exact rollback，失败fail-fast |
+| HadoopFileIO `get/create/put`非原子 | `paimon-common/.../fs/hadoop/HadoopFileIO.java:178-201` | `OwnedFileSystemEntry` single-flight与close/create状态机 |
+| `newInstance`仍用unique cache key | Hadoop `FileSystem.java:585-611,3666-3743` | 不遍历cache；exact close只处理自己的unique entry |
+| Core POM对多模块使用`${project.version}` | 本地`paimon-core-1.3.2.pom:38-112` | 归档effective POM并显式闭合unforked ecosystem版本 |
 
-## 4. 架构决策
+## 4. 硬门禁
 
-### 4.1 `PaimonMicroBatchCoordinator`
+| 门禁 | 通过条件 | 阻断范围 |
+|---|---|---|
+| G0：DDL产品决策 | 人工裁决Spec Q4：cumulative action-admission deadline及数值，或completion-driven | 仅阻断DDL Task 31及其下游；不阻断Paimon和Connector基础设施 |
+| G1a：Paimon源码基线 | 可写fork、固定commit、模块与source JAR一致、RED fixture可复现 | 阻断Paimon补丁实施；不依赖G0 |
+| G1b：Paimon制品闭包 | patched API/Common/Core、sources、effective POM、dependency tree、SHA-256与capability marker全部可追溯 | 阻断Connector依赖切换和集成 |
+| G2：安全中间态 | 不存在旧Connector搭配语义改变但无gate的新内核，或新Connector搭配未修复内核 | 阻断合并、部署与回滚候选 |
+| G3：生命周期证明 | 只有完整success barrier释放IO；WAITING和terminal retained均保持强引用并阻断global cleanup | 阻断STOP/DDL/global cleanup完成 |
+| G4：测试真实执行 | 精确Surefire XML中关键测试`tests > 0`，全模块无filter测试通过 | 阻断发布 |
 
-新增 package-private `PaimonMicroBatchCoordinator`，只维护纯协调状态，不访问 Catalog、writer 或 committer：
+## 5. 不可回退的语义
 
-- 表状态：`bufferedRecordCount`、CDC `accumulatedRecordCount`、时间基准、accepted/committed/pending generation、sourceLane 依赖和 CDC eligibility。
-- lane 状态：不可变 Heartbeat payload、`pending`、`inFlight`、version/token 和 `consumerStarted`。
-- 决策输出：当前 batch 是否因 size/time 提交、表级最近 deadline、哪些 lane 已 ready、callback reservation/complete/fail。
-- DDL 后表 generation 和锁身份保持到 Service close；只清 writer 派生状态与 deadline。
+### 5.1 Structured iterator/operation
 
-### 4.2 `PaimonAsyncCommitScheduler`
+- API返回`Iterator<T> + AutoCloseable`语义的显式handle，并提供幂等`closeAndDrain()`；handle持有本invocation全部tickets。
+- ticket只能由child wrapper `finally`完成；Future done/cancelled不是termination proof。
+- read scope在handle逃逸前登记，按“停止消费 → closeAndDrain → batch release → reader close”释放；消费0/1条同样执行。
+- 无法暴露handle的调用边界必须eager drain；禁止回退普通lazy iterator。
 
-新增 package-private `PaimonAsyncCommitScheduler`：
-
-- worker 被激活后，生产路径使用且只使用一个 daemon `ScheduledExecutorService`。
-- Service 初始化只建立无工作线程的 adapter；首次出现 scheduler-eligible 的未提交 CDC 状态后才幂等、惰性创建唯一 worker。首批 CDC 已在调用内提交且无 pending、纯 initial、连接测试、元数据操作和源端读取均不创建 worker。
-- 只安排最近表级 deadline 的 one-shot task；状态变化后重算，不使用旧版全局固定相位 `scheduleAtFixedRate`。
-- 到期 task 取得当时全部到期表的稳定快照并逐表调用 Service 提供的 flush action，不直接修改 generation。
-- 暴露 package-private clock/executor 注入点，测试使用 fake clock 和可控 executor，不使用真实 `sleep(30000)`。
-
-### 4.3 `PaimonServiceLifecycle`
-
-新增 package-private `PaimonServiceLifecycle`，实现 `NEW -> RUNNING -> STOPPING/FAILED -> CLOSED`：
-
-- 所有写入性入口和 scheduler task 使用同一 ingress token 登记/注销。
-- callback reservation 与 Consumer-start 分离；Consumer-start 与 `STOPPING` 切换共用一个线性化 gate。
-- close 等待已开始 ingress/callback，不持有表锁、coordinator 锁或 callback 执行锁。
-- 中断时完成清理、恢复 interrupt 标记并抛聚合异常；重复 close 不重复 I/O。
-- `PaimonService` 构造完成 coordinator/lifecycle/scheduler adapter 内部状态后保持 `NEW`；`PaimonConnector.onStart` 先注入可用 callback，再调用 `init()`。配置校验、Catalog 创建和 adapter 初始化全部成功后才原子发布 `RUNNING`；任一步失败都保存首因、best-effort 清理并以 suppressed 聚合后进入 `CLOSED`。callback 在 `RUNNING/STOPPING/FAILED` 不可替换或清空，仅在终止清理且不会再发生 Consumer-start 时释放强引用。该边界保留 package-private 测试注入方式，不要求无关测试启动真实 Catalog。
-
-### 4.4 `PaimonService` 仍是唯一 Paimon I/O 编排者
-
-`PaimonService` 增加一个统一的表锁内提交 helper，所有触发原因共用：
-
-- `SIZE`、`CALL_TIME`、`SCHEDULER`、`INITIAL`、`DDL`、`STOP`、`PENDING_RETRY`。
-- helper 先确认旧 pending，再决定是否写/prepare/commit；成功后一次性发布 coordinator 状态。
-- 结果不明时最多追加 3 次同 pending 确认，保留 1000ms 生产间隔；不重写已进入 writer 的 source batch。
-- `retryPendingCommit()` 的空 pending 返回保持现有幂等 no-op；它不构成本轮 commit 成功证据，不得发布 generation、清计数、更新时间或 callback。
-- callback 始终在表锁和 coordinator 锁外执行，并由 Service 级 callback 执行锁串行化。
-
-### 4.5 方案 B 的激活顺序
-
-静态 capability 是最后激活的生产切片。此前可以加入并测试内部协调类与 Service 的 callback 模式，但 `PaimonConnector` 不注入 callback，当前生产路径继续同步提交。只有表状态、pending、scheduler、DDL/initial 和 stop/close 接线全部完成后，才同时：
-
-1. 删除中间阶段的 null-callback 同步降级，并确认固定 false 旁路，以及旧 `firstOffsetByTable`、`committedOffsetTables`、`offsetCallbackLock`、getter、`commitCallback` 与全部调用点均已清除；
-2. 在 `PaimonConnector.onStart` 注入 callback，并在 `processControl` 转发 Heartbeat；
-3. 在 `spec.json` 恢复唯一 `flush_offset_callback` capability；
-4. 按 Spec 对目标 CDC 做 preflight fail-fast。
-
-这不是最终动态开关；最终产物只有方案 B 的静态 capability 合同。
-
-## 5. 依赖图与实施顺序
+### 5.2 状态与释放判定
 
 ```text
-已批准 Spec
-    |
-    +--> T1 配置默认值/文案
-    |
-    +--> T2 表与 offset 纯状态协调器 --> T3 deadline scheduler 基础
-    |
-    +--> T4 生命周期 gate
+ACTIVE WAITING / CLOSE_DEFERRED_TERMINATION
+  = 未证明终止；同一个 operation 继续 join；不发布 CLOSED
 
-T1 + T2 + T3 + T4 --> T5 CDC 写入与统一 commit helper
-T5 --> T6 initial / pending / DDL drain
-T3 + T5 + T6 --> T7 scheduler 接入
-T4 + T6 + T7 --> T8 stop/close 协作
-T2 + T5 + T6 + T7 + T8 --> T9 capability + Connector callback 激活
+SUCCESS
+  = parent + child runnable 已退出，maintainError == null
 
-T6 + T7 + T8 + T9
-    |
-    +--> T10 两表/两 lane 跨层集成与非回归
-            |
-            +--> T11 锁定引擎纯 INITIAL_SYNC/INITIAL_SYNC_CDC 运行时验收
-                    |
-                    +--> T12 全量回归、diff 审计和验证报告
+FAILED_DRAINED
+  = parent + child runnable 已退出，但存在业务失败
+  = dependency retained；最多继续独立且 exactly-once 的 committer close；禁止 IO/spill/lease release
+
+DEPENDENCY_CLOSE_FAILED_RETAINED / IO_CLOSE_FAILED_RETAINED
+  = terminal；保留 strong handle + sticky failure；同进程不重试未知部分 close
 ```
 
-## 6. 分阶段计划与 Checkpoint
+合法释放条件是：`compaction TERMINATED && writer close success && maintenance SUCCESS && maintainError == null && committer close success`。`FAILED_DRAINED`不得出现在允许IO close的判定中。
 
-### Phase A：无行为激活的基础组件
+### 5.3 Factory与写路径
 
-- T1：规范化三个配置默认值，并修正 Java 注释和三种 JSON 文案。
-- T2：实现表状态、generation 和 lane offset 屏障的纯状态协调器；只产出 callback reservation/token 决策，不执行 Consumer。
-- T3：在 T2 deadline 合同固定后，实现惰性启动、最近 deadline 的可控 scheduler；T3 完成后才能把 adapter 接入 Service 初始化。
-- T4：实现 Service 生命周期与 callback Consumer-start gate。
+- proof reason仅`STOP | DDL | FACTORY_ROLLBACK`；fatal write只设置sticky fence与`failureOrigin=WRITE_PATH`，不能启动或冒充STOP teardown。
+- Factory fixed safety order：proof → compaction TERMINATED → writer → maintenance closeAndDrain → committer → IO → spill unregister → lease release。
+- GlobalIndex创建后立即staged-own；只有`endBoostrap`成功才transfer，外部注入对象是`IOManager`且不得被assigner close。
+- Context/generation持有一个全生命周期WRITER physical lease；每次write/commit只获取operation admission并在表锁后revalidate，不重复申请physical lease。
 
-Checkpoint A：新增基础组件的定向测试通过；Connector 仍未声明 capability，当前生产 offset 行为未改变。
+### 5.4 DDL
 
-### Phase B：Service 微批纵向切片
+- 有Context时继续持有其WRITER lease；无Context时申请DDL_ONLY。DDL等待其他foreground/read borrower，绝不等待自己持有的lease。
+- 先fence目标表read，再request/join child；deadline先于action时保持active deferred，只允许内部STOP join，restart后用户显式重试。
+- 成功或失败都保持当前finally cache/guard cleanup语义；action failure原子转移WRITER/DDL_ONLY到`RetainedDdlActionLease`，callback count=0。
 
-- T5：接入 CDC 跨调用累计、size/call-time 判断和统一 commit helper。
-- T6：统一 pending 确认，固定空 pending no-op 的防误发布约束，并接入 initial、DDL 与全阶段 buffer drain。
-- T7：把 coordinator eligibility/deadline 变化通知接到 scheduler worker，接入后台 deadline 提交和异步 sticky failure。
-- T8：接入 STOPPING、全表 drain、callback-suppressed/global drain、幂等 close 与中断语义。
+### 5.5 Hadoop owned FileSystem
 
-Checkpoint B：Service 的 callback 模式定向测试证明阈值、pending、scheduler、initial/DDL 和 close 合同；Connector 仍未声明 capability，生产路径尚未激活。
+- owner mode进入CatalogContext/options并早于`CatalogFactory.createCatalog`和`FileIO.checkAccess`。
+- access check复用同一validated FileIO；无法复用时exact rollback provisional，rollback失败fail-fast。
+- `OwnedFileSystemEntry`分离operational wrapper与exact raw owner，状态`OPEN -> CLOSING -> CLOSED_SUCCESS | CLOSE_FAILED_RETAINED`。
+- create在锁外，reservation/publish/close在线性化短锁；close join in-flight creator，losing/late raw exact-close。
+- HDFS/S3A验证raw identity；`file://`验证LocalFileIO/stream隔离；native`s3://`不由S3A证明代替。
+- production cleanup/capability禁止反射；只读诊断反射不得unwrap/close/clear或通过gate。
 
-### Phase C：方案 B 激活和跨层正确性
+### 5.6 Spill安全
 
-- T9：一次性激活方案 B capability、callback 注入和 Heartbeat 转发。
-- T10：完成两表/两 sourceLane 跨 Service、真实 Paimon commit、scheduler、Connector Heartbeat 的集成测试，并运行非目标回归。
+- manager必须是stable real approved root的direct child，basename严格`paimon-io-<UUID>`。
+- root/manager/marker/traversal全部NOFOLLOW，删除前revalidate parent、basename、fileKey；identity缺失即fail-closed。
+- 优先`SecureDirectoryStream` descriptor-relative deletion；平台无等价能力时自动递归cleanup fail-closed。
 
-Checkpoint C：所有并发测试由 latch/barrier 固定交错；任一失败都保留首因、停止后续 callback 且不吞 close 错误。
+## 6. 架构与依赖图
 
-### Phase D：锁定引擎验收与收尾
+```mermaid
+flowchart TD
+    T0[0 Baseline] --> T2[2 Structured API]
+    T0 --> T4[4 FileDeletion drain]
+    T0 --> T6[6 Async reader option]
+    T0 --> T7[7 GlobalIndex cleanup]
+    T0 --> T8[8 Secured wrapper non-owning]
+    T2 --> T3A[3A Manifest lazy consumers]
+    T3A --> T3B[3B Remaining lazy consumers]
+    T2 --> T5[5 Maintenance lifecycle]
+    T3B --> T5
+    T8 --> T9[9 FileIO access probe]
+    T8 --> T10[10 Hadoop owned entry]
+    T9 --> T10
+    T2 --> T11[11 Capability ABI]
+    T5 --> T11
+    T6 --> T11
+    T7 --> T11
+    T10 --> T11
+    T11 --> T12[12 Maven closure]
+    T12 --> T13[13 Publish artifacts / G1b]
+    T4 --> T13
 
-- T11：在不修改引擎的环境中执行方案 B 的纯 INITIAL_SYNC 和 INITIAL_SYNC_CDC 重启矩阵。
-- T12：执行模块全量测试、function-context diff、配置/文档核验并生成最终验证报告。
-
-Checkpoint D：Spec 第 18 节 15 项验收全部有证据；外部运行环境缺失或私有依赖未解析时，任务保持未完成，不得把 blocker 表述为通过。
-
-## 7. 并行与串行边界
-
-- 可并行：T1、T2、T4；三者不修改同一生产文件。T3 依赖 T2 已固定的 deadline 查询合同，因此在 T2 后执行。
-- 必须串行：T5～T9 都会接触 `PaimonService.java` 或共享状态合同，按依赖顺序执行。
-- 可并行准备但不得提前判定通过：T10 的测试数据/fixture 与 T8/T9；实际运行必须等待生产接线完成。
-- 必须最后执行：T11 锁定引擎验收和 T12 全量回归。
-
-## 8. 代码风格与实现约束
-
-- Java 8；不引入新依赖，不修改公共 PDK API。
-- 新协调类和测试使用 4 空格；修改 `PaimonService` 时保持现有文件的 tab 风格，禁止整文件格式化。
-- 共享状态转换必须由同一锁或明确的 atomic/volatile 保护；不得用 `ConcurrentHashMap` 替代跨字段原子性。
-- 同表 I/O 保持以下现有锁形态，外部 callback 必须在锁外：
-
-```java
-Object lock = commitLocks.computeIfAbsent(tableKey, ignored -> new Object());
-synchronized (lock) {
-    // validate -> retry pending -> write -> publish state -> decide -> commit
-}
-// callback runs after releasing the table/coordinator locks
+    T13 --> T14[14 Connector dependency gate]
+    T14 --> T15[15 Coordinator admission]
+    T14 --> T16[16 Lease/proof state]
+    T14 --> T17[17 Spill path capability]
+    T15 --> T17
+    T16 --> T17
+    T14 --> T18[18 Compaction runtime]
+    T14 --> T20[20 Runtime table]
+    T14 --> T30[30 Read scope core]
+    T18 --> T19[19 Prepared writer]
+    T2 --> T21[21 Sequential bootstrap]
+    T3B --> T21
+    T6 --> T21
+    T20 --> T21
+    T7 --> T22[22 HASH preflight / staged index]
+    T17 --> T22
+    T20 --> T22
+    T21 --> T22
+    T5 --> T23[23 Maintenance adapter]
+    T16 --> T24[24 Write lifecycle]
+    T18 --> T24
+    T19 --> T24
+    T23 --> T24
+    T17 --> T25[25 Factory rollback]
+    T20 --> T25
+    T22 --> T25
+    T24 --> T25
+    T25 --> T26[26 Context activation]
+    T26 --> T27[27 Real spill test]
+    T15 --> T28[28 Service coordinator adoption]
+    T16 --> T28
+    T26 --> T28
+    T24 --> T29[29 STOP/write-failure]
+    T28 --> T29
+    T2 --> T30
+    T3B --> T30
+    T15 --> T30
+    T16 --> T30
+    G0{{G0 Q4}} --> T31[31 DDL orchestration]
+    T16 --> T31
+    T29 --> T31
+    T30 --> T31
+    T20 --> T32[32 Read integration]
+    T21 --> T32
+    T28 --> T32
+    T30 --> T32
+    T31 --> T32
+    T15 --> T33[33 Global barrier]
+    T16 --> T33
+    T29 --> T33
+    T30 --> T33
+    T32 --> T33
+    T9 --> T34[34 Hadoop integration]
+    T10 --> T34
+    T14 --> T34
+    T33 --> T34
+    T22 --> T35[35 Bucket/E2E]
+    T27 --> T35
+    T31 --> T35
+    T32 --> T35
+    T34 --> T35
+    T35 --> T36[36 Test execution gate]
+    T36 --> T37[37 Performance/deployment]
+    T37 --> T38[38 Release evidence]
 ```
 
-- 不修改 `PaimonTableWriteContext`、`PaimonCommitStateStore` 的语义或持久化格式；若现有接口无法满足计划，停止实现并先修订 Spec/Plan。
-- 不在 batch/stream read、schema discovery、Catalog options/storage/CatalogFactory、writer/router、bucket strategy 或非微批 capability 方法中产生行为改动；`PaimonService.init()` 只允许生命周期成功发布、scheduler adapter 初始化和初始化失败清理 hunk。
+## 7. 实施阶段与 Checkpoint
 
-## 9. 验证命令
+### Phase A：Paimon结构化并发生命周期（Task 0、2–7）
 
-每个任务执行其定向测试；每个 Checkpoint 至少执行：
+- 输出：structured API、全lazy consumer审计、FileDeletion interrupt/multi-error、maintenance outcome、async-reader显式disable、GlobalIndex自有状态清理。
+- Checkpoint A：0/1-item early-stop latch证明`closeAndDrain()`在sibling返回前不结束；`FAILED_DRAINED`使IO close count=0。
+
+### Phase B：Hadoop ownership与制品闭包（Task 8–13）
+
+- 输出：non-owning wrapper、access-probe复用、single-flight owned entry、actual-instance capability、effective-POM闭包及immutable artifacts。
+- Checkpoint B：S3A probe只有一个live raw；create/close竞态无lost handle；dependency tree无patched/upstream stack混装。
+
+### Phase C：Connector写生命周期（Task 14–27）
+
+- 输出：startup gate、coordinator、proof/lease、spill security、runtime table、sequential bootstrap、fixed-order Factory rollback与deterministic real-spill测试。
+- Checkpoint C：Factory只返回`SAFE_ROLLBACK | RETAINED_RESTART_REQUIRED`；真实spill在worker阻塞时目录存在且IO/action close count=0。
+
+### Phase D：Service、read、STOP、DDL与global barrier（Task 28–34）
+
+- 输出：Service adoption、STOP/write failure拆分、read-scope structured ownership、DDL exact lease、global barrier、Hadoop实际实例收口。
+- Checkpoint D：read未`closeAndDrain()`时DDL action=0且global close=0；fatal write不触发teardown；production reflection helper彻底删除。
+
+### Phase E：回归、性能与发布（Task 35–38）
+
+- 输出：五BucketMode、Surefire XML、W1-W4、部署清理调查、release manifest。
+- Checkpoint E：所有hard threshold通过，关键测试`tests > 0`，failure matrix每行都有test/event/outcome证据。
+
+## 8. 测试执行门禁
+
+Paimon fork定向测试应按模块运行，避免跨reactor指定不存在测试造成假失败；如果必须单命令，使用`-Dsurefire.failIfNoSpecifiedTests=false`并检查XML：
 
 ```bash
-mvn -pl connectors/paimon-connector -DskipTests compile
-mvn -pl connectors/paimon-connector test
-jq empty connectors/paimon-connector/src/main/resources/spec.json
-git diff --function-context -- connectors/paimon-connector/src/main
-git diff --check
+mvn -pl paimon-api -Dtest=ThreadPoolUtilsTest -Dsurefire.failIfNoSpecifiedTests=false test
+mvn -pl paimon-common -Dtest=HadoopFileIOTest,HadoopSecuredFileSystemTest -Dsurefire.failIfNoSpecifiedTests=false test
+mvn -pl paimon-core -Dtest=FileDeletionStructuredDrainTest,TableCommitMaintenanceLifecycleTest,KeyValueFileReaderFactoryTest,GlobalIndexAssignerTest -Dsurefire.failIfNoSpecifiedTests=false test
+mvn -pl paimon-api,paimon-common,paimon-core -am -DskipITs test
 ```
 
-关键定向命令：
+Connector精确测试使用Surefire `*Test`，不得以`*IT`配合`-DskipITs`冒充执行：
 
 ```bash
-mvn -pl connectors/paimon-connector \
-  -Dtest=PaimonConfigTest,PaimonSpecTest test
+mvn -pl connectors/paimon-plus-connector -am \
+  -Dtest=PaimonServiceResourceCoordinatorTest,PaimonWriteResourceLifecycleTest,PaimonRuntimeTableFactoryTest,PaimonSequentialIndexBootstrapTest,PaimonReadResourceScopeTest,PaimonTableReadBorrowTest,PaimonHadoopFileSystemOwnershipTest,PaimonSpillDirCleanerSecurityTest,PaimonCompactionSpillLifecycleTest,KeyDynamicBucketWriterStrategyTest \
+  -Dsurefire.failIfNoSpecifiedTests=false test
 
-mvn -pl connectors/paimon-connector \
-  -Dtest=PaimonMicroBatchCoordinatorTest,PaimonOffsetBarrierCoordinatorTest test
-
-mvn -pl connectors/paimon-connector \
-  -Dtest=PaimonAsyncCommitSchedulerTest,PaimonServiceLifecycleTest test
-
-mvn -pl connectors/paimon-connector \
-  -Dtest=PaimonMicroBatchCommitTest,PaimonServiceInitialSyncPendingTest,PaimonServiceTableDdlCacheInvalidationTest test
-
-mvn -pl connectors/paimon-connector \
-  -Dtest=PaimonConnectorCallbackTest,PaimonConnectorStopTest,PaimonMicroBatchOffsetIntegrationTest test
+mvn -pl connectors/paimon-plus-connector -am test
 ```
 
-当前环境已知 Maven 依赖解析 blocker：`tapdata-pdk-runner:2.5-SNAPSHOT`、`tapdata-pdk-api:2.0.8-SNAPSHOT`、`sql-core:1.0-SNAPSHOT`、`pdk-error-code:2.0-SNAPSHOT`。实施前必须先尝试解析；若仍缺失，记录完整输出并继续静态检查，但 Checkpoint 的 compile/test 不得勾选为通过。
+CI必须保存Surefire XML并断言至少`PaimonCompactionSpillLifecycleTest`、`PaimonHadoopFileSystemOwnershipTest`、`PaimonSequentialIndexBootstrapTest`、`KeyDynamicBucketWriterStrategyTest`各自`tests > 0`。
 
-## 10. 风险与缓解
+## 9. Definition of Done
 
-| 风险 | 影响 | 确定缓解 |
-| --- | --- | --- |
-| 全局 capability 同时影响纯 INITIAL_SYNC | 完成前重启可能扩大重放并产生重复/snapshot | 按 `DEC-02` 明示为唯一非回归例外；不伪造 initial offset；T11 执行三时点、三重启类型的逐事件验收。 |
-| callback 没有 durability ACK | Paimon 成功后 offset 保存失败会重放 | 坚持 data-before-offset，只声明 at-least-once；callback 失败后 sticky fence。 |
-| 多表按 `HashMap` 分组、表序不稳定 | 旧表序队列可能提前推进 offset | 以 sourceLane + required generation 屏障取代表顺序推断。 |
-| commit 结果不明 | 旧实现会重写 source batch；资源重建后计数从零重新累计，但数据仍可能重复写入/提交 | 复用同一 pending messages/identifier，追加确认最多 3 次，不重进 writer；空 pending no-op 不发布成功状态。 |
-| initial 不计 CDC count | DDL/stop 可能漏掉 initial writer buffer | 独立 `bufferedRecordCount`；DDL/stop 只用全阶段 buffer/pending 决定 drain。 |
-| scheduler/write/DDL/close 竞态 | 重复 snapshot、资源早关、offset 越界 | 表锁 + coordinator + lifecycle gate + callback 执行锁；使用确定性 latch 测试。 |
-| Service 初始化失败或非目标操作提前启动 worker | 半初始化实例被视为 RUNNING、资源泄漏或源端/元数据路径增加线程 | 构造后保持 NEW；全部初始化成功后发布 RUNNING；worker 只在出现 scheduler-eligible 的未提交 CDC 状态时惰性启动。 |
-| close 被中断 | 提前关闭底层资源或吞错误 | 清除中断后完成不可中断清理，末尾恢复 interrupt 并抛聚合异常。 |
-| 私有依赖或锁定引擎环境不可用 | 无法形成编译/运行时证据 | 明确标记 blocker；不降低验收标准，不把未运行写成通过。 |
+- [ ] Spec V5 Required语义无回退；G0仅阻断DDL，G1a/G1b无自依赖。
+- [ ] structured iterator/operation由read scope `closeAndDrain()`；0/1-item early-stop、error、interrupt均有latch证据。
+- [ ] `FAILED_DRAINED`、active WAITING、terminal retained在代码、测试、metrics和Failure Matrix完全一致。
+- [ ] Factory fixed safety order、GlobalIndex staged ownership、write/commit admission与physical lease合同通过。
+- [ ] Hadoop probe/single-flight/close-create、HDFS/S3A/file差异、unique cache membership与禁止reflection通过。
+- [ ] patched Maven effective-POM闭包、coordinates、sources、SHA-256、dependency tree与capability marker齐全。
+- [ ] deterministic real-spill阈值、事件偏序、>=3 runs/readers、无`.channel ENOENT`通过。
+- [ ] 五BucketMode和W1-W4 hard gate通过；默认全模块测试通过且XML证明关键测试实际执行。
+- [ ] 未修改Paimon snapshot/offset/callback/exactly-once边界，未引入`prepareCommit(true)`。
+- [ ] 人工评审批准后才进入编码阶段。
 
-## 11. 文件预算
+## 10. 尚需人工裁决
 
-预计新增生产文件 3 个：
-
-- `PaimonMicroBatchCoordinator.java`
-- `PaimonAsyncCommitScheduler.java`
-- `PaimonServiceLifecycle.java`
-
-预计修改生产文件 4 个：
-
-- `PaimonConfig.java`
-- `PaimonService.java`
-- `PaimonConnector.java`
-- `spec.json`
-
-测试按职责新增/扩展，详见 [tasks/todo.md](todo.md)。任何单个任务不得修改超过 5 个文件；若实现证明需要第 4 个生产类、修改 `PaimonTableWriteContext` 语义或跨出 Connector 模块，立即停止并修订 Spec/Plan。
-
-## 12. 实施门禁
-
-本计划没有未决产品问题。进入实现前仍需用户明确批准本 Plan 和 [tasks/todo.md](todo.md)。批准后按任务顺序执行；每个任务先写/扩展测试，再实现最小生产改动，Checkpoint 未通过不得进入下一阶段。
+仅保留Spec Q4：DDL是否启用cumulative action-admission deadline及默认值。该决策不改变任何安全不变量；未裁决时DDL implementation task保持blocked，其他任务可继续。
