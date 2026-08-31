@@ -34,7 +34,7 @@ import static org.mockito.Mockito.when;
 class PaimonWriteResourceLifecycleTest {
 
     @Test
-    void successMustFollowFixedSafetyOrderAndReleaseExactLeaseLast() throws Exception {
+    void successMustFollowFixedSafetyOrderAndStopAtSpillBoundary() throws Exception {
         List<String> events = Collections.synchronizedList(new ArrayList<>());
         PaimonCompactionRuntime compaction = new PaimonCompactionRuntime("success");
         compaction.executor().execute(() -> events.add("compaction"));
@@ -47,11 +47,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance,
                         () -> events.add("committer"),
                         () -> events.add("io"),
-                        () -> events.add("spill"),
-                        () -> {
-                            events.add("lease");
-                            return true;
-                        });
+                        () -> events.add("spill"));
 
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
@@ -62,8 +58,7 @@ class PaimonWriteResourceLifecycleTest {
         assertEquals(PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS, outcome.state());
         assertTrue(outcome.terminal());
         assertEquals(
-                Arrays.asList(
-                        "compaction", "writer", "maintenance", "committer", "io", "spill", "lease"),
+                Arrays.asList("compaction", "writer", "maintenance", "committer", "io", "spill"),
                 events);
         PaimonWriteResourceLifecycle.CloseSnapshot snapshot = lifecycle.closeSnapshot();
         assertTrue(snapshot.compactionShutdownStarted());
@@ -72,7 +67,6 @@ class PaimonWriteResourceLifecycleTest {
                 PaimonWriteCloseModel.DelegateCloseStatus.SUCCEEDED, snapshot.writer());
         assertEquals(PaimonWriteResourceLifecycle.StepState.SUCCEEDED, snapshot.maintenance());
         assertEquals(PaimonWriteResourceLifecycle.StepState.SUCCEEDED, snapshot.spill());
-        assertEquals(PaimonWriteResourceLifecycle.StepState.SUCCEEDED, snapshot.lease());
 
         assertSame(operation, lifecycle.beginClose(proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP)));
         assertSame(outcome.failure(), lifecycle.awaitAndFinish(operation, Long.MAX_VALUE).failure());
@@ -107,11 +101,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance,
                         dependencyCloses::incrementAndGet,
                         dependencyCloses::incrementAndGet,
-                        dependencyCloses::incrementAndGet,
-                        () -> {
-                            dependencyCloses.incrementAndGet();
-                            return true;
-                        });
+                        dependencyCloses::incrementAndGet);
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
 
@@ -131,7 +121,7 @@ class PaimonWriteResourceLifecycleTest {
         assertEquals(
                 PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS,
                 lifecycle.awaitAndFinish(operation, Long.MAX_VALUE).state());
-        assertEquals(5, dependencyCloses.get());
+        assertEquals(4, dependencyCloses.get());
     }
 
     @Test
@@ -155,11 +145,7 @@ class PaimonWriteResourceLifecycleTest {
                             throw committerFailure;
                         },
                         () -> events.add("io"),
-                        () -> events.add("spill"),
-                        () -> {
-                            events.add("lease");
-                            return true;
-                        });
+                        () -> events.add("spill"));
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
 
@@ -173,7 +159,6 @@ class PaimonWriteResourceLifecycleTest {
         assertEquals(Collections.singletonList(committerFailure), Arrays.asList(writerFailure.getSuppressed()));
         assertEquals(Arrays.asList("writer", "maintenance", "committer"), events);
         assertEquals(PaimonWriteResourceLifecycle.StepState.NOT_STARTED, lifecycle.closeSnapshot().spill());
-        assertEquals(PaimonWriteResourceLifecycle.StepState.NOT_STARTED, lifecycle.closeSnapshot().lease());
 
         lifecycle.awaitAndFinish(operation, Long.MAX_VALUE);
         assertEquals(Arrays.asList("writer", "maintenance", "committer"), events);
@@ -194,11 +179,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance,
                         () -> events.add("committer"),
                         () -> events.add("io"),
-                        () -> events.add("spill"),
-                        () -> {
-                            events.add("lease");
-                            return true;
-                        });
+                        () -> events.add("spill"));
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
 
@@ -241,11 +222,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance,
                         () -> events.add("committer"),
                         () -> events.add("io"),
-                        () -> events.add("spill"),
-                        () -> {
-                            events.add("lease");
-                            return true;
-                        });
+                        () -> events.add("spill"));
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
 
@@ -267,8 +244,7 @@ class PaimonWriteResourceLifecycleTest {
                         "maintenance-success",
                         "committer",
                         "io",
-                        "spill",
-                        "lease"),
+                        "spill"),
                 events);
         verify(maintenance, times(2))
                 .shutdownAndAwait(
@@ -277,7 +253,7 @@ class PaimonWriteResourceLifecycleTest {
     }
 
     @Test
-    void ioFailureMustBeStickyAndForbidSpillAndLeaseRelease() throws Exception {
+    void ioFailureMustBeStickyAndForbidSpillCleanup() throws Exception {
         List<String> events = new ArrayList<>();
         IOException ioFailure = new IOException("io");
         PaimonWriteResourceLifecycle lifecycle =
@@ -291,11 +267,7 @@ class PaimonWriteResourceLifecycleTest {
                             events.add("io");
                             throw ioFailure;
                         },
-                        () -> events.add("spill"),
-                        () -> {
-                            events.add("lease");
-                            return true;
-                        });
+                        () -> events.add("spill"));
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
 
@@ -306,7 +278,6 @@ class PaimonWriteResourceLifecycleTest {
         assertSame(ioFailure, outcome.failure());
         assertEquals(Arrays.asList("writer", "maintenance", "committer", "io"), events);
         assertEquals(PaimonWriteResourceLifecycle.StepState.NOT_STARTED, lifecycle.closeSnapshot().spill());
-        assertEquals(PaimonWriteResourceLifecycle.StepState.NOT_STARTED, lifecycle.closeSnapshot().lease());
     }
 
     @Test
@@ -326,11 +297,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance,
                         () -> events.add("committer"),
                         () -> events.add("io"),
-                        () -> events.add("spill"),
-                        () -> {
-                            events.add("lease");
-                            return true;
-                        });
+                        () -> events.add("spill"));
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(
                         proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
@@ -546,11 +513,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance(new ArrayList<>(), success()),
                         dependencyCloses::incrementAndGet,
                         dependencyCloses::incrementAndGet,
-                        dependencyCloses::incrementAndGet,
-                        () -> {
-                            dependencyCloses.incrementAndGet();
-                            return true;
-                        });
+                        dependencyCloses::incrementAndGet);
         PaimonWriteResourceLifecycle.CloseOperation timeoutOperation =
                 timeoutLifecycle.beginClose(
                         proof("timeout", PaimonWriteCloseModel.InitiatingReason.FACTORY_ROLLBACK));
@@ -573,8 +536,7 @@ class PaimonWriteResourceLifecycleTest {
                         () -> {
                             throw ioFailure;
                         },
-                        () -> {},
-                        () -> true);
+                        () -> {});
         PaimonWriteResourceLifecycle.CloseOperation ioOperation =
                 ioLifecycle.beginClose(
                         proof("io", PaimonWriteCloseModel.InitiatingReason.FACTORY_ROLLBACK));
@@ -656,10 +618,6 @@ class PaimonWriteResourceLifecycleTest {
                 PaimonWriteCloseModel.InitiatingReason.DDL,
                 InterruptStage.SPILL,
                 PaimonWriteCloseModel.CloseState.DEPENDENCY_CLOSE_FAILED_RETAINED);
-        assertCloseActionInterruption(
-                PaimonWriteCloseModel.InitiatingReason.FACTORY_ROLLBACK,
-                InterruptStage.LEASE,
-                PaimonWriteCloseModel.CloseState.FACTORY_ROLLBACK_RETAINED);
     }
 
     @Test
@@ -687,8 +645,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance,
                         committerCloses::incrementAndGet,
                         () -> {},
-                        () -> {},
-                        () -> true);
+                        () -> {});
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(
                         proof("generation", PaimonWriteCloseModel.InitiatingReason.DDL));
@@ -734,8 +691,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance(new ArrayList<>(), waiting()),
                         () -> {},
                         () -> {},
-                        () -> {},
-                        () -> true);
+                        () -> {});
         PaimonWriteResourceLifecycle.CloseOperation timeoutOperation =
                 timeoutLifecycle.beginClose(
                         proof(
@@ -776,8 +732,7 @@ class PaimonWriteResourceLifecycleTest {
                         interruptedMaintenance,
                         () -> {},
                         () -> {},
-                        () -> {},
-                        () -> true);
+                        () -> {});
         PaimonWriteResourceLifecycle.CloseOperation interruptedOperation =
                 interruptedLifecycle.beginClose(
                         proof(
@@ -792,6 +747,9 @@ class PaimonWriteResourceLifecycleTest {
                                     interruptedLifecycle.awaitAndFinish(
                                             interruptedOperation, Long.MAX_VALUE)));
             assertTrue(Thread.currentThread().isInterrupted());
+            assertEquals(
+                    PaimonWriteCloseModel.CloseState.FACTORY_ROLLBACK_RETAINED,
+                    interruptedOperation.state());
             assertSame(secondWriterFailure, interruptedOperation.terminalFailure());
             assertEquals(
                     Collections.singletonList(maintenanceInterruption),
@@ -814,11 +772,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance(new ArrayList<>(), success()),
                         dependencyCloses::incrementAndGet,
                         dependencyCloses::incrementAndGet,
-                        dependencyCloses::incrementAndGet,
-                        () -> {
-                            dependencyCloses.incrementAndGet();
-                            return true;
-                        });
+                        dependencyCloses::incrementAndGet);
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(
                         proof(
@@ -836,10 +790,9 @@ class PaimonWriteResourceLifecycleTest {
     }
 
     @Test
-    void spillAndLeaseFailureMustBeStickyAndNeverRetryUnknownPartialClose()
+    void spillFailureMustBeStickyAndNeverRetryUnknownPartialClose()
             throws Exception {
         AtomicInteger spillAttempts = new AtomicInteger();
-        AtomicInteger leaseAttempts = new AtomicInteger();
         IOException spillFailure = new IOException("spill");
         PaimonWriteResourceLifecycle spillLifecycle =
                 lifecycle(
@@ -852,10 +805,6 @@ class PaimonWriteResourceLifecycleTest {
                         () -> {
                             spillAttempts.incrementAndGet();
                             throw spillFailure;
-                        },
-                        () -> {
-                            leaseAttempts.incrementAndGet();
-                            return true;
                         });
         PaimonWriteResourceLifecycle.CloseOperation spillOperation =
                 spillLifecycle.beginClose(
@@ -865,33 +814,11 @@ class PaimonWriteResourceLifecycleTest {
                 spillLifecycle.awaitAndFinish(spillOperation, Long.MAX_VALUE).state());
         spillLifecycle.awaitAndFinish(spillOperation, Long.MAX_VALUE);
         assertEquals(1, spillAttempts.get());
-        assertEquals(0, leaseAttempts.get());
-
-        PaimonWriteResourceLifecycle leaseLifecycle =
-                lifecycle(
-                        "lease",
-                        new PaimonCompactionRuntime("lease-failure"),
-                        () -> {},
-                        maintenance(new ArrayList<>(), success()),
-                        () -> {},
-                        () -> {},
-                        () -> {},
-                        () -> {
-                            leaseAttempts.incrementAndGet();
-                            return false;
-                        });
-        PaimonWriteResourceLifecycle.CloseOperation leaseOperation =
-                leaseLifecycle.beginClose(
-                        proof("lease", PaimonWriteCloseModel.InitiatingReason.STOP));
-        assertEquals(
-                PaimonWriteCloseModel.CloseState.DEPENDENCY_CLOSE_FAILED_RETAINED,
-                leaseLifecycle.awaitAndFinish(leaseOperation, Long.MAX_VALUE).state());
-        leaseLifecycle.awaitAndFinish(leaseOperation, Long.MAX_VALUE);
-        assertEquals(1, leaseAttempts.get());
     }
 
     @Test
-    void cumulativeDeadlineMustStopBetweenIoSpillAndLeasePhases() throws Exception {
+    void cumulativeDeadlineMustGateBeforeSpillButNotCreateAPhantomPostSpillPhase()
+            throws Exception {
         CountDownLatch ioEntered = new CountDownLatch(1);
         CountDownLatch releaseIo = new CountDownLatch(1);
         List<String> ioEvents = Collections.synchronizedList(new ArrayList<>());
@@ -907,11 +834,7 @@ class PaimonWriteResourceLifecycleTest {
                             ioEntered.countDown();
                             releaseIo.await();
                         },
-                        () -> ioEvents.add("spill"),
-                        () -> {
-                            ioEvents.add("lease");
-                            return true;
-                        });
+                        () -> ioEvents.add("spill"));
         PaimonWriteResourceLifecycle.CloseOperation ioOperation =
                 ioLifecycle.beginClose(
                         proof("io-deadline", PaimonWriteCloseModel.InitiatingReason.STOP));
@@ -933,8 +856,7 @@ class PaimonWriteResourceLifecycleTest {
                     PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS,
                     ioLifecycle.awaitAndFinish(ioOperation, Long.MAX_VALUE).state());
             assertEquals(
-                    Arrays.asList(
-                            "writer", "maintenance", "committer", "io", "spill", "lease"),
+                    Arrays.asList("writer", "maintenance", "committer", "io", "spill"),
                     ioEvents);
         } finally {
             releaseIo.countDown();
@@ -956,10 +878,6 @@ class PaimonWriteResourceLifecycleTest {
                             spillEvents.add("spill");
                             spillEntered.countDown();
                             releaseSpill.await();
-                        },
-                        () -> {
-                            spillEvents.add("lease");
-                            return true;
                         });
         PaimonWriteResourceLifecycle.CloseOperation spillOperation =
                 spillLifecycle.beginClose(
@@ -976,20 +894,10 @@ class PaimonWriteResourceLifecycleTest {
             awaitPast(spillDeadline);
             releaseSpill.countDown();
             assertEquals(
-                    PaimonWriteCloseModel.CloseState.WAITING_COMMIT_MAINTENANCE,
+                    PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS,
                     spillClose.get(10L, TimeUnit.SECONDS).state());
             assertEquals(
                     Arrays.asList("writer", "maintenance", "committer", "io", "spill"),
-                    spillEvents);
-            assertEquals(
-                    PaimonWriteResourceLifecycle.StepState.NOT_STARTED,
-                    spillLifecycle.closeSnapshot().lease());
-            assertEquals(
-                    PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS,
-                    spillLifecycle.awaitAndFinish(spillOperation, Long.MAX_VALUE).state());
-            assertEquals(
-                    Arrays.asList(
-                            "writer", "maintenance", "committer", "io", "spill", "lease"),
                     spillEvents);
         } finally {
             releaseSpill.countDown();
@@ -1014,8 +922,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance(new ArrayList<>(), success()),
                         () -> {},
                         () -> {},
-                        () -> {},
-                        () -> true);
+                        () -> {});
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
         ExecutorService executor = Executors.newFixedThreadPool(3);
@@ -1126,8 +1033,27 @@ class PaimonWriteResourceLifecycleTest {
             if (method.getName().equals("joinForStop")
                     || method.getName().equals("transitionOnWaiting")
                     || method.getName().equals("transitionOnInterruptedWait")) {
+                assertTrue(Modifier.isPrivate(method.getModifiers()), method::toString);
                 assertTrue(Modifier.isSynchronized(method.getModifiers()), method::toString);
             }
+        }
+        for (java.lang.reflect.Field field :
+                PaimonWriteResourceLifecycle.class.getDeclaredFields()) {
+            assertFalse(
+                    field.getName().toLowerCase(java.util.Locale.ROOT).contains("lease"),
+                    "physical lease ownership must remain outside write resource lifecycle: "
+                            + field);
+        }
+        for (Class<?> nested : PaimonWriteResourceLifecycle.class.getDeclaredClasses()) {
+            assertFalse(
+                    nested.getSimpleName().toLowerCase(java.util.Locale.ROOT).contains("lease"),
+                    "write resource lifecycle must not declare a physical lease step: " + nested);
+        }
+        for (Method method :
+                PaimonWriteResourceLifecycle.CloseSnapshot.class.getDeclaredMethods()) {
+            assertFalse(
+                    method.getName().toLowerCase(java.util.Locale.ROOT).contains("lease"),
+                    "resource-close snapshot must not claim physical lease completion: " + method);
         }
     }
 
@@ -1140,8 +1066,7 @@ class PaimonWriteResourceLifecycleTest {
                 maintenance(new ArrayList<>(), success()),
                 () -> {},
                 () -> {},
-                () -> {},
-                () -> true);
+                () -> {});
     }
 
     private static PaimonWriteResourceLifecycle lifecycle(
@@ -1151,10 +1076,9 @@ class PaimonWriteResourceLifecycleTest {
             PaimonMaintenanceAdapter maintenance,
             PaimonWriteCloseModel.CloseAction committer,
             PaimonWriteCloseModel.CloseAction io,
-            PaimonWriteCloseModel.CloseAction spill,
-            PaimonWriteResourceLifecycle.LeaseReleaseAction lease) {
+            PaimonWriteCloseModel.CloseAction spill) {
         return new PaimonWriteResourceLifecycle(
-                generation, compaction, writer, maintenance, committer, io, spill, lease);
+                generation, compaction, writer, maintenance, committer, io, spill);
     }
 
     private static PaimonMaintenanceAdapter maintenance(
@@ -1225,8 +1149,7 @@ class PaimonWriteResourceLifecycleTest {
                         maintenance,
                         () -> {},
                         () -> {},
-                        () -> {},
-                        () -> true);
+                        () -> {});
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof("generation-" + reason, reason));
         try {
@@ -1272,14 +1195,7 @@ class PaimonWriteResourceLifecycleTest {
                                 "spill",
                                 InterruptStage.SPILL,
                                 interruptedStage,
-                                interruption),
-                        () -> {
-                            events.add("lease");
-                            if (interruptedStage == InterruptStage.LEASE) {
-                                throw interruption;
-                            }
-                            return true;
-                        });
+                                interruption));
         Object capability = "generation-" + reason + '-' + interruptedStage;
         PaimonWriteResourceLifecycle.CloseOperation operation =
                 lifecycle.beginClose(proof(capability, reason));
@@ -1365,8 +1281,7 @@ class PaimonWriteResourceLifecycleTest {
         WRITER,
         COMMITTER,
         IO,
-        SPILL,
-        LEASE
+        SPILL
     }
 
     private static PaimonWriteCloseModel.QuiescenceProof proof(

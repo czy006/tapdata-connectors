@@ -11,8 +11,11 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>The safety order is fixed: exact quiescence proof, graceful compaction shutdown, actual
  * executor termination, writer, structured commit maintenance, committer, IO manager, spill
- * registration and finally the exact physical lease. A dependency failure is terminal and
- * retained; it never authorizes a later in-process retry of a partially closed resource.
+ * registration. Physical generation lease ownership is deliberately outside this class: the
+ * coordinator or factory construction envelope releases or transfers that exact lease only after
+ * this lifecycle publishes {@link PaimonWriteCloseModel.CloseState#CLOSED_SUCCESS}. A dependency
+ * failure is terminal and retained; it never authorizes a later in-process retry of a partially
+ * closed resource or release of its physical lease.
  *
  * <p>Paimon source contract: a terminal result from {@code
  * TableCommitMaintenance#shutdownAndAwait} is published only after its executor, every accepted
@@ -28,11 +31,6 @@ final class PaimonWriteResourceLifecycle {
         WAITING,
         SUCCEEDED,
         FAILED
-    }
-
-    @FunctionalInterface
-    interface LeaseReleaseAction {
-        boolean release() throws Exception;
     }
 
     /** Opaque identity and monotonic state for the one close operation of this generation. */
@@ -215,7 +213,6 @@ final class PaimonWriteResourceLifecycle {
         private final PaimonWriteCloseModel.DelegateCloseStatus committer;
         private final PaimonWriteCloseModel.DelegateCloseStatus io;
         private final StepState spill;
-        private final StepState lease;
 
         private CloseSnapshot(
                 CloseOutcome outcome,
@@ -226,8 +223,7 @@ final class PaimonWriteResourceLifecycle {
                 StepState maintenance,
                 PaimonWriteCloseModel.DelegateCloseStatus committer,
                 PaimonWriteCloseModel.DelegateCloseStatus io,
-                StepState spill,
-                StepState lease) {
+                StepState spill) {
             this.outcome = outcome;
             this.operationPresent = operationPresent;
             this.compactionShutdownStarted = compactionShutdownStarted;
@@ -237,7 +233,6 @@ final class PaimonWriteResourceLifecycle {
             this.committer = committer;
             this.io = io;
             this.spill = spill;
-            this.lease = lease;
         }
 
         CloseOutcome outcome() {
@@ -276,9 +271,6 @@ final class PaimonWriteResourceLifecycle {
             return spill;
         }
 
-        StepState lease() {
-            return lease;
-        }
     }
 
     private final Object coordination = new Object();
@@ -289,7 +281,6 @@ final class PaimonWriteResourceLifecycle {
     private final PaimonWriteCloseModel.CloseAction committerClose;
     private final PaimonWriteCloseModel.CloseAction ioClose;
     private final OnceCloseStep spillUnregister;
-    private final OnceLeaseRelease leaseRelease;
     private final PaimonWriteCloseModel.DelegateCloseProgress dependencyProgress =
             new PaimonWriteCloseModel.DelegateCloseProgress();
     private final MaintenanceProgress maintenanceProgress = new MaintenanceProgress();
@@ -306,8 +297,7 @@ final class PaimonWriteResourceLifecycle {
             PaimonMaintenanceAdapter maintenance,
             PaimonWriteCloseModel.CloseAction committerClose,
             PaimonWriteCloseModel.CloseAction ioClose,
-            PaimonWriteCloseModel.CloseAction spillUnregister,
-            LeaseReleaseAction leaseRelease) {
+            PaimonWriteCloseModel.CloseAction spillUnregister) {
         this.exactGenerationCapability =
                 Objects.requireNonNull(
                         exactGenerationCapability, "exactGenerationCapability");
@@ -324,8 +314,6 @@ final class PaimonWriteResourceLifecycle {
         this.spillUnregister =
                 new OnceCloseStep(
                         Objects.requireNonNull(spillUnregister, "spillUnregister"));
-        this.leaseRelease =
-                new OnceLeaseRelease(Objects.requireNonNull(leaseRelease, "leaseRelease"));
     }
 
     CloseOperation beginClose(
@@ -425,8 +413,7 @@ final class PaimonWriteResourceLifecycle {
                 maintenanceProgress.state(),
                 dependencyProgress.committerOutcome().status(),
                 dependencyProgress.ioOutcome().status(),
-                spillUnregister.state(),
-                leaseRelease.state());
+                spillUnregister.state());
     }
 
     private CloseOutcome finishRound(
@@ -580,17 +567,6 @@ final class PaimonWriteResourceLifecycle {
         if (spillFailure != null) {
             operation.retain(retainedDependencyState(operation), spillFailure);
             rethrowInterruption(interruption(spillFailure));
-            return outcome(operation);
-        }
-
-        expired = stopBeforeNewPhaseIfDeadlineExpired(operation, absoluteDeadlineNanos);
-        if (expired != null) {
-            return expired;
-        }
-        Throwable releaseFailure = leaseRelease.run();
-        if (releaseFailure != null) {
-            operation.retain(retainedDependencyState(operation), releaseFailure);
-            rethrowInterruption(interruption(releaseFailure));
             return outcome(operation);
         }
 
@@ -956,44 +932,4 @@ final class PaimonWriteResourceLifecycle {
 
     }
 
-    private static final class OnceLeaseRelease {
-        private final LeaseReleaseAction action;
-        private StepState state = StepState.NOT_STARTED;
-        private Throwable failure;
-
-        private OnceLeaseRelease(LeaseReleaseAction action) {
-            this.action = action;
-        }
-
-        Throwable run() {
-            synchronized (this) {
-                if (state != StepState.NOT_STARTED) {
-                    return failure;
-                }
-                state = StepState.IN_PROGRESS;
-            }
-            Throwable completedFailure = null;
-            try {
-                if (!action.release()) {
-                    completedFailure =
-                            new IllegalStateException(
-                                    "Exact Paimon writer lease release was rejected");
-                }
-            } catch (Throwable releaseFailure) {
-                completedFailure = releaseFailure;
-                if (releaseFailure instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            synchronized (this) {
-                failure = completedFailure;
-                state = completedFailure == null ? StepState.SUCCEEDED : StepState.FAILED;
-                return failure;
-            }
-        }
-
-        synchronized StepState state() {
-            return state;
-        }
-    }
 }
