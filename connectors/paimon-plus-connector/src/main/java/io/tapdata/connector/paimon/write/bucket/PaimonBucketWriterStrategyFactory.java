@@ -57,30 +57,14 @@ public final class PaimonBucketWriterStrategyFactory {
         Objects.requireNonNull(commitUser, "commitUser");
         Objects.requireNonNull(writeSemanticContract, "writeSemanticContract");
         Objects.requireNonNull(runtimeFactory, "runtimeFactory");
-        return create(
+        PaimonBucketWriterStrategyContext context =
                 new PaimonBucketWriterStrategyContext(
                         tableKey,
                         preparedWriter.runtimeTable(),
                         preparedWriter.transferWriterToStrategy(),
                         commitUser,
                         preparedWriter.ioManager(),
-                        writeSemanticContract),
-                runtimeFactory);
-    }
-
-    /* Transitional test seam removed by Task 19B after existing strategy tests migrate. */
-    static PaimonBucketWriterStrategy create(PaimonBucketWriterStrategyContext context)
-            throws Exception {
-        return create(context, DefaultPaimonBucketWriterRuntimeFactory.INSTANCE);
-    }
-
-    /* Transitional test seam removed by Task 19B after existing strategy tests migrate. */
-    static PaimonBucketWriterStrategy create(
-            PaimonBucketWriterStrategyContext context,
-            PaimonBucketWriterRuntimeFactory runtimeFactory)
-            throws Exception {
-        Objects.requireNonNull(context, "context");
-        Objects.requireNonNull(runtimeFactory, "runtimeFactory");
+                        writeSemanticContract);
         BucketMode mode = context.table().bucketMode();
         switch (mode) {
             case HASH_FIXED:
