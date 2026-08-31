@@ -98,6 +98,36 @@ class PaimonCompactionRuntimeTest {
     }
 
     @Test
+    void shutdownFenceMustAtomicallyDistinguishPreFenceAndRejectedPostFenceSubmission()
+            throws Exception {
+        PaimonCompactionRuntime clean = new PaimonCompactionRuntime("factory-clean");
+        assertTrue(clean.beginShutdown());
+        assertThrows(
+                RejectedExecutionException.class,
+                () -> clean.executor().execute(() -> {}));
+        assertTrue(
+                clean.beginShutdown(),
+                "a rejected post-fence attempt must not rewrite the shutdown snapshot");
+        assertTrue(
+                clean.awaitTermination(
+                        PaimonCompactionExecutorFixture.deadlineAfterSeconds(10L)));
+
+        PaimonCompactionRuntime submitted = new PaimonCompactionRuntime("factory-submitted");
+        try {
+            submitted.executor().submit(() -> {}).get(10L, TimeUnit.SECONDS);
+            assertFalse(
+                    submitted.beginShutdown(),
+                    "an accepted pre-fence submission must make rollback evidence false");
+            assertFalse(submitted.beginShutdown());
+            assertTrue(
+                    submitted.awaitTermination(
+                            PaimonCompactionExecutorFixture.deadlineAfterSeconds(10L)));
+        } finally {
+            submitted.beginShutdown();
+        }
+    }
+
+    @Test
     void gracefulShutdownMustPreserveNaturalTaskFailure() throws Exception {
         try (PaimonCompactionExecutorFixture fixture =
                 new PaimonCompactionExecutorFixture()) {

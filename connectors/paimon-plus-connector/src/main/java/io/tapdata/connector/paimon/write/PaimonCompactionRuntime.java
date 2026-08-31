@@ -37,6 +37,7 @@ final class PaimonCompactionRuntime {
     private final AtomicBoolean submissionObserved = new AtomicBoolean();
 
     private volatile Phase phase = Phase.OPEN;
+    private boolean submissionFreeAtShutdownFence;
 
     PaimonCompactionRuntime(String diagnosticGenerationName) {
         this(
@@ -75,13 +76,18 @@ final class PaimonCompactionRuntime {
      * <p>{@link ScheduledThreadPoolExecutor#shutdown()} is non-blocking. It does not interrupt the
      * running compaction task, and queued one-shot tasks remain eligible to run.
      */
-    void beginShutdown() {
+    boolean beginShutdown() {
         synchronized (admissionLock) {
             if (phase != Phase.OPEN) {
-                return;
+                return submissionFreeAtShutdownFence;
             }
+            // Linearize the factory-rollback precondition with admission closure. Every admission
+            // path uses this same lock, so an accepted pre-fence task is observed and a post-fence
+            // task is rejected; there is no check-then-shutdown window.
+            submissionFreeAtShutdownFence = !submissionObserved.get();
             phase = Phase.SHUTDOWN_REQUESTED;
             ownedExecutor.shutdown();
+            return submissionFreeAtShutdownFence;
         }
     }
 
