@@ -17,7 +17,7 @@
 完成必须同时满足：
 
 1. Paimon以 additive ABI新增显式`AutoCloseable` structured iterator/operation，保留旧`Iterable`/`Iterator` descriptor。每个handle恰有一个owner：跨read边界由read child scope接管，不逃逸边界则由lexical owner eager-drain；所有success/failure/early-stop/interrupt路径执行`closeAndDrain()`。
-2. `FAILED_DRAINED`只证明runnable已退出，不代表业务成功；仅maintenance SUCCESS且无`maintainError`、writer/committer均成功时允许关闭IO/spill/lease。
+2. `FAILED_DRAINED`只证明runnable已退出，不代表业务成功；仅maintenance SUCCESS且无`maintainError`、writer/committer均成功时允许关闭IO/spill。physical lease仍由外层场景ownership finalizer持有，不能由dependency outcome释放。
 3. active termination wait与terminal retained严格分离；前者继续同一operation join，后者不在同进程重试未知部分close。
 4. Factory、STOP、DDL、read和write使用同一proof/lease模型，无逆序close旁路、自等待或伪造proof。
 5. Hadoop owned mode在Catalog创建/首次probe前启用；probe无遗失handle，first access single-flight，close/create线性化，禁止production反射与broad cache close。
@@ -72,7 +72,7 @@ SUCCESS
 
 FAILED_DRAINED
   = parent + child runnable 已退出，但存在业务失败
-  = dependency retained；最多继续独立且 exactly-once 的 committer close；禁止 IO/spill/lease release
+  = dependency retained；最多继续独立且 exactly-once 的 committer close；禁止 IO/spill 和外层 physical-lease ownership transition
 
 DEPENDENCY_CLOSE_FAILED_RETAINED / IO_CLOSE_FAILED_RETAINED
   = terminal；保留 strong handle + sticky failure；同进程不重试未知部分 close
@@ -84,7 +84,7 @@ DEPENDENCY_CLOSE_FAILED_RETAINED / IO_CLOSE_FAILED_RETAINED
 
 - proof reason仅`STOP | DDL | FACTORY_ROLLBACK`；fatal write只设置sticky fence与`failureOrigin=WRITE_PATH`，不能启动或冒充STOP teardown。
 - PreparedWriter按两个独立提交闭合：19A通过`FileStoreTable.newWrite(commitUser)`取得具体`TableWriteImpl`并在任何first-use前绑定IO/Compaction；19B迁移最后一个bucket factory测试seam并删除过渡raw overload。19B完成前不得宣称生产raw writer类型边界已经闭合。
-- Factory fixed safety order：proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → lease release。
+- Write-resource fixed safety order：proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → resource `CLOSED_SUCCESS`。physical lease不属于该lifecycle；Factory envelope仅在SAFE rollback后exact-release，retained时转移给retained marker；STOP/DDL由coordinator在Context expected-remove后按场景release或transfer。
 - GlobalIndex创建后立即staged-own；只有`endBoostrap`成功才transfer，外部注入对象是`IOManager`且不得被assigner close。
 - Context/generation持有一个全生命周期WRITER physical lease；每次write/commit只获取operation admission并在表锁后revalidate，不重复申请physical lease。
 
@@ -127,6 +127,8 @@ graph TD
     G4 --> R
     G1C{"G1c: remote publish authorization"} -.->|blocks release only| R
 ```
+
+![Paimon根治实施阶段与门禁依赖](assets/paimon-root-fix-plan-dependencies.svg)
 
 任务级依赖以 [`tasks/todo.md`](todo.md) 每个 Task 的“依赖”字段为规范来源。纯 Markdown 阶段关系如下：
 

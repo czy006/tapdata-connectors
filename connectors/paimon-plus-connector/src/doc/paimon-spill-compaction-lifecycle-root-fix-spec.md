@@ -104,7 +104,7 @@ v5 以本地 Paimon `1.3.2` source JAR、Hadoop `3.3.6` source JAR、Connector �
   <tr><td>Critical</td><td>`ThreadPoolUtils` 返回普通 lazy `Iterator/Iterable`；调用方消费 0/1 条后正常放弃时没有 drain 入口</td><td>保留旧方法 descriptor，并新增显式 `AutoCloseable` structured operation/iterator API。每个 structured handle 恰有一个 resource owner：跨 read 边界时由 read child scope 接管；不逃逸边界时由 lexical owner eager-drain；所有 success、failure、early-stop、interrupt 路径执行 `closeAndDrain()`</td></tr>
   <tr><td>Critical</td><td>`FileIO.checkAccess` 创建 provisional FileIO、调用 `exists` 后丢失 handle；Hadoop fallback 随后又创建正式实例</td><td>access check 返回并复用同一个已 configure/validate 的 FileIO；无法复用的 provisional 必须 exact-close，rollback close 失败则 fail-fast</td></tr>
   <tr><td>Critical</td><td>`HadoopFileIO#getFileSystem` 的 `get/create/put` 在 owned mode 可并发创建并覆盖 unique raw</td><td>使用 `OwnedFileSystemEntry` single-flight reservation；`close` 与 creation 线性化，losing/late raw exact-close</td></tr>
-  <tr><td>Required</td><td>把 `FAILED_DRAINED` 等同于父资源可释放</td><td>`FAILED_DRAINED` 只证明 runnable 已退出；业务失败仍进入 dependency retained。只有 maintenance `SUCCESS`、`maintainError == null`、writer/committer close 都成功时才允许关闭 IO/spill/lease</td></tr>
+  <tr><td>Required</td><td>把 `FAILED_DRAINED` 等同于父资源可释放</td><td>`FAILED_DRAINED` 只证明 runnable 已退出；业务失败仍进入 dependency retained。只有 maintenance `SUCCESS`、`maintainError == null`、writer/committer close 都成功时才允许关闭 IO/spill；physical lease由外层coordinator/envelope另行按场景处理</td></tr>
   <tr><td>Required</td><td>把 `newInstance` 描述为不进入 Hadoop static cache，并把 `file://` 当作 Hadoop raw FS</td><td>`newInstance` 以 unique key 被 static cache 跟踪，exact raw close只移除自己的 entry；禁止 broad close。`file://` 默认是 `LocalFileIO`，不作 Hadoop raw identity/count 断言</td></tr>
   <tr><td>Required</td><td>只发布 patched API/Common/Core，却未闭合 Core POM 中 `${project.version}` 依赖</td><td>归档 effective POM；patched stack 与 upstream ecosystem 分版本，显式固定 `paimon-codegen-loader`、`paimon-format` 等未 fork 模块为 `1.3.2`，或发布经证明的完整闭包</td></tr>
   <tr><td>Required</td><td>Factory rollback 采用普通逆序 close；DDL 等待自身 WRITER lease；fatal write error 被当作 STOP proof</td><td>Factory 使用固定安全偏序和 staged ownership；DDL 持有现有 WRITER/DDL_ONLY lease并只等其他 borrower；fatal write只 sticky-fence，只有真实 STOP/DDL/FACTORY_ROLLBACK 能建立 proof</td></tr>
@@ -113,17 +113,18 @@ v5 以本地 Paimon `1.3.2` source JAR、Hadoop `3.3.6` source JAR、Connector �
 
 ### 0.7 Markdown 图表兼容约定
 
-- Mermaid fenced block只使用保守语法：`graph`、`sequenceDiagram`、`stateDiagram-v2`、显式节点ID和引号包裹的label；不使用HTML`<br/>`、未转义的复杂表达式或超大单图。
-- 每个规范性时序图、所有权架构图、状态机和DDL流程图后都提供纯Markdown表格/`text` fallback；查看器不支持Mermaid时，fallback仍是完整规范，不依赖图片附件。
-- Mermaid图与fallback必须在同一次变更中同步；发生冲突时，以紧邻图后的Markdown表格/编号流程及正文不变量为准。
+- Mermaid fenced block只使用保守语法：`graph`、`sequenceDiagram`、显式节点ID和引号包裹的label；不使用HTML`<br/>`、未转义的复杂表达式或超大单图。状态机也使用`graph`表达，兼容不支持`stateDiagram-v2`的旧Markdown渲染器。
+- 每个规范性时序图、所有权架构图、状态机和DDL流程图同时提供三种表示：Mermaid源码、同目录`assets/`下的静态SVG预览、纯Markdown表格或`text` fallback。查看器不支持Mermaid时仍可显示SVG；查看器禁用SVG时fallback仍是完整规范。
+- Mermaid源码、静态SVG与fallback必须在同一次变更中同步，并用Mermaid CLI解析全部图；发生冲突时，以紧邻图后的Markdown表格/编号流程及正文不变量为准。
 
 ### 0.8 当前实施事实
 
-- Paimon fork：`codex/spill-lifecycle-root-fix`，基线为 `c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`。
-- `f70e5267e`、`98a18ab81`、`60044a2a7` 已新增并加固 `StructuredIterator`及escaping wrapper failure retention；旧 `sequentialBatchedExecute` 与 `randomlyExecuteSequentialReturn` JVM descriptor 保持不变，新 API 以 `*Structured` 方法 additive 提供。
-- `8307184b0`、`844bc1d1b` 已用 RED/GREEN 修复 `SemaphoredDelegatingExecutor` 在 interrupt/rejection 下的 permit accounting，避免 structured submission 无法形成可靠 termination ticket。
-- `0d9bb4a23` 已暴露 structured manifest operation，`41957490b` 已收口 `FileEntry` manifest read owner，`67655eb9a` 已让 `IncrementalDeltaStartingScanner` drain structured operation；Task 3A/3B仍需按调用点清单关闭剩余consumer。
-- 上述提交只证明对应 API/Common/Core 局部切片已落地；maintenance、其余consumer、Core capability、制品闭包与 Connector 接入仍按 Plan 分阶段完成，不得提前宣称根治完成。
+- Paimon fork：`codex/spill-lifecycle-root-fix`，基线为`c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`，当前冻结HEAD为`cdd41cd50`。
+- `f70e5267e`至`60ab3ee5f`已交付additive `StructuredIterator`、accepted-runnable ticket、escaping failure retention，并迁移manifest/file-operation、scan、append compaction、Flink/Spark planner等生产consumer；旧JVM descriptor保持不变。
+- `343476768`至`cdd41cd50`已交付显式async reader禁用、structured commit maintenance、strict spill cleanup、GlobalIndex/RocksDB cleanup、owned Hadoop raw FS、Core capability、artifact graph闭包与exact maintenance interruption evidence。
+- Connector分支`codex/paimon-spill-lifecycle-spec-v5`已完成runtime capability gate、async-safe runtime table、maintenance adapter、owned compaction runtime、resource coordinator骨架、exact close model、sequential bootstrap、prepared-writer binding、strict spill cleanup与Task 24 write-resource lifecycle；Task 24聚焦联合回归为42/42。
+- Task 24的`CLOSED_SUCCESS`只证明generation-local writer/maintenance/committer/IO/spill已安全关闭。physical lease已从该lifecycle API、snapshot和测试中移除；Task 25A/25B/25C将分别交付exact ownership carrier、Factory typed construction envelope及bootstrap/preflight retained handoff，随后才进入Context/Service生产接入。
+- 当前仍不得宣称全Spec根治完成：Factory、Context、Service STOP/read/DDL/global barrier与actual Catalog-owned Hadoop FileIO集成，以及real-spill/E2E/发布门禁仍按Plan待完成。
 
 ## 1. Objective
 
@@ -226,6 +227,8 @@ sequenceDiagram
     IO->>FS: open the channel file
     FS-->>T: ENOENT because parent directory is missing
 ```
+
+![当前故障竞态时序](assets/current-spill-cleanup-race.svg)
 
 纯 Markdown 等价时序：
 
@@ -478,32 +481,36 @@ v2 只等待外层 Compaction、maintenance、stream executor，仍不能证明�
 规范性调用流程如下：
 
 ```mermaid
-sequenceDiagram
-    participant R as Read resource scope
-    participant O as Structured iterator
-    participant P as Static child pool
-    participant C as Global cleanup gate
-    R->>O: Register handle before it escapes
-    O->>P: Submit wrapped child tasks and tickets
-    R->>O: Consume zero, one, or all results
-    R->>O: Call closeAndDrain in finally
-    O->>P: Wait for every runnable-returned ticket
-    P-->>O: Return result and aggregated failures
-    O-->>R: Publish drained outcome and restore interrupt
-    R-->>C: Unregister only after exact close succeeds
-    Note over R,C: FAILED_DRAINED or close failure blocks cleanup
+graph TD
+    A["Lexical read boundary creates structured operation"] --> B["Submit wrapped child tasks"]
+    B --> C["Create one completion ticket per accepted task"]
+    C --> D["Return exact handle to lexical boundary"]
+    D --> E["Register handle in read scope before publication"]
+    E --> F["Caller consumes zero one or all results"]
+    F --> G["Read scope calls closeAndDrain in finally"]
+    G --> H{"Every accepted runnable has returned"}
+    H -->|No| I["Keep waiting on completion tickets"]
+    I --> H
+    H -->|Yes| J["Aggregate first failure and suppressed failures"]
+    J --> K["Restore caller interrupt status after drain"]
+    K --> L{"Structured outcome"}
+    L -->|SUCCESS| M["Exact-unregister handle from read scope"]
+    M --> N["Global cleanup may re-evaluate barrier"]
+    L -->|FAILED_DRAINED| O["Retain exact scope and block global cleanup"]
 ```
+
+![Structured operation规范性调用流程](assets/structured-operation-call-flow.svg)
 
 不支持 Mermaid 的 Markdown 查看器使用下表；它与上图是同一个规范性合同：
 
 | 顺序 | Owner | 动作 | 完成条件 |
 |---:|---|---|---|
-| 1 | Read scope | 在 structured handle 逃逸前登记所有权 | handle 已进入 active read registry |
-| 2 | Structured operation | 提交 child wrapper 与 completion ticket | 每个已提交任务都有 ticket |
-| 3 | Caller | 消费 0、1 或全部结果 | 消费数量不改变 close 义务 |
-| 4 | Read scope | 在 `finally` 调用 `closeAndDrain()` | 所有 runnable-returned ticket 已完成 |
-| 5 | Structured operation | 聚合 first failure、suppressed failure，并恢复 interrupt flag | outcome 为 `SUCCESS` 或携带错误的 `FAILED_DRAINED` |
-| 6 | Read scope | exact-close 后注销 borrower | 仅完整成功允许继续 global cleanup；其他结果保持阻断 |
+| 1 | Structured operation | 提交 child wrapper，并为每个已接受任务创建 completion ticket | handle持有全部accepted-task ticket；提交失败也不能丢失已接受任务 |
+| 2 | Lexical read boundary | 接收exact handle；在向调用方发布前登记到read scope | handle已进入active read registry；登记失败则由lexical owner同步drain，不得逃逸 |
+| 3 | Caller | 消费0、1或全部结果 | 消费数量不改变close义务；Future的`done/cancelled`不是runnable-returned证明 |
+| 4 | Read scope | 在`finally`调用`closeAndDrain()` | 即使业务异常、early-stop或caller interrupt也必须继续等待全部ticket |
+| 5 | Structured operation | 所有accepted runnable返回后聚合first failure与suppressed failure，再恢复interrupt flag | outcome为`SUCCESS`或携带错误的`FAILED_DRAINED`；保留原始`InterruptedException`证据 |
+| 6 | Read scope | 仅`SUCCESS`后exact-unregister borrower | `FAILED_DRAINED`或scope close failure保留exact handle并阻断global cleanup |
 
 `GlobalIndexAssigner` 的必修范围有精确源码依据：字段声明在 [`bootstrapKeys/bootstrapRecords` lines 91-92](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L91-L92)，初始化在 [`open` lines 169-180](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L169-L180)。`endBoostrap()`（上游 typo）在 [`199-205`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L199-L205) 委托 public `endBoostrapWithoutEmit()`；后者在 [`207-241`，尤其 232-233](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L207-L241) 清理 `bootstrapKeys`，并经 bulk-load 分支 [`320-340`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L320-L340) 或返回 iterator 的 `close()` [`381-417`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L381-L417) 清理 `bootstrapRecords`。原版 [`close` lines 275-285](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L275-L285) 只关 state factory/RocksDB 并删除 RocksDB path，不清理上述 bootstrap buffers；因此 Connector staged ownership 与 Core null-safe/idempotent cleanup 必须同时交付。
 
@@ -675,7 +682,7 @@ Service logical map 与 JVM static registry 都只能用 expected lease/token co
 
 有 Context 时，DDL 使用并校验其 WRITER lease；无本地 Context但物理表存在时，DDL 必须先原子获取 DDL_ONLY lease。若 static registry 已有另一 Service writer 或 retained factory generation，action count 必须为 0。
 
-Context `CLOSED_SUCCESS` 后才能 expected-remove；physical lease继续持有到 action与 unconditional cache invalidation/guard cleanup完成。action成功后 exact-release；action抛错时在 coordinator短临界区把来源为 WRITER或DDL_ONLY的 lease原子转移为 `RetainedDdlActionLease`，由 sticky-fenced Service最终 STOP在确认无 borrower后释放，或随 JVM restart消失。action未开始、marker尚未成功发布时不得释放。
+Context `CLOSED_SUCCESS` 后才能 expected-remove；physical lease继续持有到 action与 unconditional cache invalidation/guard cleanup完成。action与cleanup均成功后才exact-release；action或cleanup任一失败时，在coordinator短临界区把来源为WRITER或DDL_ONLY的lease原子转移为`RetainedDdlActionLease`，由sticky-fenced Service最终STOP在确认无borrower后释放，或随JVM restart消失。action未开始、marker尚未成功发布时不得释放。
 
 ### INV-10：提交语义隔离
 
@@ -727,7 +734,11 @@ stream scope 的 executor 在 graceful await timeout 后可按现有语义 `shut
 - active read scope 与 retained read-scope registry 均为空；
 - published Context map 与 retained-generation registry 均不存在可能的 borrower；
 - 所有已移除 generation 都已 `CLOSED_SUCCESS`；
+- 本Service的active generation ownership carrier、active DDL action scope与ownership transfer-in-progress registry均为空；Context expected-remove本身不删除carrier；
+- 以`serviceOwnerId`读取的physical lease registry线性化快照中，不存在本Service拥有的`WRITER`、`DDL_ONLY`或retained slot；禁止用JVM-global registry `isEmpty()`，否则会错误阻断同ClassLoader中的其他Service；
 - 所有 `RetainedDdlActionLease` 已在 STOP 的安全终态 exact-release；marker 必须携带原始 lease purpose=`WRITER | DDL_ONLY`、完整 exact token 和 action outcome。
+
+Context expected-remove、lease exact-release/transfer、retained marker publication与barrier-visible carrier更新必须组成一个无ownership gap的线性化transition。compare-remove失败或transfer失败时，必须先保持或发布active/retained carrier，再允许barrier取快照；禁止出现Context、marker与carrier同时为空但static slot仍属于本Service的窗口。
 
 任一 Context 处于 termination waiting、dependency/IO retained failure 或 Factory/preflight retained rollback 时，不得关闭/null Catalog/FileIO，也不得 `clear()` Context/lease/marker map。两类结果必须严格分开：
 
@@ -769,46 +780,43 @@ Connector不拥有Hadoop static cache container，也不能覆盖同一ClassLoad
 
 ```mermaid
 graph TD
-    SL["PaimonServiceLifecycle"] -->|STOP proof| Q["PaimonWriteQuiescence"]
-    TL["Per-table lock and draining guard"] -->|DDL proof| Q
-    CG["Factory construction envelope"] -->|FACTORY_ROLLBACK proof| Q
-
     S["PaimonService"] --> RC["PaimonServiceResourceCoordinator"]
-    RC -->|owns exact generation| L["PhysicalTableWriterLease"]
-    RC -->|publishes expected instance| C["PaimonTableWriteContext"]
+    RC --> OC["Active scenario ownership carriers"]
+    OC -->|owns exact generation| L["PhysicalTableWriterLease"]
+    RC -->|owns published generation| C["PaimonTableWriteContext"]
     RC -->|retains unsafe outcomes| RR["Retained generation registry"]
+    RC --> DA["Active DDL action ownership scopes"]
+    RC --> TX["Ownership transfer-in-progress registry"]
     RC -->|tracks borrowers| RS["Read scopes and table borrows"]
     RC --> TG["Per-table DDL read gate"]
     RC --> GB["Service global resource barrier"]
 
     S --> HF["Catalog-owned HadoopFileIO"]
     HF -.->|does not own cache container| HC["Hadoop static cache"]
-    CG --> RT["Runtime table with async reader disabled"]
-    RS --> RT
-    RT --> KB["Sequential index bootstrap"]
+    HF -->|owns exact raw handles| RH["Owned raw Hadoop FileSystem entries"]
     C -->|delegates close| R["PaimonWriteResourceLifecycle"]
-    Q --> R
 
     R --> CR["PaimonCompactionRuntime"]
     R --> W["Writer strategy and TableWriteImpl"]
     R --> M["TableCommit maintenance handle"]
+    R --> CM["StreamTableCommitter"]
     R --> IO["IOManager"]
-    R --> SP["Spill owner lock"]
+    R --> SP["Exact spill registration capability"]
 
     CR -->|bind before first use| W
-    RT -->|runtime table copy| W
     W -->|foreground and compaction spill| IO
-    M -->|maintenance| TS["Table storage"]
-    KB -->|synchronous readers| TS
-    GB -->|close only after full success| TS
-    HF --> TS
-    RS -->|read operations| TS
+    OC -.->|non-empty blocks| GB
+    DA -.->|non-empty blocks| GB
+    TX -.->|non-empty blocks| GB
+    L -.->|service-scoped slot must be absent| GB
+    GB -->|authorizes Catalog and FileIO close| HF
     IO -->|owns| D["paimon-io generation directory"]
 
-    R -.->|CLOSED_SUCCESS| C
-    C -.->|expected remove| RC
-    RC -.->|scenario-safe release| L
+    R -.->|publishes resource-close outcome| C
+    C -.->|outer scenario finalizes ownership| RC
 ```
+
+![Paimon Service与writer generation所有权架构](assets/ownership-architecture.svg)
 
 纯 Markdown 所有权视图：
 
@@ -816,6 +824,9 @@ graph TD
 PaimonService
 ├─ PaimonServiceResourceCoordinator
 │  ├─ PhysicalTableWriterLease
+│  ├─ active scenario ownership carrier
+│  ├─ active DDL action ownership scope
+│  ├─ ownership transfer-in-progress registry
 │  ├─ active/retained generation registry
 │  ├─ read scope + per-table borrow registry
 │  ├─ DDL read gate
@@ -828,25 +839,92 @@ PaimonService
       ├─ PaimonCompactionRuntime
       ├─ writer strategy / TableWriteImpl
       ├─ TableCommit maintenance handle
+      ├─ StreamTableCommitter
       ├─ IOManager
-      └─ spill owner lock and paimon-io generation directory
+      └─ exact spill registration capability and paimon-io generation directory
 
-Close permission:
+Resource-close permission:
 quiescence proof -> compaction TERMINATED -> writer success
 -> maintenance SUCCESS -> committer success -> IO close
--> spill unregister -> exact lease release -> global barrier
+-> spill unregister -> resource CLOSED_SUCCESS
+
+Scenario ownership finalization:
+- STOP: expected-remove Context -> exact-release WRITER lease
+- DDL: expected-remove Context + atomically transfer the same lease to DDL action scope
+       -> action -> unconditional invalidation/guard cleanup
+       -> exact-release on success or RetainedDdlActionLease on failure
+- FACTORY: SAFE_ROLLBACK releases; RETAINED transfers lease and handles to retained marker
 ```
 
-所有权被明确拆成五层：
+#### 6.1.1 Write resource关闭偏序
+
+```mermaid
+graph TD
+    A["Validate exact STOP DDL or FACTORY_ROLLBACK proof"] --> B["Initiate compaction shutdown exactly once"]
+    B --> C["Await shutdown-step completion within caller deadline"]
+    C --> D["Prove compaction executor TERMINATED"]
+    D --> E["Close writer exactly once"]
+    E --> F["Close and drain commit maintenance"]
+    F --> G["Close independent committer exactly once"]
+    G --> H{"Writer maintenance and committer all succeeded"}
+    H -->|No| R["Publish terminal retained outcome"]
+    H -->|Yes| I["Close IOManager exactly once"]
+    I --> J{"IO close succeeded"}
+    J -->|No| R
+    J -->|Yes| K["Exact-unregister spill owner"]
+    K --> L{"Spill unregister succeeded"}
+    L -->|No| R
+    L -->|Yes| O["Publish resource CLOSED_SUCCESS"]
+```
+
+![Write resource close固定偏序](assets/write-resource-close-order.svg)
+
+#### 6.1.2 Scenario-specific ownership finalization
+
+```mermaid
+graph TD
+    OC["Active scenario ownership carrier"] --> O["Resource CLOSED_SUCCESS"]
+    O --> P{"Initiating scenario"}
+    P -->|STOP| S1["Coordinator expected-removes Context"]
+    S1 --> S2["Exact-release WRITER lease"]
+    S2 --> SX{"Lease compare-remove succeeded"}
+    SX -->|Yes| S3["Remove active carrier"]
+    SX -->|No| SR["Publish retained ownership carrier without registry gap"]
+    P -->|DDL| D0["Publish transfer-in-progress in carrier"]
+    D0 --> D1["Atomically expected-remove Context and transfer same lease to DDL action scope"]
+    D1 --> D2["Execute synchronous DDL action"]
+    D2 --> D3["Run unconditional cache invalidation and guard cleanup"]
+    D3 --> D4{"DDL action and cleanup succeeded"}
+    D4 -->|Yes| D5["Exact-release DDL action lease"]
+    D4 -->|No| D6["Publish RetainedDdlActionLease without registry gap"]
+    P -->|FACTORY_ROLLBACK| F1{"Construction rollback is SAFE"}
+    F1 -->|Yes| F2["Exact-release unpublished generation lease"]
+    F1 -->|No| F3["Transfer lease and handles to retained generation marker"]
+    S3 --> Q["Global barrier may re-evaluate only when carriers and this Service lease slots are empty"]
+    D5 --> DX{"Lease compare-remove succeeded"}
+    DX -->|Yes| D7["Remove DDL action carrier"]
+    DX -->|No| D6
+    D7 --> Q
+    F2 --> FX{"Lease compare-remove succeeded"}
+    FX -->|Yes| F4["Remove construction carrier"]
+    FX -->|No| F3
+    F4 --> Q
+```
+
+![STOP DDL与Factory场景化lease处理](assets/scenario-lease-finalization.svg)
+
+write resource偏序中的任一步失败只发布一次sticky retained结果；未知部分关闭不得在进程内重试。`CLOSED_SUCCESS`仅证明generation-local write资源已关闭，不表示physical lease已释放，也不授权global barrier。`DDL` deadline/interrupt只把同一operation置为deferred，`STOP`只加入该operation；`FACTORY_ROLLBACK`不能被加入。`STOP`等待slice到期只轮转，不能把“等待时间已过”当成termination proof。
+
+所有权被明确拆成六层：
 
 1. `PaimonRuntimeTableFactory` 创建显式禁用 static async reader的不落盘 table copy；`PaimonSequentialIndexBootstrap` 在 construction scope内同步拥有当前 split reader/batch，不创建 outer executor，并依赖 patched static manifest scope完成 structured drain；
 2. `PaimonCompactionRuntime` 只拥有 injected executor；
-3. `PaimonWriteResourceLifecycle` 拥有 writer、committer、IOManager、spill lease 和一次性 close progress；
+3. `PaimonWriteResourceLifecycle` 拥有 writer、committer、IOManager、exact spill registration capability 和一次性 close progress；这里的 spill capability 仅用于注销本 generation 的 spill owner，不是 physical-table lease；
 4. `PaimonServiceResourceCoordinator` 拥有 physical-table generation lease、Context map、retained-generation/DDL-action registry、active/retained read-scope registry、per-table DDL read gate 与 Catalog/FileIO global barrier；
 5. patched `HadoopFileIO`拥有由本Service创建的exact raw FS handles；Hadoop static cache container位于所有权边界外，但exact close可移除自己的unique entry；
 6. `PaimonService` 只保留 PDK ingress、业务 flush/callback、Catalog DDL action 与 coordinator orchestration，不再直接实现资源状态机。
 
-物理表 lease 不属于 IO/spill lifecycle，因为 DDL 必须在资源已关闭后继续持有它跨越 action。
+物理表lease的所有权不属于IO/spill lifecycle。coordinator或construction envelope始终持有exact lease；通用write lifecycle既不持有release callback，也不在snapshot中发布虚假的`lease=SUCCEEDED`。DDL action必须跨越资源关闭继续持有同一token，因此Context expected-remove与lease owner transfer必须在coordinator短临界区原子完成，不能由通用IO cleanup提前释放。
 
 ### 6.2 `PaimonServiceResourceCoordinator` 与锁契约
 
@@ -1005,7 +1083,7 @@ Factory 使用 `PaimonPreparedWriterRuntime` 形成显式类型边界：只有�
 - 不释放 physical lease；
 - 不注销 spill owner；
 - 抛出 `PaimonContextCreationFailure`，携带 generation、exact lease、`SAFE_ROLLBACK | RETAINED_RESTART_REQUIRED`、resource snapshot；
-- Service 在 `retainedWriteGenerations` 保存 `PaimonRetainedWriteGeneration` 强引用 marker，包含 resource lifecycle、spill lease、physical lease 和原始 failure；
+- Service 在 `retainedWriteGenerations` 保存 `PaimonRetainedWriteGeneration` 强引用 marker，包含 resource lifecycle、exact spill registration capability、physical-table lease 和原始 failure；二者是不同 ownership domain，不得用同一个“lease”概念合并；
 - Service sticky-fence；
 - 要求 Engine/JVM restart；
 - 测试必须让未来任何在 publication 前提交 Compaction 的改动失败。
@@ -1047,33 +1125,30 @@ factoryUnpublished?
 ### 6.9 Close 状态机
 
 ```mermaid
-stateDiagram-v2
-    [*] --> OPEN
-    OPEN --> QUIESCING: valid proof / fence ingress
-    QUIESCING --> SHUTDOWN_REQUESTED: graceful shutdown once
-    SHUTDOWN_REQUESTED --> WAITING_COMPACTION
-    WAITING_COMPACTION --> WAITING_COMPACTION: STOP worker slice elapsed / rotate
-    WAITING_COMPACTION --> CLOSE_DEFERRED_TERMINATION: DDL deadline or caller interrupt
-    WAITING_COMPACTION --> FACTORY_ROLLBACK_RETAINED: Factory interrupt or non-termination
-    CLOSE_DEFERRED_TERMINATION --> WAITING_COMPACTION: STOP joins DDL operation
-    WAITING_COMPACTION --> COMPACTION_TERMINATED: awaitTermination true
-    COMPACTION_TERMINATED --> CLOSING_WRITER
-    CLOSING_WRITER --> WAITING_COMMIT_MAINTENANCE: writer recorded / maintenance graceful shutdown once
-    WAITING_COMMIT_MAINTENANCE --> WAITING_COMMIT_MAINTENANCE: STOP worker slice elapsed / rotate
-    WAITING_COMMIT_MAINTENANCE --> CLOSE_DEFERRED_TERMINATION: DDL deadline or caller interrupt
-    WAITING_COMMIT_MAINTENANCE --> FACTORY_ROLLBACK_RETAINED: Factory interrupt or non-termination
-    CLOSE_DEFERRED_TERMINATION --> WAITING_COMMIT_MAINTENANCE: STOP joins DDL operation at maintenance phase
-    WAITING_COMMIT_MAINTENANCE --> CLOSING_COMMITTER: parent and child drained, record outcome
-    CLOSING_COMMITTER --> EVALUATING_DEPENDENCIES: committer returned, record success or failure
-    EVALUATING_DEPENDENCIES --> DEPENDENCY_CLOSE_FAILED_RETAINED: any dependency failed or maintenance not successful
-    EVALUATING_DEPENDENCIES --> CLOSING_IO: writer + maintenance + committer all succeeded
-    CLOSING_IO --> IO_CLOSE_FAILED_RETAINED: IOManager close failed
-    CLOSING_IO --> CLOSED_SUCCESS: IO close and spill unregister succeeded
-    CLOSED_SUCCESS --> [*]
-    FACTORY_ROLLBACK_RETAINED --> [*]
-    DEPENDENCY_CLOSE_FAILED_RETAINED --> [*]
-    IO_CLOSE_FAILED_RETAINED --> [*]
+graph TD
+    OPEN["OPEN"] -->|valid proof and ingress fence| QUIESCING["QUIESCING"]
+    QUIESCING -->|graceful shutdown exactly once| WC["WAITING_COMPACTION"]
+    WC -->|STOP slice elapsed then rotate| WC
+    WC -->|DDL deadline or caller interrupt| DEF["CLOSE_DEFERRED_TERMINATION"]
+    WC -->|Factory interrupt or non-termination| FR["FACTORY_ROLLBACK_RETAINED"]
+    DEF -->|STOP joins original operation| WC
+    WC -->|executor reports TERMINATED| WR["CLOSING_WRITER"]
+    WR -->|writer outcome recorded| WM["WAITING_COMMIT_MAINTENANCE"]
+    WM -->|STOP slice elapsed then rotate| WM
+    WM -->|DDL deadline or caller interrupt| DEF
+    WM -->|Factory interrupt or non-termination| FR
+    DEF -->|STOP resumes deferred maintenance phase| WM
+    WM -->|parent and structured children drained| CM["CLOSING_COMMITTER"]
+    CM --> EV{"Writer maintenance and committer succeeded"}
+    EV -->|No| DR["DEPENDENCY_CLOSE_FAILED_RETAINED"]
+    EV -->|Yes| IO["CLOSING_IO"]
+    IO -->|IO close failed| IR["IO_CLOSE_FAILED_RETAINED"]
+    IO -->|IO close succeeded| SP["UNREGISTERING_SPILL"]
+    SP -->|exact unregister failed| DR
+    SP -->|exact unregister succeeded| OK["RESOURCE_CLOSED_SUCCESS"]
 ```
+
+![Write resource close状态机](assets/write-resource-close-state-machine.svg)
 
 纯 Markdown 状态摘要：
 
@@ -1083,7 +1158,7 @@ stateDiagram-v2
 | `CLOSE_DEFERRED_TERMINATION` | 只允许内部 STOP 加入原 operation | 普通 DDL 重试、IO close、lease release |
 | `FAILED_DRAINED` | 记录原业务错误；可尝试尚未调用且独立的 committer close | 不得进入 IO close 分支 |
 | `DEPENDENCY_CLOSE_FAILED_RETAINED` / `IO_CLOSE_FAILED_RETAINED` | 保留 exact handle 与 sticky failure，等待 restart | 同进程重试未知部分 close |
-| `CLOSED_SUCCESS` | expected-remove、spill unregister、lease release | 无 |
+| `RESOURCE_CLOSED_SUCCESS`（代码状态仍名为`CLOSED_SUCCESS`） | 允许外层coordinator/envelope执行scenario-specific Context/lease ownership transition | 不得据此声称physical lease已释放或直接授权global barrier |
 
 该图描述 resource operation，不描述 STOP caller outcome。STOP caller deadline/interrupt 不改变 resource state；daemon worker 继续，slice 到期只轮转。`CLOSE_DEFERRED_TERMINATION` 仅表示同步 DDL caller 已停止等待，没有隐式后台 worker，必须由后续内部 STOP join。Factory rollback 不能 join，interrupt/non-termination 直接 retained。`DEPENDENCY_CLOSE_FAILED_RETAINED` 和 `IO_CLOSE_FAILED_RETAINED` 是进程内 terminal failure。
 
@@ -1106,7 +1181,8 @@ validated foreground proof
   -> evaluate Compaction + writer + maintenance + committer outcomes
   -> only when all are successful and maintainError == null: IOManager.close exactly once
   -> unregister spill owner only after IO close success
-  -> release exact physical lease only after spill unregister success
+  -> publish resource CLOSED_SUCCESS after spill unregister success
+  -> return outcome to the coordinator or construction envelope; no physical lease action here
 ```
 
 现有 writer/committer adapter 在 delegate close 前标记 closed，因此一旦 delegate 抛错就不能安全重试。v2 不用第二次 no-op 掩盖第一次失败；它保存原始 failure 和 progress。
@@ -1136,10 +1212,10 @@ STOP：
 6. callback 已开始时不 interrupt；close worker 上 callback 重入调用 `close()` 必须保留当前 self-worker fast return，不能等待自己；
 7. stop-drain/callback 阶段结束、active consumer=0 后，snapshot exact Context + lease并创建 STOP proof；
 8. 对所有 Context 先调用 `beginClose(STOP proof)` 和 graceful `beginCompactionShutdown()`，再开始任何 await；
-9. close worker 用 bounded-slice round-robin 等待各 executor。表 A Compaction 永久卡住时，只要表 B 的 dependency close 不阻塞，B 必须完成 writer → maintenance → committer → IO → lease release；
+9. close worker 用 bounded-slice round-robin 等待各 executor。表 A Compaction 永久卡住时，只要表 B 的 dependency close 不阻塞，B 必须完成 writer → maintenance → committer → IO → spill unregister；随后表B的外层STOP ownership finalizer可执行Context expected-remove与exact lease release；
 10. v1 不隔离第三方 writer/committer/IO close 的永久阻塞；若某个已终止 generation 的 dependency close 自身卡死，单 worker 可能延迟后续表，不创建无上限 per-table threads；
 11. PDK caller 的 30 秒 absolute deadline同时控制 caller wait 和 **新 callback consumer admission**，但不 interrupt resource close worker，也不授权 unsafe delete；worker 使用独立 bounded slice，不复用已经过期的 caller deadline作为 cleanup 终止条件；
-12. Context `CLOSED_SUCCESS` 后才 expected-remove并 exact-release其 lease；read child由 resource owner exact-close，parent只在全部 child和stream executor成功后 expected-remove；
+12. Context resource `CLOSED_SUCCESS` 后才允许expected-remove。STOP在expected-remove成功后exact-release WRITER lease；DDL在同一短临界区expected-remove并把同一lease转入DDL action scope，action及unconditional cleanup完成后才release或转为retained；Factory由construction envelope按SAFE/RETAINED分类处理。read child由resource owner exact-close，parent只在全部child和stream executor成功后expected-remove；
 13. 所有table generation/read scope、maintenance与patched manifest/file child scope成功且Service-global barrier成立后才关闭Catalog/FileIO及其Service-owned raw FS handles并发布CLOSED；绝不枚举或broad-close Hadoop static cache container，exact raw close只处理自己的unique entry；dependency/IO/construction/read/static-child terminal retained时保留强引用并发布`CLOSED_WITH_RETAINED_RESOURCES`；仍在termination waiting时operation/daemon worker保持active，绝不能提前发布CLOSED或无条件clear/null。
 
 中断语义按调用场景区分：
@@ -1173,10 +1249,12 @@ graph TD
     AD -->|Expired| AX["Retain fence and lease; STOP or restart before explicit retry"]
     AD -->|Admitted or disabled| M["Execute synchronous DDL action"]
     M --> N["Invalidate caches and clear guards in finally"]
-    N --> O{"DDL action succeeded?"}
+    N --> O{"DDL action and unconditional cleanup succeeded?"}
     O -->|Yes| P["Release lease and read fence; run eligible callbacks"]
-    O -->|No| Q["Publish RetainedDdlActionLease; keep read fence; callback count is zero"]
+    O -->|No| Q["Publish RetainedDdlActionLease without registry gap; keep read fence; callback count is zero"]
 ```
+
+![DDL资源关闭与action编排](assets/ddl-resource-orchestration.svg)
 
 纯 Markdown DDL 流程：
 
@@ -1186,7 +1264,7 @@ graph TD
 4. 有 Context 时 flush/commit，并用 DDL proof 关闭 expected generation；任一 barrier 失败都保留 Context、spill 与 exact lease。
 5. 在 action 前执行一次最终 admission check；deadline 已过则保持 deferred，只有内部 STOP 可加入原 operation。
 6. action 一旦开始就同步等待结果，不因随后越过 deadline 而强制中断。
-7. success/exception 都在 `finally` 执行 cache/guard cleanup；成功时释放 lease/fence，失败时原子转移到 `RetainedDdlActionLease`。
+7. success/exception都在`finally`执行cache/guard cleanup；只有action与unconditional cleanup均成功时才释放lease/fence，任一失败都无缝原子转移到`RetainedDdlActionLease`。
 
 DDL 细则：
 
@@ -1199,11 +1277,11 @@ DDL 细则：
 - 目标表不存在时保持当前 drop/clear 的 idempotent no-op 语义，不创建虚假的 lease；
 - deadline 在 action admission 前到期，或 DDL caller interrupt：action 零执行，callback 零执行，expected Context 与 lease 保留，Context 继续 fenced；DDL 没有隐式后台 worker；interrupt 路径在完成 fencing 后恢复 caller flag；用户必须 STOP/restart 后显式重试该 DDL；
 - DDL 不在 caller 返回后自动执行 action；sticky failure 会拒绝后续普通 DDL，只有 Service `close()` 可以通过内部 FAILED→STOPPING cleanup transition 按 join matrix 加入同一 resource operation；用户必须在任务/Engine restart 后显式重试业务 DDL；
-- Context close成功后才 expected-remove；lease继续跨越 action。若 action失败，coordinator在同一短临界区把来源为 WRITER或DDL_ONLY的 exact lease转移给统一 `RetainedDdlActionLease`，禁止先 release再publish marker；
+- Context close成功后才expected-remove；lease继续跨越action与unconditional cleanup。若action或cache invalidation/guard cleanup任一失败，coordinator在同一短临界区把来源为WRITER或DDL_ONLY的exact lease转移给统一`RetainedDdlActionLease`，禁止先release再publish marker；
 - cache invalidation、writer-derived-state cleanup、dynamic ingress guard cleanup 保持当前 finally 语义；
-- teardown 或 DDL action 失败会先记录 lifecycle firstFailure；随后 callback admission 返回 null。因此已 commit reservation 保留、offset 不 acknowledge，不能写成失败后仍执行 callback；
-- DDL action 成功且 callback admission 仍允许时才执行 ready callbacks；
-- DDL action抛错时记录 sticky failure并重新抛出原异常；cache/guard cleanup后保留 `RetainedDdlActionLease`和table read fence，最终 STOP在无 borrower条件下 exact-release；
+- teardown、DDL action或unconditional cleanup失败会记录sticky firstFailure；随后callback admission返回null。因此已commit reservation保留、offset不acknowledge，不能写成失败后仍执行callback；
+- DDL action与unconditional cleanup均成功且callback admission仍允许时才执行ready callbacks；
+- DDL action或cleanup抛错时保留first failure并重新抛出，其他错误作为suppressed；原子保留`RetainedDdlActionLease`和table read fence，最终STOP在无borrower条件下exact-release；
 - 不调用 `prepareCommit(true)`。
 
 ### 6.13 表锁后的二次 ingress fence
@@ -1216,13 +1294,14 @@ DDL success 后没有 sticky failure，已排队 DML 可以在 guard 移除后�
 
 现有 `cleanupAllResources` 必须拆为三个阶段：
 
-1. table-generation cleanup：drain、termination barriers、dependency/IO close、expected map/lease release；
+1. table-generation cleanup：drain、termination barriers、dependency/IO/spill close；resource success后由外层场景原子执行expected map removal与lease release/transfer；
 2. read-scope cleanup：fence new parent/child、request resource owners stop、join close operation、正向等待 local executor；STOP不得代替 owner关闭 batch/reader；
 3. global cleanup：只有`canCloseGlobalResources()`为true才关闭Catalog、Catalog FileIO和patched`HadoopFileIO`明确拥有的exact raw FS handles；禁止枚举/broad-close Hadoop static cache，允许exact raw close移除自己的unique entry。
 
-`canCloseGlobalResources()` 必须检查 Context map、retained-generation registry、所有 `RetainedDdlActionLease`、read parent/child、patched static-child scope和所有 close outcome，禁止：
+`canCloseGlobalResources()` 必须在线性化快照中检查Context map、retained-generation registry、active scenario ownership carrier、DDL action scope、ownership transfer-in-progress、所有`RetainedDdlActionLease`、read parent/child、patched static-child scope、所有close outcome，以及按`serviceOwnerId`筛选的physical lease slots，禁止：
 
 - active/retained read-scope registry 非空时继续；
+- 本Service任一active/retained ownership carrier、DDL action scope、transfer-in-progress或physical lease slot非空时继续；不得使用JVM-global physical registry为空作为条件；
 
 - `tableWriteContexts.clear()`；
 - broad loop 无条件 unregister physical owner；
@@ -1583,7 +1662,7 @@ Runtime exact monotonic `submissionObserved` 必须覆盖 `execute`、全部 `su
 - STOP drain failure 或 caller deadline 赢得 callback-start fence时 callback count=0、reservation retained、offset unacknowledged；
 - callback 正常执行及 callback 内重入 `close()` 不发生 self-wait；
 - STOP 在所有 Context 上先 graceful shutdown，再开始等待；
-- 表 A Compaction 永久卡住、表 B dependency close 不阻塞时，B 完成 writer → maintenance → committer → IO → lease；
+- 表A Compaction永久卡住、表B dependency close不阻塞时，B完成writer → maintenance → committer → IO → spill；随后仅表B的外层场景ownership finalizer可处理lease；
 - 表 A executor 已终止但 writer.close 被 latch 卡住时，v1 不承诺 B cleanup 公平；释放 latch 后最终完成；
 - PDK caller 30 秒 absolute budget 到期后再释放 Compaction latch，证明 daemon worker用独立 bounded slice继续，不按表重置 caller deadline；
 - DDL 自己持 ingress 时不会等待全局 ingress=0；
@@ -1632,7 +1711,7 @@ Runtime exact monotonic `submissionObserved` 必须覆盖 `execute`、全部 `su
 4. worker 被 latch 阻塞时触发 STOP 或 DDL；
 5. 断言 manager 目录仍存在，IO close count=0，DDL action count=0；
 6. 释放 latch并等待真实 executor TERMINATED；
-7. 断言 writer/committer/IO/lease 严格按序完成；
+7. 断言writer/maintenance/committer/IO/spill严格按序完成；Service场景测试另行断言resource `CLOSED_SUCCESS`后才按STOP/DDL/FACTORY规则finalize lease；
 8. 日志中不出现 `.channel (No such file or directory)`。
 
 该测试不能依靠“刚好在 compaction 中 stop”的概率时序。
@@ -1701,14 +1780,14 @@ mvn -pl connectors/paimon-plus-connector -am \
   <tr><td>场景</td><td>后续允许动作</td><td>IO/spill</td><td>physical lease</td><td>结果</td></tr>
   <tr><td>正常 STOP</td><td>所有 barrier 成功后 dependency close</td><td>close/delete/unregister</td><td>Context expected-remove 后 release</td><td>CLOSED_SUCCESS</td></tr>
   <tr><td>正常 DDL</td><td>Context close → expected-remove → action → invalidation</td><td>action 前已安全删除</td><td>action + invalidation 后 release</td><td>DDL result</td></tr>
-  <tr><td>无本地 Context DDL</td><td>获取 DDL_ONLY lease 后 action</td><td>无 Context spill</td><td>success 后 release</td><td>DDL result</td></tr>
+  <tr><td>无本地 Context DDL</td><td>获取 DDL_ONLY lease 后 action与unconditional cleanup</td><td>无 Context spill</td><td>action + cleanup均success后release</td><td>DDL result</td></tr>
   <tr><td>DDL 目标表存在 active read child</td><td>fence 新 borrower，request/join 目标 child；deadline 前未 exact-close 则 action=0</td><td>Catalog/FileIO 保留</td><td>保留</td><td>DDL_READ_BORROWER_TIMEOUT_RETAINED</td></tr>
   <tr><td>Future cancelled，worker 仍运行</td><td>不视为 proof，继续 await</td><td>保留</td><td>保留</td><td>resource state 仍 WAITING</td></tr>
   <tr><td>Static child sibling 未返回，或lazy iterator消费0/1条后尚未drain</td><td>父task/Future失败或普通iterator放弃都不视为drain；read scope执行/继续`closeAndDrain()`</td><td>Catalog/FileIO保留</td><td>保留</td><td>active WAITING / CLOSE_DEFERRED_TERMINATION，不发布terminal retained</td></tr>
   <tr><td>Patched Core capability 缺失/制品混版</td><td>构建或 Service 初始化 fail-fast，不创建 writer/read</td><td>无新资源</td><td>不获取</td><td>PAIMON_PATCHED_CORE_CAPABILITY_MISSING</td></tr>
   <tr><td>STOP worker Compaction/maintenance slice 到期</td><td>round-robin 轮转后继续同一 operation</td><td>保留</td><td>保留</td><td>active WAITING，不发布 CLOSED</td></tr>
   <tr><td>DDL action-admission deadline 在 action 前赢</td><td>拒绝 ingress；action/callback=0；只允许后续内部 STOP join，restart后显式重试</td><td>保留</td><td>保留</td><td>CLOSE_DEFERRED_TERMINATION</td></tr>
-  <tr><td>DDL action 已通过最后 admission</td><td>不因随后越过 deadline 而 interrupt/伪报零执行；等待同步 action success/failure</td><td>按 action outcome</td><td>跨 action/invalidation持有</td><td>DDL result</td></tr>
+  <tr><td>DDL action 已通过最后 admission</td><td>不因随后越过 deadline 而 interrupt/伪报零执行；等待同步 action 与 unconditional cleanup outcome</td><td>按 action + cleanup 联合 outcome</td><td>跨 action/invalidation持有</td><td>DDL result</td></tr>
   <tr><td>STOP caller interrupted</td><td>恢复 caller flag；daemon worker 继续</td><td>按 worker outcome</td><td>按 worker outcome</td><td>caller failure + ongoing cleanup</td></tr>
   <tr><td>DDL caller interrupted</td><td>fence 后恢复 flag；action/callback=0；无隐式 worker，只等 STOP join</td><td>保留</td><td>保留</td><td>pending operation</td></tr>
   <tr><td>Factory rollback interrupted/non-terminating</td><td>保存 marker并恢复 flag；不得 publication/join</td><td>保留 owner</td><td>保留</td><td>RETAINED_RESTART_REQUIRED</td></tr>

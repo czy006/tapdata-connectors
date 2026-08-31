@@ -206,21 +206,35 @@
 ### Task 24：实现WriteResourceLifecycle固定偏序
 
 - **依赖**：Task 16、18、19、23。
-- **工作**：validated proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → exact lease release；writer失败仍尝试maintenance与独立committer；未知部分close不重试。
+- **工作**：validated proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → resource `CLOSED_SUCCESS`；writer失败仍尝试maintenance与独立committer；未知部分close不重试。physical lease明确排除在本lifecycle之外，snapshot不得声称lease已释放。
 - **文件（≤3）**：`PaimonWriteResourceLifecycle.java`、lifecycle test、failure-injection fixture。
-- **验收**：1)严格事件偏序且exactly-once；2)FAILED_DRAINED/writer/committer失败IO=0；3)WAITING无terminal发布。
+- **验收**：1)严格事件偏序且exactly-once；2)FAILED_DRAINED/writer/committer失败IO=0；3)WAITING无terminal发布；4)生产字段、构造器、snapshot均不存在physical lease release step。
 
-### Task 25：Factory staged construction与固定rollback
+### Task 25A：建立exact generation ownership与Context carrier
 
-- **依赖**：Task 17、20、22、24。
-- **工作**：每个真实handle创建即登记；使用FACTORY_ROLLBACK proof和固定安全偏序，不做普通逆序close；失败只产生SAFE_ROLLBACK或RETAINED_RESTART_REQUIRED。
+- **依赖**：Task 15、16、24。
+- **工作**：在进入Factory前获取一次physical WRITER lease；用不可伪造的generation capability把lease、resource lifecycle和retained handoff绑定到同一active ownership carrier。resource lifecycle只发布到spill unregister；carrier/coordinator负责STOP release、DDL无缝transfer，construction envelope负责Factory SAFE release/RETAINED handoff。Context expected-remove后carrier仍保持active，直到exact release成功或原子转成DDL action/retained owner；transfer-in-progress是显式barrier状态。
+- **文件（≤5）**：generation ownership carrier、coordinator、`PaimonTableWriteContext.java`、ownership test、Context carrier test。
+- **验收**：1)lifecycle不存在lease release字段/callback/snapshot；2)旧token delayed release不能移除新generation；3)DDL transfer前后registry不存在无owner窗口；4)Context只能接收一次成功publication transfer；5)release compare-remove失败时carrier在同一线性化区转retained，不出现Context/marker/carrier全空窗口。
+
+### Task 25B：Factory construction envelope与typed rollback
+
+- **依赖**：Task 17、20、24、25A。
+- **工作**：每个真实handle创建即登记到construction envelope；使用FACTORY_ROLLBACK proof和固定资源安全偏序，不做普通逆序close。rollback只产生`SAFE_ROLLBACK`或`RETAINED_RESTART_REQUIRED`；只有前者在resource close success后exact-release unpublished lease，后者把同一lease、lifecycle snapshot与强引用移交retained marker。
 - **文件（≤5）**：`PaimonTableWriteContextFactory.java`、construction envelope、creation failure、factory test、rollback fixture。
-- **验收**：1)每个注入点无unregistered handle；2)non-termination不继续IO/delete/release；3)safe rollback完整exact-close。
+- **验收**：1)每个注入点无unregistered handle；2)non-termination或任一close failure不继续IO/delete/release；3)SAFE rollback完整exact-close后lease compare-remove一次；4)成功publication把envelope/lifecycle/lease一次性transfer给Context。
 
-### Task 26：建立Context全生命周期WRITER lease模型
+### Task 25C：bootstrap/preflight retained-handle交接
 
-- **依赖**：Task 25。
-- **工作**：在Factory-created Context及fixture中建立一次physical WRITER lease直到scenario-safe release；write/commit仅operation admission并在表锁后revalidate；close委托统一lifecycle。本Task不宣称所有`PaimonService`入口已激活，Service adoption由Task 28完成。
+- **依赖**：Task 22、25B。
+- **工作**：KEY staged assigner与HASH pollution preflight的open/bootstrap/end/reader/batch/assigner close failure都携带真实强引用和typed phase进入construction envelope；禁止仅suppressed异常后丢失assigner或reader owner。
+- **文件（≤5）**：Key/Hash strategy、preflight、typed retained carrier、fault-injection test。
+- **验收**：1)三个assigner构造故障点及reader/batch close failure均无handle丢失；2)retained分支IO/spill/lease release count=0；3)safe分支保持现有bootstrap/pollution语义。
+
+### Task 26：建立Context全生命周期WRITER lease与operation admission
+
+- **依赖**：Task 25A、25B、25C。
+- **工作**：Factory-created Context接收一次generation ownership carrier；write/commit仅获取operation admission并在表锁后revalidate；close只委托统一resource lifecycle并把outcome交回coordinator，禁止Context自行release physical lease。本Task不宣称所有`PaimonService`入口已激活，Service adoption由Task 28完成。
 - **文件（≤3）**：`PaimonTableWriteContext.java`、context test、context integration test。
 - **验收**：1)write/commit不重复physical acquire/release；2)late DML被二次fence拒绝；3)Context无旁路close。
 
@@ -271,9 +285,9 @@
 ### Task 33：实现Service-global borrower barrier
 
 - **依赖**：Task 15、16、29、30、32。
-- **工作**：统一检查active/retained generation、read parent/child、RetainedDdlActionLease、structured child outcome和scheduler/stream termination；禁止broad clear/null。
+- **工作**：统一检查active/retained generation、read parent/child、active scenario ownership carrier、DDL action scope、ownership transfer-in-progress、RetainedDdlActionLease、structured child outcome和scheduler/stream termination；再按`serviceOwnerId`核验static physical lease registry无本Service的WRITER/DDL_ONLY slot，禁止用JVM-global registry `isEmpty()`误阻塞其他Service，也禁止broad clear/null。
 - **文件（≤4）**：coordinator、`PaimonService.java`、global barrier test、retained registry test。
-- **验收**：1)任一waiting/retained时global close=0；2)全部CLOSED_SUCCESS才exactly-once global close；3)terminal retained发布CLOSED_WITH_RETAINED_RESOURCES且保留handle。
+- **验收**：1)任一waiting/retained/active carrier/DDL action scope/transfer-in-progress时global close=0；2)resource `CLOSED_SUCCESS`、scenario ownership finalization完成且本Service physical lease slot为空后才exactly-once global close；3)terminal retained发布CLOSED_WITH_RETAINED_RESOURCES且保留handle；4)另一Service的slot不阻断本Service安全global close。
 
 ### Task 34：收口actual Hadoop FileIO并删除production反射
 
