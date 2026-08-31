@@ -19,8 +19,10 @@ class PaimonMaintenanceAdapterTest {
     @Test
     void waitingCanRejoinTheSameOpaqueOperation() {
         TableCommitMaintenance lifecycle = mock(TableCommitMaintenance.class);
-        TableCommitMaintenance.Outcome waiting = outcome(TableCommitMaintenance.Status.WAITING, null);
-        TableCommitMaintenance.Outcome success = outcome(TableCommitMaintenance.Status.SUCCESS, null);
+        TableCommitMaintenance.Outcome waiting =
+                outcome(TableCommitMaintenance.Status.WAITING, null, null);
+        TableCommitMaintenance.Outcome success =
+                outcome(TableCommitMaintenance.Status.SUCCESS, null, null);
         when(lifecycle.shutdownAndAwait(1L, TimeUnit.SECONDS))
                 .thenReturn(waiting)
                 .thenReturn(success);
@@ -42,7 +44,7 @@ class PaimonMaintenanceAdapterTest {
         Throwable failure = new IllegalStateException("maintenance");
         TableCommitMaintenance lifecycle = mock(TableCommitMaintenance.class);
         TableCommitMaintenance.Outcome failed =
-                outcome(TableCommitMaintenance.Status.FAILED_DRAINED, failure);
+                outcome(TableCommitMaintenance.Status.FAILED_DRAINED, failure, null);
         when(lifecycle.closeAndDrain()).thenReturn(failed);
 
         PaimonMaintenanceAdapter.Outcome actual =
@@ -53,10 +55,31 @@ class PaimonMaintenanceAdapterTest {
     }
 
     @Test
+    void waitingMustRetainTheExactPaimonInterruption() {
+        InterruptedException interruption = new InterruptedException("maintenance join");
+        TableCommitMaintenance lifecycle = mock(TableCommitMaintenance.class);
+        TableCommitMaintenance.Outcome waiting =
+                outcome(
+                        TableCommitMaintenance.Status.WAITING,
+                        null,
+                        interruption);
+        when(lifecycle.shutdownAndAwait(1L, TimeUnit.SECONDS))
+                .thenReturn(waiting);
+
+        PaimonMaintenanceAdapter.Outcome actual =
+                new PaimonMaintenanceAdapter(lifecycle)
+                        .shutdownAndAwait(1L, TimeUnit.SECONDS);
+
+        assertEquals(PaimonMaintenanceAdapter.Status.WAITING, actual.status());
+        assertNull(actual.failure());
+        assertSame(interruption, actual.interruption());
+    }
+
+    @Test
     void inconsistentOutcomeFailsClosed() {
         TableCommitMaintenance lifecycle = mock(TableCommitMaintenance.class);
         TableCommitMaintenance.Outcome inconsistent =
-                outcome(TableCommitMaintenance.Status.FAILED_DRAINED, null);
+                outcome(TableCommitMaintenance.Status.FAILED_DRAINED, null, null);
         when(lifecycle.closeAndDrain()).thenReturn(inconsistent);
 
         assertThrows(
@@ -65,10 +88,13 @@ class PaimonMaintenanceAdapterTest {
     }
 
     private static TableCommitMaintenance.Outcome outcome(
-            TableCommitMaintenance.Status status, Throwable failure) {
+            TableCommitMaintenance.Status status,
+            Throwable failure,
+            InterruptedException interruption) {
         TableCommitMaintenance.Outcome outcome = mock(TableCommitMaintenance.Outcome.class);
         when(outcome.status()).thenReturn(status);
         when(outcome.failure()).thenReturn(failure);
+        when(outcome.interruption()).thenReturn(interruption);
         return outcome;
     }
 }

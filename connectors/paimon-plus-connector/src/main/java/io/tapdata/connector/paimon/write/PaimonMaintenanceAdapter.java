@@ -17,10 +17,13 @@ public final class PaimonMaintenanceAdapter {
     public static final class Outcome {
         private final Status status;
         private final Throwable failure;
+        private final InterruptedException interruption;
 
-        private Outcome(Status status, Throwable failure) {
+        private Outcome(
+                Status status, Throwable failure, InterruptedException interruption) {
             this.status = status;
             this.failure = failure;
+            this.interruption = interruption;
         }
 
         public Status status() {
@@ -29,6 +32,11 @@ public final class PaimonMaintenanceAdapter {
 
         public Throwable failure() {
             return failure;
+        }
+
+        /** Exact interruption returned by Paimon for a WAITING join, otherwise {@code null}. */
+        public InterruptedException interruption() {
+            return interruption;
         }
     }
 
@@ -52,20 +60,22 @@ public final class PaimonMaintenanceAdapter {
         Objects.requireNonNull(outcome, "maintenance outcome");
         switch (outcome.status()) {
             case SUCCESS:
-                if (outcome.failure() != null) {
-                    throw new IllegalStateException("Successful maintenance carried a failure.");
+                if (outcome.failure() != null || outcome.interruption() != null) {
+                    throw new IllegalStateException(
+                            "Successful maintenance carried failure or interruption evidence.");
                 }
-                return new Outcome(Status.SUCCESS, null);
+                return new Outcome(Status.SUCCESS, null, null);
             case FAILED_DRAINED:
-                if (outcome.failure() == null) {
-                    throw new IllegalStateException("FAILED_DRAINED maintenance lost its failure.");
+                if (outcome.failure() == null || outcome.interruption() != null) {
+                    throw new IllegalStateException(
+                            "FAILED_DRAINED maintenance carried inconsistent evidence.");
                 }
-                return new Outcome(Status.FAILED_DRAINED, outcome.failure());
+                return new Outcome(Status.FAILED_DRAINED, outcome.failure(), null);
             case WAITING:
                 if (outcome.failure() != null) {
                     throw new IllegalStateException("WAITING maintenance carried a failure.");
                 }
-                return new Outcome(Status.WAITING, null);
+                return new Outcome(Status.WAITING, null, outcome.interruption());
             default:
                 throw new IllegalStateException(
                         "Unknown Paimon maintenance outcome: " + outcome.status());
