@@ -1,6 +1,6 @@
 # Spec: Paimon Spill 与异步资源生命周期根治
 
-> - 状态：DRAFT v5，已完成 GLM 报告核验及第四轮 Paimon/Hadoop/Maven 事实审查修正，等待人工评审；本阶段不修改生产代码
+> - 状态：APPROVED FOR PHASED IMPLEMENTATION v5.1；2026-09-01 已授权按 RED/GREEN 和阶段提交实施。Q4 只阻断 DDL action-admission policy 与对应 DDL 验证，不阻断 Paimon structured API、Connector read/global barrier 等非 DDL 工作
 > - 基线分支：`develop`
 > - 基线提交：`3b8e6d982266`
 > - 目标模块：`connectors/paimon-plus-connector`
@@ -17,8 +17,8 @@ v1 的根因方向正确，但不能进入实施：独立审查发现 DDL 提前
 
 v2 已按 correctness、failure semantics、API/compatibility、performance、security/observability 五个维度修正；v3 再对 DDL/read 隔离、Paimon static child、路径安全、可执行测试与量化性能门禁进行对抗审查；v4 对外部审查逐项反证，修正 GlobalIndex、DDL deadline、maintenance outcome 与 Hadoop FS ownership；v5 进一步修正 lazy iterator 提前放弃、Hadoop access probe/single-flight 与 Maven effective-POM 闭包。当前结论是：
 
-- **Spec 可提交人工评审**；
-- **尚未授权或开始生产代码实施**；
+- **Spec 已通过进入分阶段实施所需的架构评审**；
+- **实施已获授权并已在 Paimon fork 开始；Connector 生产接入仍须逐 Task 通过 RED/GREEN 与本 Spec 门禁**；
 - 源码事实可以由不可变 commit 和本地 source JAR 复核；
 - 单次生产事件的实际删除者仍不能仅凭异常后的 `ls` 唯一定责，必须保留 `EXTERNAL_OR_UNATTRIBUTED` 分类。
 
@@ -101,7 +101,7 @@ v5 以本地 Paimon `1.3.2` source JAR、Hadoop `3.3.6` source JAR、Connector �
 
 <table header-row="true" fit-page-width="true">
   <tr><td>级别</td><td>v4 缺口</td><td>v5 规范性修正</td></tr>
-  <tr><td>Critical</td><td>`ThreadPoolUtils` 返回普通 lazy `Iterator/Iterable`；调用方消费 0/1 条后正常放弃时没有 drain 入口</td><td>返回显式 `AutoCloseable` structured operation/iterator；read scope 为唯一 owner，并在 success、failure、early-stop、interrupt 路径执行 `closeAndDrain()`</td></tr>
+  <tr><td>Critical</td><td>`ThreadPoolUtils` 返回普通 lazy `Iterator/Iterable`；调用方消费 0/1 条后正常放弃时没有 drain 入口</td><td>保留旧方法 descriptor，并新增显式 `AutoCloseable` structured operation/iterator API。每个 structured handle 恰有一个 resource owner：跨 read 边界时由 read child scope 接管；不逃逸边界时由 lexical owner eager-drain；所有 success、failure、early-stop、interrupt 路径执行 `closeAndDrain()`</td></tr>
   <tr><td>Critical</td><td>`FileIO.checkAccess` 创建 provisional FileIO、调用 `exists` 后丢失 handle；Hadoop fallback 随后又创建正式实例</td><td>access check 返回并复用同一个已 configure/validate 的 FileIO；无法复用的 provisional 必须 exact-close，rollback close 失败则 fail-fast</td></tr>
   <tr><td>Critical</td><td>`HadoopFileIO#getFileSystem` 的 `get/create/put` 在 owned mode 可并发创建并覆盖 unique raw</td><td>使用 `OwnedFileSystemEntry` single-flight reservation；`close` 与 creation 线性化，losing/late raw exact-close</td></tr>
   <tr><td>Required</td><td>把 `FAILED_DRAINED` 等同于父资源可释放</td><td>`FAILED_DRAINED` 只证明 runnable 已退出；业务失败仍进入 dependency retained。只有 maintenance `SUCCESS`、`maintainError == null`、writer/committer close 都成功时才允许关闭 IO/spill/lease</td></tr>
@@ -116,6 +116,14 @@ v5 以本地 Paimon `1.3.2` source JAR、Hadoop `3.3.6` source JAR、Connector �
 - Mermaid fenced block只使用保守语法：`graph`、`sequenceDiagram`、`stateDiagram-v2`、显式节点ID和引号包裹的label；不使用HTML`<br/>`、未转义的复杂表达式或超大单图。
 - 每个规范性时序图、所有权架构图、状态机和DDL流程图后都提供纯Markdown表格/`text` fallback；查看器不支持Mermaid时，fallback仍是完整规范，不依赖图片附件。
 - Mermaid图与fallback必须在同一次变更中同步；发生冲突时，以紧邻图后的Markdown表格/编号流程及正文不变量为准。
+
+### 0.8 当前实施事实
+
+- Paimon fork：`codex/spill-lifecycle-root-fix`，基线为 `c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`。
+- `f70e5267e`、`98a18ab81`、`60044a2a7` 已新增并加固 `StructuredIterator`及escaping wrapper failure retention；旧 `sequentialBatchedExecute` 与 `randomlyExecuteSequentialReturn` JVM descriptor 保持不变，新 API 以 `*Structured` 方法 additive 提供。
+- `8307184b0`、`844bc1d1b` 已用 RED/GREEN 修复 `SemaphoredDelegatingExecutor` 在 interrupt/rejection 下的 permit accounting，避免 structured submission 无法形成可靠 termination ticket。
+- `0d9bb4a23` 已暴露 structured manifest operation，`41957490b` 已收口 `FileEntry` manifest read owner，`67655eb9a` 已让 `IncrementalDeltaStartingScanner` drain structured operation；Task 3A/3B仍需按调用点清单关闭剩余consumer。
+- 上述提交只证明对应 API/Common/Core 局部切片已落地；maintenance、其余consumer、Core capability、制品闭包与 Connector 接入仍按 Plan 分阶段完成，不得提前宣称根治完成。
 
 ## 1. Objective
 
@@ -458,9 +466,9 @@ v2 只等待外层 Compaction、maintenance、stream executor，仍不能证明�
 
 这个缺口没有 Connector public API 可以观察或 join；把 `scan.manifest.parallelism=1` 或 `file-operation.thread-num=1` 也不是证明。更重要的是，现有 `randomlyExecuteSequentialReturn`/`sequentialBatchedExecute` 只返回普通 `Iterator/Iterable`：即使 child ticket 正确实现，调用方正常消费 0/1 条后提前停止也没有 close/drain入口。因此 v5 将显式 structured operation 纳入 Paimon API/Common/Core shipping unit，而不是 reflection、thread-name polling或等待固定时间：
 
-- `ThreadPoolUtils` 返回 `StructuredIterator<T>`（名称可在实现评审时等价调整），其契约至少是 `Iterator<T> + AutoCloseable`，并显式提供幂等 `closeAndDrain()`；handle持有本次 invocation 的全部 completion ticket，不能只持有尚未消费的 Future；
+- `ThreadPoolUtils` 保留旧方法 descriptor，并以 additive 新方法返回 `StructuredIterator<T>`；其契约至少是 `Iterator<T> + AutoCloseable`，并显式提供幂等 `closeAndDrain()`。handle持有本次 invocation 的全部 completion ticket，不能只持有尚未消费的 Future；
 - 每个已提交 callable/runnable都由 wrapper 在 `finally` 中完成 ticket；Future只承载 result/failure，不承载 runnable termination proof。`closeAndDrain()`在 success、异常、消费 0/1 条后的 early-stop 和 interrupt路径都 drain全部 ticket，保留 first failure + suppressed，drain完成后恢复 interrupt flag；不得用 `cancelled/done` 代替 runnable completion；
-- **ownership固定在调用者 scope**：scan/read返回的 structured iterator必须立即登记到 `PaimonReadResourceScope`，该 scope是唯一 close owner，并在 reader/batch关闭前执行 `closeAndDrain()`。STOP/DDL只能 request/join scope，不能绕过 owner直接 close iterator；
+- **每handle单一owner**：跨scan/read边界返回的structured iterator必须在逃逸前立即登记到对应`PaimonReadResourceScope`，该scope成为该exact handle的唯一close owner，并在reader/batch关闭前执行`closeAndDrain()`；不逃逸当前边界的handle由lexical owner eager-drain。STOP/DDL只能request/join owner operation，不能绕过owner直接close iterator；
 - 如果某个现有调用边界无法向上暴露 structured handle，则必须在该边界返回前 eager drain，不能退回普通 lazy iterator。`randomlyExecuteSequentialReturn`、`sequentialBatchedExecute` 的全部生产调用点都必须枚举审计，不能只验证 manifest、commit、deletion四类已知入口；
 - `FileDeletionBase` 当前 `CompletableFuture.allOf()` 在普通 child failure时会等待全部 child；独立缺口是 caller interrupt可提前退出，以及 multi-error aggregation不足。它必须迁移到同一个 canonical structured drain helper，等待所有 runnable-returned后再恢复 flag；`ManifestReadThreadPool`/`FileOperationThreadPool` 若实现只委托/暴露 pool则不做无依据改写，只补 compatibility tests；
 - `TableCommitImpl` 暴露一次性 maintenance shutdown/await/outcome seam，Connector routine close 使用 graceful shutdown；maintenance outcome或 child drain失败进入 retained；
@@ -499,9 +507,9 @@ sequenceDiagram
 
 `GlobalIndexAssigner` 的必修范围有精确源码依据：字段声明在 [`bootstrapKeys/bootstrapRecords` lines 91-92](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L91-L92)，初始化在 [`open` lines 169-180](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L169-L180)。`endBoostrap()`（上游 typo）在 [`199-205`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L199-L205) 委托 public `endBoostrapWithoutEmit()`；后者在 [`207-241`，尤其 232-233](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L207-L241) 清理 `bootstrapKeys`，并经 bulk-load 分支 [`320-340`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L320-L340) 或返回 iterator 的 `close()` [`381-417`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L381-L417) 清理 `bootstrapRecords`。原版 [`close` lines 275-285](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java#L275-L285) 只关 state factory/RocksDB 并删除 RocksDB path，不清理上述 bootstrap buffers；因此 Connector staged ownership 与 Core null-safe/idempotent cleanup 必须同时交付。
 
-交付依赖必须锁定经过上述回归测试的 patched `paimon-api`、`paimon-common`、`paimon-core` 非 SNAPSHOT 制品（建议版本 `1.3.2-tapdata.1`，最终 Maven coordinates 与 SHA-256 由构建团队在评审门禁中固化）。但版本闭包不能只看三个 JAR：Paimon Core 1.3.2 [`pom.xml` lines 38-112](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/pom.xml#L38-L112) 对Common、codegen-loader、format等使用`${project.version}`；Connector当前`pom.xml:20,53-90`又用单一`paimon.version`控制Core/Common/Format/S3。构建必须生成并归档effective POM，采用“patched stack version + upstream ecosystem version”显式分离：API/Common/Core指向`1.3.2-tapdata.1`，未fork的codegen-loader/format/filesystem plugin等明确固定到upstream`1.3.2`；若无法重写并验证该闭包，才发布经证明必要的完整artifact closure。父POM也必须可解析。若没有该补丁或等价上游版本，或dependency tree出现upstream/patched API/Common/Core混装，Connector构建与启动capability gate都必须fail-fast。禁止Connector复制Core大类、生产反射绕过或在缺失capability时静默回退。补丁应同时提交Apache Paimon upstream，但生产上线不等待upstream release。
+交付依赖必须锁定经过上述回归测试的 patched `paimon-api`、`paimon-common`、`paimon-core` 非 SNAPSHOT 制品（建议版本 `1.3.2-tapdata.1`，最终 Maven coordinates 与 SHA-256 由构建团队在评审门禁中固化）。但版本闭包不能只看三个 JAR：Paimon Core 1.3.2 [`pom.xml` lines 38-112](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/pom.xml#L38-L112) 对Common、codegen-loader、format等使用`${project.version}`；Connector当前`pom.xml:20,53-90`又用单一`paimon.version`控制Core/Common/Format/S3。构建必须生成并归档effective POM，采用“patched stack version + upstream ecosystem version”显式分离：API/Common/Core指向`1.3.2-tapdata.1`，未fork的codegen-loader/format/filesystem plugin等明确固定到upstream`1.3.2`；若无法重写并验证该闭包，才发布经证明必要的完整artifact closure。父POM也必须可解析。若没有该补丁或等价上游版本，或dependency tree出现upstream/patched API/Common/Core混装，Connector构建与启动capability gate都必须fail-fast。禁止Connector复制Core大类、生产反射绕过或在缺失capability时静默回退。upstream提交须另行获得外部发布授权，可并行准备但不阻断Connector根治或本地验证。
 
-static pool 不暴露给 Connector、也不按线程名扫描。安全证明通过 **per invocation structured-child outcome** 向上传播：同步 scan/read可以携带 structured iterator返回，但 read scope必须在释放 reader/batch和注销 borrower前调用 `closeAndDrain()`；无法暴露handle的边界才在返回前eager drain。异步 maintenance由patched `TableCommitImpl`将同一proof纳入maintenance outcome。`PaimonServiceResourceCoordinator`检查的是这些owner operation outcome，不是不可靠的classloader-global executor状态。
+static pool 不暴露给 Connector、也不按线程名扫描。安全证明通过 **per invocation structured-child outcome** 向上传播。每个 structured handle 恰有一个 resource owner：handle 跨 read 边界时，在向调用方发布前原子登记到对应 read child scope；handle 不逃逸当前调用边界时，由该 lexical scope 在返回前 eager-drain。ownership transfer 只能发生一次并记录 exact identity；STOP/DDL 只能 join owner 的 close operation。异步 maintenance由patched `TableCommitImpl`将同一proof纳入maintenance outcome。`PaimonServiceResourceCoordinator`检查的是这些owner operation outcome，不是不可靠的classloader-global executor状态。
 
 ### 3.8 Paimon Flink Connector 的可复用事实与反例
 
@@ -542,6 +550,8 @@ Flink 1.20.1 的 [`StreamTask` lines 157-218](https://github.com/apache/flink/bl
 - 不用 reflection、`Unsafe` 或 catch 后退回隐式 executor；
 - 升级 Paimon 时，方法签名变化必须成为编译失败或显式兼容门禁失败；
 - 不需要“运行时 raw writer 类型不兼容”测试，因为直接调用 `FileStoreTable#newWrite` 的返回类型已经在编译期确定。
+- `ThreadPoolUtils` 不通过修改返回类型替换已有 public static method descriptor；旧 `Iterable`/`Iterator` 方法保持二进制兼容，新 structured API 使用独立方法名。patched consumer 必须迁移到新方法，禁止对 structured handle 调用普通 `.iterator()` 后丢失 owner。
+- ABI 门禁使用 `javap -s` 或等价字节码检查，断言两个旧 descriptor 存在且不变，同时断言新 structured descriptor 存在。
 
 ### 3.10 Hadoop FileSystem wrapper、cache 与关闭所有权
 
@@ -694,7 +704,7 @@ Factory 必须基于原始 `FileStoreTable` 创建只在本 generation/read scop
 
 所有 `PaimonService` stream/batch/count/query 路径必须在 public read operation 入口、任何 `catalog.getTable()` 或其他 Catalog/Table/FileIO 访问之前注册不可伪造的 provisional `PaimonReadResourceScope`，并一次性声明规范化、去重后的请求 `tableKey` 集合。scope admission、STOP 的 new-scope fence 和 per-table DDL read fence 必须在 `PaimonServiceResourceCoordinator` 的同一线性化点完成：admission 先赢则 STOP/目标表 DDL 必须观察对应 borrower；STOP/DDL fence 先赢则 read 必须在首次下游访问前失败。多表 stream 为每个 table 创建独立 child borrow，目标表 DDL 只等待该表 child，不阻塞其他表 reader。TableNotExist、参数校验和 runtime-table 构造失败也必须通过 provisional parent/child 的正常 exact-close 退出，不能形成未跟踪 borrower。
 
-表解析成功后，child borrow 绑定 lifetime-safe runtime table，并跟踪 current batch、reader、scan worker及从Paimon返回的所有 `AutoCloseable` structured iterator/operation；parent scope跟踪stream executor与consumer thread。child状态为 `OPEN -> STOP_REQUESTED -> CLOSING_BY_RESOURCE_OWNER -> CLOSED_SUCCESS | RETAINED`，parent在所有child结束后进入 `WAITING_TERMINATION -> CLOSED_SUCCESS | RETAINED`。每个scope只有一个不可伪造的close operation；创建reader/batch/structured iterator的resource owner负责按“停止消费 → `closeAndDrain()` → batch release → reader close”的顺序exact-close并发布progress，public caller是parent finalizer，STOP/DDL只能request + join，禁止直接double-close。正常消费0/1条后提前停止同样必须进入该finally路径。structured drain、batch release或reader close失败不得只WARN；scope进入terminal retained并保留原异常/handle。
+表解析成功后，child borrow 绑定 lifetime-safe runtime table，并跟踪 current batch、reader、scan worker及从Paimon返回的所有 `AutoCloseable` structured iterator/operation；parent scope跟踪stream executor与consumer thread。child状态为 `OPEN -> STOP_REQUESTED -> CLOSING_BY_RESOURCE_OWNER -> CLOSED_SUCCESS | RETAINED`，parent在所有child结束后进入 `WAITING_TERMINATION -> CLOSED_SUCCESS | RETAINED`。每个scope只有一个不可伪造的close operation；每个 structured handle 也必须绑定一个且仅一个 resource owner。创建 handle 的代码要么在返回前将 exact handle 转交给 read child scope，要么在本 lexical scope eager-drain，禁止无 owner 返回。创建reader/batch/structured iterator的resource owner负责按“停止消费 → `closeAndDrain()` → batch release → reader close”的顺序exact-close并发布progress，public caller是parent finalizer，STOP/DDL只能request + join，禁止直接double-close。正常消费0/1条后提前停止同样必须进入该finally路径。structured drain、batch release或reader close失败不得只WARN；scope进入terminal retained并保留原异常/handle。
 
 stream scope 的 executor 在 graceful await timeout 后可按现有语义 `shutdownNow()`，但必须执行第二次正向 await；未 TERMINATED 时保持 active/retained。Service close 先 fence 新 read scope并请求所有 child 停止；DDL 在持有 table DDL fence 后请求目标表 child 停止并等待其 exact-close，deadline/close failure 时 action count=0、fence 保留。只有所有同步 child 退出、stream executor TERMINATED、reader close成功后，read registry 才允许 expected-remove。caller/STOP/DDL interruption只改变各自 wait outcome，不转移 resource owner，也不把 close progress伪装为成功。
 
@@ -1084,15 +1094,19 @@ completion-driven WAITING 可以无限持续，这是 fail-closed 设计而非�
 关闭顺序：
 
 ```text
-Compaction TERMINATED
+validated foreground proof
+  -> Compaction executor graceful shutdown exactly once
+  -> awaitTermination returns true
+  -> Compaction TERMINATED
   -> writerStrategy.close exactly once; record outcome without short-circuit
   -> patched maintenanceHandle.shutdown gracefully exactly once
   -> await parent TERMINATED and all static child scopes drained
   -> record maintenance SUCCESS / FAILED_DRAINED / WAITING
   -> rawCommitter.close exactly once even if writer close failed
-  -> evaluate writer + committer outcomes
-  -> only when both succeeded: IOManager.close exactly once
+  -> evaluate Compaction + writer + maintenance + committer outcomes
+  -> only when all are successful and maintainError == null: IOManager.close exactly once
   -> unregister spill owner only after IO close success
+  -> release exact physical lease only after spill unregister success
 ```
 
 现有 writer/committer adapter 在 delegate close 前标记 closed，因此一旦 delegate 抛错就不能安全重试。v2 不用第二次 no-op 掩盖第一次失败；它保存原始 failure 和 progress。
@@ -1260,7 +1274,7 @@ DDL success 后没有 sticky failure，已排队 DML 可以在 guard 移除后�
 - **Performance**：每表仍一个惰性 Compaction thread；write/commit热路径只增加常量级 generation/fence读取，不增加目录扫描或长持有全局锁。KEY/HASH bootstrap改为逐 split sequential，大 ORC read禁用 static async reader；必须满足 9.3 的固定 workload和 hard gate，不能只写“灰度观察”。
 - **Termination-wait fairness**：多表先统一 shutdown，再 bounded-slice round-robin；卡住的 Compaction executor 不阻止其他 dependency-close 非阻塞的 generation 完成，v1 不隔离第三方 dependency close 自身的永久阻塞。
 - **Memory**：不缓存 row、CommitMessage 副本或 Compaction 结果；retained terminal failure 为安全性保留必要 resource lifecycle、owner 和 failure 强引用，直到 JVM restart。
-- **Compatibility**：Java 8、patched Paimon `1.3.2-tapdata.1`、无新增非 Paimon三方依赖、无表 schema/持久化 option/stateMap变化；原版1.3.2 capability gate必须失败。
+- **Compatibility**：Connector 模块按 effective POM 的 Java source/target 11 编译；patched Paimon fork继续保持 source/target 1.8 与 Java 8 字节码兼容。验证 Paimon 时可使用受支持的 JDK 11，但不能据此把 Connector 声称为 Java 8 compatible。无新增非 Paimon三方依赖、无表 schema/持久化 option/stateMap变化；原版1.3.2 capability gate必须失败。
 - **Security**：日志不打印记录数据、credentials、完整 table options；table/path字段去除 CR/LF并限制长度。stale cleanup只删除 approved-root直接子目录，NOFOLLOW并复核稳定 identity，防止路径逃逸、symlink swap、log forging与超大日志。
 - **Observability**：按 manager/generation 记录目录级事件，不在每个 channel/spill record 热路径打印 INFO。
 
@@ -1359,7 +1373,7 @@ metrics label只允许低基数枚举；`generationId`、`readOperationId`、tab
   <tr><td>Histogram</td><td>`paimon_read_seconds`</td><td>`operation`</td><td>stream/batch/count/query latency</td></tr>
 </table>
 
-基准必须在相同 commit以外只改变候选 patch、相同 JDK/CPU/heap/磁盘、关闭其他任务的环境运行；每组5次 warmup + 10次测量，报告 P50/P95/P99、records/s、CPU-seconds、peak heap和spill bytes：
+基准对照固定为 Connector `develop@3b8e6d982266e430d825b1309038e84f4645d3ef` + upstream Paimon `1.3.2@c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`；候选固定为当前 Connector/Paimon implementation commit。除候选 patch 外，两组必须使用同一 JDK distribution/version、JVM flags、CPU allocation、heap、direct-memory、磁盘设备/filesystem/mount options、数据生成 seed 和 Paimon/Connector options。Task 0 先归档环境与命令 manifest；Task 37 安装并执行仓库内 benchmark harness。没有 baseline command、candidate command、硬件 manifest 与原始结果时，W1-W4 状态只能是 `NOT_RUN`，不能标记通过。每组5次 warmup + 10次测量，报告 P50/P95/P99、records/s、CPU-seconds、peak heap和spill bytes：
 
 <table header-row="true" fit-page-width="true">
   <tr><td>Workload</td><td>固定维度</td><td>默认发布门禁</td></tr>
@@ -1450,26 +1464,27 @@ src/test/java/io/tapdata/connector/paimon/
 
 ### 10.2 有序实施切片与 traceability
 
-以下是可独立审查的 stacked changes，不是可独立上线的 feature flags。生产包只有 S0-S4全部通过才允许发布；任何中间 slice都不得放宽旧 global cleanup或删除 retained marker。
+以下是可独立审查的 stacked changes，不是可独立上线的 feature flags。生产包只有 S0、S1、S2、S3a、S3b、S4全部通过才允许发布；任何中间 slice都不得放宽旧 global cleanup或删除 retained marker。Q4只阻断S3b，不阻断S3a或S4实施。
 
 <table header-row="true" fit-page-width="true">
   <tr><td>Slice</td><td>依赖 / FR</td><td>主要落点</td><td>测试与事件</td><td>出口门禁</td></tr>
-  <tr><td>S0 Paimon structured async/owned FS</td><td>无；FR-17/20/23</td><td>`StructuredIterator`/`ThreadPoolUtils`、`FileDeletionBase`、`TableCommitImpl`、`KeyValueFileReaderFactory`、`GlobalIndexAssigner`、`FileIO`、`HadoopFileIO`，发布 immutable patched stack及闭合effective POM</td><td>0/1-item early-close sibling latch、maintenance outcome、async-reader disabled、bootstrap-buffer cleanup、probe/single-flight/owned raw FS lifecycle</td><td>Paimon API/Common/Core目标模块测试全绿；effective POM/dependency tree闭合；Connector compatibility test能识别全部 capability，原版1.3.2为RED</td></tr>
+  <tr><td>S0 Paimon structured async/owned FS</td><td>无；FR-17/20/23</td><td>`StructuredIterator`/`ThreadPoolUtils`、`FileDeletionBase`、`TableCommitImpl`、`KeyValueFileReaderFactory`、`GlobalIndexAssigner`、`FileIO`、`HadoopFileIO`，先形成隔离本地仓库可复现的 patched candidate stack及闭合effective POM</td><td>0/1-item early-close sibling latch、maintenance outcome、async-reader disabled、bootstrap-buffer cleanup、probe/single-flight/owned raw FS lifecycle</td><td>Paimon API/Common/Core目标模块测试全绿；effective POM/dependency tree闭合；Connector compatibility test能识别全部 capability，原版1.3.2为RED；远端deploy另受发布授权门禁约束</td></tr>
   <tr><td>S1 Coordinator foundation</td><td>S0；FR-6/8/14/16/21/22</td><td>`PaimonServiceResourceCoordinator`、exact lease、retained registry、spill deletion security、metrics</td><td>ABA、lock-order双向latch、containment/symlink tests；created/retained/delete events</td><td>只建立 fail-closed状态和观察，不切换资源关闭；不存在 broad clear/unregister API</td></tr>
   <tr><td>S2 Write lifecycle root fix</td><td>S1；FR-1..5/10/12</td><td>prepared writer、Compaction runtime、resource lifecycle、staged Factory/GlobalIndex、committer handle</td><td>Runtime/Factory/lifecycle tests和 `PaimonCompactionSpillLifecycleTest`；shutdown/terminated/delete events</td><td>真实 `.channel` RED fixture在旧路径稳定失败、候选路径稳定通过；IO只在完整 write barrier后关闭</td></tr>
-  <tr><td>S3 STOP/DDL orchestration</td><td>S2；FR-7/9/13/19/21</td><td>Service delegation、table read gate、DDL/STOP/callback、RetainedDdlActionLease</td><td>STOP/DDL/read双向latch、callback throws、WRITER/DDL_ONLY transfer；close/DDL events</td><td>目标表reader未关闭时DDL action=0；另一表不阻塞；offset/callback语义回归通过</td></tr>
-  <tr><td>S4 Read/global barrier</td><td>S3；FR-11/14/15/17..20/23</td><td>runtime table、sequential bootstrap、parent/child read scope、global cleanup、移除 Hadoop reflection helper</td><td>manifest/file child drain、reader exact-close、HDFS/S3A ownership、全BucketMode、performance suite；read/bootstrap metrics</td><td>所有 correctness、security、performance和全模块命令通过后才可构建发布包</td></tr>
+  <tr><td>S3a Service/STOP orchestration</td><td>S2；FR-7/13/21</td><td>Service delegation、STOP/callback、fatal write fence</td><td>STOP/read双向latch、callback throws、real-spill STOP；close events</td><td>offset/callback语义回归通过；不依赖Q4</td></tr>
+  <tr><td>S3b DDL orchestration</td><td>S3a + Q4；FR-9/19/21</td><td>table read gate、DDL exact lease、RetainedDdlActionLease</td><td>DDL/read双向latch、WRITER/DDL_ONLY transfer、real-spill DDL；DDL events</td><td>目标表reader/worker未关闭时DDL action=0；另一表不阻塞</td></tr>
+  <tr><td>S4 Read/global barrier</td><td>S3a；FR-11/14/15/17..20/23</td><td>runtime table、sequential bootstrap、parent/child read scope、global cleanup、移除 Hadoop reflection helper</td><td>manifest/file child drain、reader exact-close、HDFS/S3A ownership、全BucketMode、performance suite；read/bootstrap metrics</td><td>非DDL correctness、security、performance和全模块命令通过；最终发布仍需S3b</td></tr>
 </table>
 
-每个 slice 的 change description必须独立说明行为和不足；S0依赖升级单独提交并审阅 Paimon fork changelog/patch与制品 checksum，S1-S4不得夹带无关重构。若 S0 无法交付，允许只提交分析/测试，不允许把 Connector-only workaround标记为根治。
+每个 slice 的 change description必须独立说明行为和不足；S0依赖升级单独提交并审阅 Paimon fork changelog/patch与制品 checksum，S1、S2、S3a、S3b、S4不得夹带无关重构。若 S0 无法交付，允许只提交分析/测试，不允许把 Connector-only workaround标记为根治。
 
 ## 11. Testing Strategy
 
 ### 11.0 Patched Paimon 制品门禁
 
-S0 必须在 Paimon fork 先建立 RED/GREEN 测试，再发布非 SNAPSHOT 制品：
+S0 必须在 Paimon fork 先建立 RED/GREEN 测试，再在隔离空本地 Maven repository 构建/install 非 SNAPSHOT 候选制品：
 
-- `ThreadPoolUtils` 返回显式 `AutoCloseable` structured iterator/operation；分别消费0条、1条和全部结果后调用`closeAndDrain()`。一个child立即失败、一个卡在latch时，close在latch释放前不得返回，释放后抛first failure并保留suppressed；
+- `ThreadPoolUtils` 保留旧 `Iterable`/`Iterator` descriptor并新增显式 `AutoCloseable` structured iterator/operation；分别消费0条、1条和全部结果后调用`closeAndDrain()`。一个child立即失败、一个卡在latch时，close在latch释放前不得返回，释放后抛first failure并保留suppressed；
 - caller 在 child drain 期间被 interrupt 时，先等所有 runnable 返回，再恢复 interrupt flag 并传播结果；
 - `FileDeletionBase` 的 all-of 在中断/子任务失败时不能早退；
 - `TableCommitImpl` 验证 `SUCCESS | FAILED_DRAINED | WAITING`，且 routine close 不 interrupt 正在运行的 maintenance；SYNC/ASYNC 的最后一次 runnable 抛错都写入并在 drain 后观察 `maintainError`，只能返回携带同一 Throwable 的 `FAILED_DRAINED`；
@@ -1487,7 +1502,7 @@ Paimon fork 至少执行：
 mvn -pl paimon-api,paimon-common,paimon-core -am -DskipITs test
 ```
 
-没有这组 GREEN 证据、已发布 coordinates 和 SHA-256，S1-S4 只能作为开发分支，不能生成可上线包。
+没有这组 GREEN 证据、本地可复现 coordinates 和 SHA-256，S1、S2、S3a、S3b、S4只能作为开发分支，不能生成可上线包。远端 deploy 需要独立的 repository URL/id、凭证注入方式和明确发布授权；缺少授权只阻断发布，不阻断本地实现与验证。
 
 ### 11.1 Runtime 确定性并发测试
 
@@ -1719,7 +1734,7 @@ mvn -pl connectors/paimon-plus-connector -am \
 
 ### 13.1 Rollout
 
-1. 完成S0 Paimon fork RED/GREEN，发布非SNAPSHOT patched API/Common/Core stack，归档coordinates、SHA-256、patch diff、effective POM、dependency tree和上游基线commit；未fork ecosystem artifacts显式固定为upstream 1.3.2；
+1. 完成S0 Paimon fork RED/GREEN，在隔离且为空的本地 Maven repository 构建/install 非SNAPSHOT patched API/Common/Core候选，归档coordinates、SHA-256、patch diff、effective POM、dependency tree和上游基线commit；未fork ecosystem artifacts显式固定为upstream 1.3.2；
 2. 完成 Connector TDD 与默认 Surefire 中真实 Paimon deterministic spill test，归档 executed test report；
 3. 在测试环境使用专用本地 spill root，先验证 approved-root/symlink/identity 安全用例；
 4. 执行高频增量写、stream/batch/count/query、stop/restart、drop/truncate/alter并发压测；
@@ -1727,7 +1742,8 @@ mvn -pl connectors/paimon-plus-connector -am \
 6. 验证 `snapshot.expire.execution-mode=SYNC` 与 `ASYNC`，确认 patched maintenance graceful drain和业务 failure outcome；
 7. 完整执行 W1-W4，对 sequential bootstrap、同步 ORC reader、write/read/STOP/DDL 逐项应用第 9.3 节 hard gate；
 8. 灰度单节点，观察 retained failures、termination latency、bootstrap/read latency、spill 残留与重启恢复；
-9. 门禁全部通过后再扩大范围。
+9. 门禁全部通过且获得明确 repository URL/id、凭证注入方式与发布授权后，才执行远端 deploy；凭证不得写入 Spec、manifest、日志或命令记录。没有远端授权只阻断发布，不阻断本地实现和验证；
+10. 远端不可变性、下载后 checksum 与空仓库解析验证通过后再扩大范围。
 
 ### 13.2 回滚
 
@@ -1781,9 +1797,9 @@ mvn -pl connectors/paimon-plus-connector -am \
 8. KEY_DYNAMIC 与 HASH_DYNAMIC preflight 使用 Connector-owned sequential bootstrap；启动性能换取可证明的 reader lifetime，恢复并行必须另行评审。
 9. 所有 Connector read/write使用 patched `file-reader-async-enabled=false` 的不落盘 runtime table copy；原表 option不变，大 ORC读取性能取舍纳入量化门禁。
 10. DDL 先对目标表发布 read fence，再 request/join 该表 active child；timeout 时 action count=0、fence/lease retained，不用可用性换取数据正确性。
-11. Paimon patch与Connector S0-S4是一个shipping unit；没有非SNAPSHOT制品、checksum、effective-POM/dependency-tree闭包、capability gate和回归证据时不发布。
+11. Paimon patch与Connector S0、S1、S2、S3a、S3b、S4是一个shipping unit；没有非SNAPSHOT制品、checksum、effective-POM/dependency-tree闭包、capability gate和回归证据时不发布。
 
-### Q1：是否向 Apache Paimon 提交 upstream 修复？
+### 已决策 Q1：upstream 提交不阻断 Connector 根治
 
 建议并行提交，但 Connector 上线不能依赖上游发布周期。候选上游内容：
 
@@ -1793,11 +1809,11 @@ mvn -pl connectors/paimon-plus-connector -am \
 - `TableCommitImpl` maintenance structured drain/outcome API；
 - `KEY_DYNAMIC` bootstrap `ParallelExecution` 的可等待 termination handle 或结构化同步读取 API。
 
-### Q2：是否需要进程内 quarantine reaper？
+### 已决策 Q2：v1 不引入进程内 quarantine reaper
 
 v1 不需要。STOP worker 已能继续等待 retryable termination；真正需要 reaper 的只剩 dependency/IO close terminal failure，而重复 close 不安全。termination WAITING 即使超过告警阈值也不能凭时间转成 terminal；只发一次升级告警和 restart recommendation，继续持有 operation/resources。只有明确的可恢复协议与 exact resource handle 设计后才能增加。
 
-### Q3：部署环境是否清理 `/tapdata_cache`？
+### 运维调查 Q3：部署环境是否清理 `/tapdata_cache`
 
 上线前必须检查 systemd-tmpfiles、cron、容器 emptyDir/volume 生命周期、磁盘清理 agent 与人工脚本。该调查不阻塞代码根治，但决定是否还需修改部署模板。
 
@@ -1830,7 +1846,7 @@ v1 不需要。STOP worker 已能继续等待 retryable termination；真正需�
 
 ## 18. 人工评审门禁
 
-进入实施计划和 TDD 前，请确认：
+以下架构项已作为实施合同；完成时逐项以代码、测试和制品证据关闭：
 
 - [ ] 同意foreground quiescence + Compaction termination + patched maintenance/static-child structured drain为完整barrier；lazy API返回显式`AutoCloseable` structured iterator/operation，并由read scope执行`closeAndDrain()`；
 - [ ] 同意 Compaction 只使用 graceful `shutdown() + awaitTermination()`，v1 不提供无 Paimon Future handle 的 force-shutdown；
@@ -1856,4 +1872,4 @@ v1 不需要。STOP worker 已能继续等待 retryable termination；真正需�
 - [ ] 同意 `PaimonCompactionSpillLifecycleTest` 使用 `*Test` 命名并由默认 Surefire/CI report 证明实际执行；
 - [ ] 同意不引入 `prepareCommit(true)`，保持提交与 offset 语义；
 - [ ] 同意删除来源保留 `EXTERNAL_OR_UNATTRIBUTED` 分类；
-- [ ] 裁决 Q1-Q4；尤其明确 Q4 的 DDL action-admission deadline是否启用及默认值，不得把建议的30秒写成既定产品行为。
+- [ ] 裁决唯一未决产品问题 Q4：DDL action-admission deadline 是否启用及默认值；不得把建议的30秒写成既定产品行为。Q4 未决只阻断 DDL policy 实现与 DDL-specific release evidence。

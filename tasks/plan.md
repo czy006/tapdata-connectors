@@ -1,12 +1,14 @@
-# Implementation Plan：Paimon Spill 与异步资源生命周期根治（Spec V5）
+# Implementation Plan：Paimon Spill 与异步资源生命周期根治（Spec V5.1）
 
 ## 1. 计划状态
 
-- 阶段：Spec-driven Development Phase 2；当前仅修订 Spec 与实施计划，不授权修改生产代码。
-- 事实源：`connectors/paimon-plus-connector/src/doc/paimon-spill-compaction-lifecycle-root-fix-spec.md`（DRAFT v5）。
-- Connector 基线：当前 `develop`；Paimon 基线：`1.3.2` / upstream commit `c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`；Hadoop 基线：`3.3.6`。
+- 阶段：Phased implementation；2026-09-01 已授权按 Task 的 RED/GREEN、独立 commit 与审查门禁实施。
+- 事实源：`connectors/paimon-plus-connector/src/doc/paimon-spill-compaction-lifecycle-root-fix-spec.md`（APPROVED FOR PHASED IMPLEMENTATION v5.1）。
+- Connector 实施分支：`codex/paimon-spill-lifecycle-spec-v5`，基线 `develop@3b8e6d982266e430d825b1309038e84f4645d3ef`；Paimon 实施分支：`codex/spill-lifecycle-root-fix`，基线 `1.3.2@c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`；Hadoop 基线：`3.3.6`。
 - 现有工作区：保留用户已有 `pom.xml`、`.run/` 和 Connector 文档变更，不覆盖、不清理。
 - 执行约束：严格按 `tasks/todo.md` 的依赖实施；每项最多修改 5 个文件，RED/GREEN 与证据未完成时不得越过门禁。
+
+当前已落地的Paimon切片事实：`f70e5267e`、`98a18ab81`、`60044a2a7`新增并加固additive structured iterator API与escaping wrapper failure retention；`8307184b0`、`844bc1d1b`以RED/GREEN修复`SemaphoredDelegatingExecutor` permit accounting；`0d9bb4a23`、`41957490b`、`67655eb9a`开始迁移manifest、`FileEntry`与incremental scanner consumer。旧`Iterable`/`Iterator` descriptor仍保留。该状态不代表Task 3A/3B调用点全部闭合、maintenance、Core capability、制品闭包或Connector接入完成。
 
 ## 2. 目标与完成定义
 
@@ -14,7 +16,7 @@
 
 完成必须同时满足：
 
-1. Paimon lazy并发API返回显式`AutoCloseable` structured iterator/operation；read scope是唯一owner，所有success/failure/early-stop/interrupt路径执行`closeAndDrain()`。
+1. Paimon以 additive ABI新增显式`AutoCloseable` structured iterator/operation，保留旧`Iterable`/`Iterator` descriptor。每个handle恰有一个owner：跨read边界由read child scope接管，不逃逸边界则由lexical owner eager-drain；所有success/failure/early-stop/interrupt路径执行`closeAndDrain()`。
 2. `FAILED_DRAINED`只证明runnable已退出，不代表业务成功；仅maintenance SUCCESS且无`maintainError`、writer/committer均成功时允许关闭IO/spill/lease。
 3. active termination wait与terminal retained严格分离；前者继续同一operation join，后者不在同进程重试未知部分close。
 4. Factory、STOP、DDL、read和write使用同一proof/lease模型，无逆序close旁路、自等待或伪造proof。
@@ -41,9 +43,10 @@
 
 | 门禁 | 通过条件 | 阻断范围 |
 |---|---|---|
-| G0：DDL产品决策 | 人工裁决Spec Q4：cumulative action-admission deadline及数值，或completion-driven | 仅阻断DDL Task 31及其下游；不阻断Paimon和Connector基础设施 |
+| G0：DDL产品决策 | 人工裁决Spec Q4：cumulative action-admission deadline及数值，或completion-driven | 仅阻断Task 31、DDL-specific验证和最终发布裁决；不阻断Tasks 32–35等非DDL实现 |
 | G1a：Paimon源码基线 | 可写fork、固定commit、模块与source JAR一致、RED fixture可复现 | 阻断Paimon补丁实施；不依赖G0 |
-| G1b：Paimon制品闭包 | patched API/Common/Core、sources、effective POM、dependency tree、SHA-256与capability marker全部可追溯 | 阻断Connector依赖切换和集成 |
+| G1b：Paimon本地制品闭包 | 隔离空本地仓库可解析patched API/Common/Core、sources、effective POM、dependency tree、SHA-256与capability marker | 阻断Connector依赖切换和本地集成 |
+| G1c：远端不可变发布 | 明确repository URL/id、凭证注入方式与发布授权；deploy后下载校验SHA-256且空仓库可解析 | 只阻断发布，不阻断本地实现 |
 | G2：安全中间态 | 不存在旧Connector搭配语义改变但无gate的新内核，或新Connector搭配未修复内核 | 阻断合并、部署与回滚候选 |
 | G3：生命周期证明 | 只有完整success barrier释放IO；WAITING和terminal retained均保持强引用并阻断global cleanup | 阻断STOP/DDL/global cleanup完成 |
 | G4：测试真实执行 | 精确Surefire XML中关键测试`tests > 0`，全模块无filter测试通过 | 阻断发布 |
@@ -52,7 +55,8 @@
 
 ### 5.1 Structured iterator/operation
 
-- API返回`Iterator<T> + AutoCloseable`语义的显式handle，并提供幂等`closeAndDrain()`；handle持有本invocation全部tickets。
+- 保留旧方法descriptor，并以additive新方法返回`Iterator<T> + AutoCloseable`语义的显式handle，提供幂等`closeAndDrain()`；handle持有本invocation全部tickets。
+- 每个handle只有一个resource owner；跨read边界必须在发布前转交read child scope，不逃逸边界则lexical eager-drain，STOP/DDL/其他joiner只能加入owner close operation。
 - ticket只能由child wrapper `finally`完成；Future done/cancelled不是termination proof。
 - read scope在handle逃逸前登记，按“停止消费 → closeAndDrain → batch release → reader close”释放；消费0/1条同样执行。
 - 无法暴露handle的调用边界必须eager drain；禁止回退普通lazy iterator。
@@ -79,7 +83,7 @@ DEPENDENCY_CLOSE_FAILED_RETAINED / IO_CLOSE_FAILED_RETAINED
 ### 5.3 Factory与写路径
 
 - proof reason仅`STOP | DDL | FACTORY_ROLLBACK`；fatal write只设置sticky fence与`failureOrigin=WRITE_PATH`，不能启动或冒充STOP teardown。
-- Factory fixed safety order：proof → compaction TERMINATED → writer → maintenance closeAndDrain → committer → IO → spill unregister → lease release。
+- Factory fixed safety order：proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → lease release。
 - GlobalIndex创建后立即staged-own；只有`endBoostrap`成功才transfer，外部注入对象是`IOManager`且不得被assigner close。
 - Context/generation持有一个全生命周期WRITER physical lease；每次write/commit只获取operation admission并在表锁后revalidate，不重复申请physical lease。
 
@@ -110,14 +114,17 @@ DEPENDENCY_CLOSE_FAILED_RETAINED / IO_CLOSE_FAILED_RETAINED
 graph TD
     G1A["G1a: source baseline"] --> A["Phase A: Paimon structured lifecycle; Tasks 0 and 2-7"]
     A --> B["Phase B: Hadoop ownership and artifacts; Tasks 8-13"]
-    B --> G1B["G1b: immutable artifact closure"]
+    B --> G1B["G1b: reproducible local artifact closure"]
     G1B --> C["Phase C: Connector write lifecycle; Tasks 14-27"]
     C --> D0["Phase D foundation: Service, STOP, and read scope; Tasks 28-30"]
+    D0 --> DREAD["Read integration, global barrier, and Hadoop integration; Tasks 32-34"]
     D0 --> DDL["DDL orchestration; Task 31"]
-    G0{"G0: DDL deadline decision"} -.->|blocks this task and downstream only| DDL
-    DDL --> D1["Read integration, global barrier, and Hadoop integration; Tasks 32-34"]
-    D1 --> E["Phase E: regression, performance, and release; Tasks 35-38"]
+    G0{"G0: DDL deadline decision"} -.->|blocks DDL only| DDL
+    DREAD --> E["Non-DDL regression and performance; Tasks 35-37"]
     E --> G4["G4: executed-test evidence"]
+    DDL --> R["Final release review; Task 38"]
+    G4 --> R
+    G1C{"G1c: remote publish authorization"} -.->|blocks release only| R
 ```
 
 任务级依赖以 [`tasks/todo.md`](todo.md) 每个 Task 的“依赖”字段为规范来源。纯 Markdown 阶段关系如下：
@@ -127,9 +134,10 @@ graph TD
 | A：Paimon structured lifecycle | 0、2–7 | G1a | structured 0/1-item drain、maintenance、async reader、GlobalIndex测试通过 |
 | B：Hadoop ownership与制品 | 8–13 | A | G1b：effective POM、dependency tree、checksum、capability闭合 |
 | C：Connector write lifecycle | 14–27 | G1b | Factory fixed rollback与真实spill测试通过 |
-| D0：Service/STOP/read scope基础 | 28–30 | C | 不依赖G0；完成Service、STOP与read scope owner接入 |
-| D1：DDL与global barrier | 31–34 | D0；Task 31额外依赖G0 | read/DDL/global cleanup/Hadoop实际实例收口 |
-| E：回归与发布 | 35–38 | D | G4：关键Surefire XML中`tests > 0`且全量测试通过 |
+| D0：Service/STOP/read scope基础 | 28–30 | C | 不依赖G0；完成Service/STOP接入与read scope owner模型，四类public read接入留给Task 32 |
+| D1a：read与global barrier | 32–34 | D0；不依赖G0 | read/global cleanup/Hadoop实际实例收口 |
+| D1b：DDL orchestration | 31 | D0 + G0 | DDL exact lease、read fence和policy分支通过 |
+| E：回归与发布 | 35–38 | D1a；Task 38额外依赖D1b与G1c | G4：关键Surefire XML中`tests > 0`且全量测试通过 |
 
 ## 7. 实施阶段与 Checkpoint
 
@@ -140,7 +148,7 @@ graph TD
 
 ### Phase B：Hadoop ownership与制品闭包（Task 8–13）
 
-- 输出：non-owning wrapper、access-probe复用、single-flight owned entry、actual-instance capability、effective-POM闭包及immutable artifacts。
+- 输出：non-owning wrapper、access-probe复用、single-flight owned entry、actual-instance capability、effective-POM闭包及由checksum固定的本地可复现candidate artifacts；远端immutable deploy留到G1c。
 - Checkpoint B：S3A probe只有一个live raw；create/close竞态无lost handle；dependency tree无patched/upstream stack混装。
 
 ### Phase C：Connector写生命周期（Task 14–27）
@@ -150,7 +158,7 @@ graph TD
 
 ### Phase D：Service、read、STOP、DDL与global barrier（Task 28–34）
 
-- 输出：Service adoption、STOP/write failure拆分、read-scope structured ownership、DDL exact lease、global barrier、Hadoop实际实例收口。
+- 输出：Service adoption、STOP/write failure拆分、read-scope structured ownership、global barrier与Hadoop实际实例收口不依赖Q4；DDL exact lease与action-admission policy作为Task 31独立分支。
 - Checkpoint D：read未`closeAndDrain()`时DDL action=0且global close=0；fatal write不触发teardown；production reflection helper彻底删除。
 
 ### Phase E：回归、性能与发布（Task 35–38）
@@ -183,8 +191,8 @@ CI必须保存Surefire XML并断言至少`PaimonCompactionSpillLifecycleTest`、
 
 ## 9. Definition of Done
 
-- [ ] Spec V5 Required语义无回退；G0仅阻断DDL，G1a/G1b无自依赖。
-- [ ] structured iterator/operation由read scope `closeAndDrain()`；0/1-item early-stop、error、interrupt均有latch证据。
+- [ ] Spec V5.1 Required语义无回退；G0仅阻断DDL-specific工作，G1a/G1b无自依赖，G1c只阻断远端发布。
+- [ ] 每个structured iterator/operation有且仅有一个owner；跨read边界由read scope `closeAndDrain()`，非逃逸边界lexical eager-drain；0/1-item early-stop、error、interrupt均有latch证据。
 - [ ] `FAILED_DRAINED`、active WAITING、terminal retained在代码、测试、metrics和Failure Matrix完全一致。
 - [ ] Factory fixed safety order、GlobalIndex staged ownership、write/commit admission与physical lease合同通过。
 - [ ] Hadoop probe/single-flight/close-create、HDFS/S3A/file差异、unique cache membership与禁止reflection通过。
@@ -192,8 +200,8 @@ CI必须保存Surefire XML并断言至少`PaimonCompactionSpillLifecycleTest`、
 - [ ] deterministic real-spill阈值、事件偏序、>=3 runs/readers、无`.channel ENOENT`通过。
 - [ ] 五BucketMode和W1-W4 hard gate通过；默认全模块测试通过且XML证明关键测试实际执行。
 - [ ] 未修改Paimon snapshot/offset/callback/exactly-once边界，未引入`prepareCommit(true)`。
-- [ ] 人工评审批准后才进入编码阶段。
+- [x] 已获分阶段编码授权；每个切片仍须独立RED/GREEN、commit和审查。
 
 ## 10. 尚需人工裁决
 
-仅保留Spec Q4：DDL是否启用cumulative action-admission deadline及默认值。该决策不改变任何安全不变量；未裁决时DDL implementation task保持blocked，其他任务可继续。
+仅保留Spec Q4：DDL是否启用cumulative action-admission deadline及默认值。该决策不改变任何安全不变量；未裁决时Task 31及DDL-specific evidence保持blocked，Tasks 2–30、32–37可继续。Task 38最终发布审查必须同时取得Q4裁决、非DDL门禁证据和远端发布授权。

@@ -1,38 +1,48 @@
-# Tasks：Paimon Spill 与异步资源生命周期根治（Spec V5）
+# Tasks：Paimon Spill 与异步资源生命周期根治（Spec V5.1）
 
-> 状态：待人工评审。当前任务清单不授权修改生产代码。每项最多修改 5 个文件；若源码审计发现超出范围，必须先拆任务并更新 Plan，不能扩大当前任务。
+> 状态：已授权分阶段实施。每项必须先RED、后GREEN、独立commit并通过审查；Q4只阻断Task 31、DDL-specific验证和最终发布裁决。每项最多修改 5 个文件；若源码审计发现超出范围，必须先拆任务并更新 Plan，不能扩大当前任务。
 
 ## Gate 与基线
 
 ### Task 0：固定双仓库源码与RED基线
 
 - **依赖**：无。
-- **工作**：固定Connector/Paimon/Hadoop commit、Java/Maven版本；用`rg`生成`ThreadPoolUtils`全部调用点清单；复现旧路径`.channel ENOENT`、lazy 0/1-item abandon、S3A probe leak和Hadoop first-access race。
+- **工作**：固定Connector/Paimon/Hadoop commit；明确Connector effective Java 11、Paimon source/target 1.8；归档JDK distribution/version、Maven、CPU/核数、内存、heap/direct-memory、磁盘设备/filesystem/mount、数据seed和baseline/candidate命令合同；用`rg`生成`ThreadPoolUtils`全部调用点清单；复现旧路径`.channel ENOENT`、lazy 0/1-item abandon、S3A probe leak和Hadoop first-access race。
 - **文件（≤2）**：仅测试证据/审计清单，不改生产文件。
 - **验收**：1) commit与调用点清单可复查；2) 四类RED fixture稳定复现；3) 不修改生产行为。
 
 ### Task 1：裁决G0 DDL action-admission deadline
 
-- **依赖**：无；只阻断Task 31及其下游。
+- **依赖**：无；只阻断Task 31、DDL-specific验证和Task 38最终发布裁决。
 - **工作**：由产品/运维owner选择cumulative deadline及值，或completion-driven；记录“不interrupt已开始action、timeout不构成termination proof”。
 - **文件（≤3）**：Spec、`tasks/plan.md`、`tasks/todo.md`。
-- **验收**：1) Q4有签字结论；2) failure matrix/metrics/测试期望同步；3) 未裁决不阻断Task 2–30。
+- **验收**：1) Q4有签字结论；2) failure matrix/metrics/测试期望同步；3) 未裁决不阻断Tasks 2–30、32–37。
 
 ## Paimon Fork：structured concurrency
 
 ### Task 2：定义显式AutoCloseable structured operation API
 
 - **依赖**：Task 0 / G1a。
-- **工作**：新增`StructuredIterator<T>`或等价API；`ThreadPoolUtils`返回handle，持有全部tickets；`closeAndDrain()`幂等、first failure + suppressed、中断后恢复flag；ticket仅由wrapper finally完成。
-- **文件（≤4）**：`paimon-api/.../StructuredIterator.java`、`ThreadPoolUtils.java`、`ThreadPoolUtilsTest.java`、API兼容说明。
-- **验收**：1) 消费0/1/all均需显式close；2) sibling latch释放前close不返回；3) error/interrupt聚合与flag符合Spec。
+- **工作**：保留旧`Iterable`/`Iterator`方法descriptor；新增`StructuredIterator<T>`与独立`*Structured`方法；handle持有全部tickets；`closeAndDrain()`幂等、first failure + suppressed、中断后恢复flag；ticket仅由wrapper finally完成。
+- **文件（≤4）**：`paimon-api/.../StructuredIterator.java`、`StructuredIteratorImpl.java`、`ThreadPoolUtils.java`、`ThreadPoolUtilsTest.java`。
+- **验收**：1) 消费0/1/all均需显式close；2) sibling latch释放前close不返回；3) error/interrupt聚合与flag符合Spec；4)`javap -s`证明旧descriptor不变且新structured descriptor存在。
+- **当前事实**：Paimon commits `f70e5267e`、`98a18ab81`、`60044a2a7`已落地；后续consumer迁移不得回改旧descriptor。
+
+### Task 2A：修复structured submission的permit accounting
+
+- **依赖**：Task 2。
+- **工作**：保证`SemaphoredDelegatingExecutor`在caller interrupt、delegate rejection与immediate failed Future下不膨胀或泄漏permit，accepted wrapper仍由`finally`完成ticket。
+- **文件（≤2）**：`SemaphoredDelegatingExecutor.java`、`SemaphoredDelegatingExecutorTest.java`。
+- **当前事实**：RED `8307184b0`，GREEN `844bc1d1b`。
+- **验收**：interrupt/rejection前后permit count不变，无永不完成的structured reservation。
 
 ### Task 3A：迁移manifest lazy主调用链
 
-- **依赖**：Task 2。
+- **依赖**：Task 2、Task 2A。
 - **工作**：让Manifest wrapper、`FileEntry`、`AbstractFileStoreScan`传播structured handle；不能用`.iterator()`丢失owner；无法暴露的边界eager drain。
 - **文件（≤5）**：`ManifestReadThreadPool.java`、`FileEntry.java`、`AbstractFileStoreScan.java`、对应structured scan test、调用点审计清单。
 - **验收**：1) 0/1-item scan early-stop可closeAndDrain；2) parent资源在sibling返回前close count=0；3)本组无普通lazy handle逃逸。
+- **当前事实**：`0d9bb4a23`已暴露structured manifest operation，`41957490b`已收口`FileEntry`；`AbstractFileStoreScan`及本组完整调用点审计未关闭前，Task 3A仍为进行中。
 
 ### Task 3B：迁移其余lazy helper consumer
 
@@ -40,6 +50,7 @@
 - **工作**：迁移`IncrementalDeltaStartingScanner`、`IcebergCommitCallback`、`ListUnexistingFiles`、`LocalOrphanFilesClean`；逐个决定向上暴露handle或边界eager drain。
 - **文件（≤5）**：上述4个生产类、一个参数化structured-consumer test。
 - **验收**：1) Task 0清单除TableCommit专属路径外全部闭合；2) early-stop/error/interrupt无dangling ticket；3)无fixed sleep/thread-name polling。
+- **当前事实**：`67655eb9a`已迁移`IncrementalDeltaStartingScanner`；其余列出的consumer未全部闭合前，Task 3B仍为进行中。
 
 ### Task 4：统一FileDeletion interrupt与多错误drain
 
@@ -53,7 +64,7 @@
 - **依赖**：Task 2、Task 3A、Task 3B。
 - **工作**：以opaque handle提供graceful shutdown/join/outcome；移除所有正常close旁路中的`shutdownNow()`和“先commit.close”；`checkFilesExistence`消费structured handle；drain后统一读取SYNC/ASYNC `maintainError`。
 - **文件（≤4）**：`TableCommitImpl.java`、maintenance handle/outcome类、`TableCommitMaintenanceLifecycleTest.java`、commit-file structured test。
-- **验收**：1) outcome仅SUCCESS/FAILED_DRAINED/WAITING；2)maintainError非空返回同Throwable的FAILED_DRAINED；3)FAILED_DRAINED时IO释放资格为false。
+- **验收**：1) outcome仅SUCCESS/FAILED_DRAINED/WAITING；2)maintainError非空返回同Throwable的FAILED_DRAINED；3)Paimon层只返回稳定outcome和原始Throwable，不声明Connector IO释放资格；FAILED_DRAINED阻断IO的策略由Task 23/24验证。
 
 ### Task 6：显式禁用AsyncRecordReader
 
@@ -106,18 +117,18 @@
 - **文件（≤5）**：Paimon parent/BOM或发布POM、API/Common/Core POM（合计不超过5）。
 - **验收**：1)effective POM无不存在的`1.3.2-tapdata.1` ecosystem坐标；2)dependency tree无upstream/patched stack混装；3)clean repository可解析构建。
 
-### Task 13：发布不可变Paimon修复制品
+### Task 13：构建本地可复现Paimon候选制品
 
 - **依赖**：Task 4、12；本任务完成后形成G1b，不把G1b写成自身前置条件。
-- **工作**：执行模块定向与全量测试；发布binary/sources/POM；归档commit、patch、effective POM、dependency tree、SHA-256和capability manifest。
+- **工作**：执行模块定向与全量测试；在隔离空本地Maven repository执行package/install并验证binary/sources/POM；归档commit、patch、effective POM、dependency tree、SHA-256和capability manifest。不得在本任务执行远端deploy。
 - **文件（≤2）**：release manifest、测试/制品证据索引。
-- **验收**：1)所有坐标非SNAPSHOT且不可变；2)关键XML tests>0；3)从空仓库按manifest可复现。
+- **验收**：1)所有候选坐标非SNAPSHOT，内容由SHA-256固定；2)关键XML tests>0；3)两个独立空本地仓库按manifest得到相同bytes。
 
 ## Connector：基础设施与写生命周期
 
 ### Task 14：Connector依赖拆分与actual-instance启动门禁
 
-- **依赖**：Task 13。
+- **依赖**：Task 13形成的本地G1b；不依赖远端deploy。
 - **工作**：POM拆分patched stack/upstream ecosystem版本并显式patched API；owned option在CatalogContext/createCatalog前设置；capability绑定实际Catalog-owned FileIO/resolved scheme/mode。
 - **文件（≤5）**：Connector `pom.xml`、`PaimonService.java`初始化段、capability gate类、gate test、dependency test。
 - **验收**：1)原版/混版/late opt-in均启动失败且无新资源；2)patched actual instance通过；3)生产gate不使用反射。
@@ -183,12 +194,12 @@
 - **依赖**：Task 5、14。
 - **工作**：Connector消费opaque lifecycle handle，不反射executor；映射SUCCESS/FAILED_DRAINED/WAITING，保留原始Throwable。
 - **文件（≤3）**：maintenance adapter、adapter test、capability integration fixture。
-- **验收**：1)WAITING可同operation继续join；2)FAILED_DRAINED只允许独立committer close且阻断IO；3)未知outcome fail-closed。
+- **验收**：1)WAITING可同operation继续join；2)adapter原样映射FAILED_DRAINED及Throwable，不在adapter层关闭committer或判断IO资格；3)未知outcome fail-closed。
 
 ### Task 24：实现WriteResourceLifecycle固定偏序
 
 - **依赖**：Task 16、18、19、23。
-- **工作**：compaction proof → writer → maintenance closeAndDrain → committer → success判定 → IO/spill/lease；writer失败仍尝试maintenance与独立committer；未知部分close不重试。
+- **工作**：validated proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → exact lease release；writer失败仍尝试maintenance与独立committer；未知部分close不重试。
 - **文件（≤3）**：`PaimonWriteResourceLifecycle.java`、lifecycle test、failure-injection fixture。
 - **验收**：1)严格事件偏序且exactly-once；2)FAILED_DRAINED/writer/committer失败IO=0；3)WAITING无terminal发布。
 
@@ -199,19 +210,19 @@
 - **文件（≤5）**：`PaimonTableWriteContextFactory.java`、construction envelope、creation failure、factory test、rollback fixture。
 - **验收**：1)每个注入点无unregistered handle；2)non-termination不继续IO/delete/release；3)safe rollback完整exact-close。
 
-### Task 26：激活Context全生命周期WRITER lease
+### Task 26：建立Context全生命周期WRITER lease模型
 
 - **依赖**：Task 25。
-- **工作**：Context/generation持有一次physical WRITER lease直到scenario-safe release；write/commit仅operation admission并在表锁后revalidate；close委托统一lifecycle。
+- **工作**：在Factory-created Context及fixture中建立一次physical WRITER lease直到scenario-safe release；write/commit仅operation admission并在表锁后revalidate；close委托统一lifecycle。本Task不宣称所有`PaimonService`入口已激活，Service adoption由Task 28完成。
 - **文件（≤3）**：`PaimonTableWriteContext.java`、context test、context integration test。
 - **验收**：1)write/commit不重复physical acquire/release；2)late DML被二次fence拒绝；3)Context无旁路close。
 
-### Task 27：建立deterministic真实spill回归
+### Task 27：建立deterministic真实spill fixture与Context生命周期回归
 
 - **依赖**：Task 26。
-- **工作**：Surefire `PaimonCompactionSpillLifecycleTest`，threshold=2且输入生成>=3 sorted readers/runs；在delegate createChannel前latch；参数化STOP/DDL。
+- **工作**：建立Surefire `PaimonCompactionSpillLifecycleTest`可复用fixture，threshold=2且输入生成>=3 sorted readers/runs；在delegate createChannel前latch。本Task只验证直接Context lifecycle，不能在Service STOP/DDL尚未接入时声称其通过。
 - **文件（≤3）**：real-spill test、test seam/fixture、Surefire配置（仅需要时）。
-- **验收**：1)阻塞时目录存在、IO close=0、DDL action=0；2)释放后actual TERMINATED且严格偏序；3)无`.channel ENOENT`且>=3 runs/readers有硬断言。
+- **验收**：1)阻塞时目录存在且IO close=0；2)释放后actual TERMINATED且严格偏序；3)无`.channel ENOENT`且>=3 runs/readers有硬断言。
 
 ## Connector：Service、Read、DDL与Global Barrier
 
@@ -224,28 +235,28 @@
 
 ### Task 29：拆分fatal write failure与真实STOP编排
 
-- **依赖**：Task 24、28。
-- **工作**：fatal write只sticky-fence并记录`failureOrigin=WRITE_PATH`；只有真实STOP建立/加入teardown proof；STOP先完成stop-drain/callback admission再snapshot并round-robin join。
+- **依赖**：Task 24、27、28。
+- **工作**：fatal write只sticky-fence并记录`failureOrigin=WRITE_PATH`；只有真实STOP建立/加入teardown proof；STOP先完成stop-drain/callback admission再snapshot并round-robin join；复用Task 27 fixture增加真实spill STOP case。
 - **文件（≤4）**：`PaimonService.java`、service close test、write failure test、STOP concurrency test。
-- **验收**：1)write failure不会启动资源teardown；2)STOP slice timeout保持active WAITING；3)failure/deadline后offset/callback不ack。
+- **验收**：1)write failure不会启动资源teardown；2)STOP slice timeout保持active WAITING；3)failure/deadline后offset/callback不ack；4)real-spill worker阻塞时STOP不关闭IO，释放后严格终止。
 
-### Task 30：实现ReadResourceScope与structured owner
+### Task 30：建立ReadResourceScope与structured owner模型
 
 - **依赖**：Task 2、3A、3B、15、16。
-- **工作**：public read在首次Catalog访问前登记parent/per-table child；resource owner跟踪structured operation、batch、reader、stream executor；按closeAndDrain→batch→reader顺序关闭。
+- **工作**：实现scope/child/owner类型、状态机和确定性fixture；每个structured handle一个owner，按closeAndDrain→batch→reader顺序关闭。四类public read生产接入由Task 32完成。
 - **文件（≤5）**：`PaimonReadResourceScope.java`、table borrow类、scope test、borrow test、structured read fixture。
 - **验收**：1)消费0/1条也drain；2)STOP/DDL只request/join不double-close；3)close failure retained并阻断global cleanup。
 
 ### Task 31：实现DDL exact-lease与read fence编排
 
 - **依赖**：Task 1/G0、16、29、30。
-- **工作**：先fence目标read再join；有Context持WRITER，无Context取DDL_ONLY；不等待自身lease；action前deadline产生active deferred；action failure转移到RetainedDdlActionLease并执行既有finally invalidation/guard cleanup。
+- **工作**：先fence目标read再join；有Context持WRITER，无Context取DDL_ONLY；不等待自身lease；若Q4选择deadline-enabled，使用单一cumulative absolute action-admission deadline并产生active deferred；若选择completion-driven，不以elapsed time产生terminal/force-close。action failure转移到RetainedDdlActionLease并执行既有finally invalidation/guard cleanup；复用Task 27 fixture增加真实spill DDL case。
 - **文件（≤5）**：`PaimonService.java`、`RetainedDdlActionLease.java`、DDL test、read-fence test、lease transfer test。
-- **验收**：1)blocked read时action=0且表B不受影响；2)timeout只允许内部STOP join、普通DDL不可retry；3)action失败callback=0且lease原子转移。
+- **验收**：1)blocked read时action=0且表B不受影响；2)deadline-enabled时超时只允许内部STOP join、普通DDL不可retry；completion-driven时无基于elapsed time的terminal/force-close；3)action失败callback=0且lease原子转移；4)real-spill worker未终止时DDL action=0。
 
 ### Task 32：接入stream/batch/count/query read路径
 
-- **依赖**：Task 20、21、28、30、31。
+- **依赖**：Task 20、21、28、30。
 - **工作**：四类public read在任何Catalog/Table/FileIO访问前注册scope并使用runtime table；所有正常/异常/early-stop路径exact-close；stream force后做第二次positive await。
 - **文件（≤5）**：`PaimonService.java`、read integration test、stream termination test、batch/count/query test、failure fixture。
 - **验收**：1)provisional failure无borrower泄漏；2)stream未TERMINATED不unregister；3)structured operation未drain时Catalog/FileIO close=0。
@@ -268,7 +279,7 @@
 
 ### Task 35：五BucketMode与跨层E2E回归
 
-- **依赖**：Task 22、27、31、32、34。
+- **依赖**：Task 22、27、32、34。
 - **工作**：精确覆盖HASH_FIXED、HASH_DYNAMIC、KEY_DYNAMIC、POSTPONE_MODE、BUCKET_UNAWARE；验证row/bucket/TTL、snapshot/commit/offset/callback/stateMap零变化。
 - **文件（≤5）**：每种模式一个参数化/现有测试文件，合计不超过5。
 - **验收**：1)五模式全部实际执行；2)KEY/HASH dynamic不调用ParallelExecution；3)offset/exactly-once边界无变化。
@@ -283,16 +294,16 @@
 ### Task 37：执行W1-W4性能与部署清理审计
 
 - **依赖**：Task 36。
-- **工作**：执行Spec W1–W4并使用原值判定：W1 throughput≥95%、write P99≤110%、Compaction P95≤120%；W2 P95≤200%且最大集≤300s；W3 throughput≥80%、P99≤125%；W4 termination P99<25s且STOP 30s完成率100%。同时调查tmpfiles/cron/emptyDir/agent/人工脚本。
+- **工作**：先提交可执行benchmark harness和environment collector；用Task 0固定的baseline/candidate commits、同一硬件/JDK/JVM flags/dataset seed分别执行Spec W1–W4并使用原值判定：W1 throughput≥95%、write P99≤110%、Compaction P95≤120%；W2 P95≤200%且最大集≤300s；W3 throughput≥80%、P99≤125%；W4 termination P99<25s且STOP 30s完成率100%。保存完整命令、环境manifest、raw samples和汇总；任一要素缺失则结果为`NOT_RUN`。同时调查tmpfiles/cron/emptyDir/agent/人工脚本。
 - **文件（≤4）**：benchmark harness、结果报告、部署审计清单、回滚阈值文件。
 - **验收**：1)W1-W4每项给出P50/P95/P99及硬判定；2)超阈值即阻断不豁免；3)外部删除源有owner/action plan或EXTERNAL_OR_UNATTRIBUTED结论。
 
 ### Task 38：汇总release evidence并做最终人工审查
 
-- **依赖**：Task 37。
-- **工作**：映射FR→class→test→event→outcome；归档patched coordinates/sources/POM/checksum/dependency tree、failure matrix、性能与rollback说明；逐项复核Spec无语义回退。
+- **依赖**：Task 31、Task 37；Q4只在此重新成为最终发布门禁。
+- **工作**：映射FR→class→test→event→outcome；归档patched coordinates/sources/POM/checksum/dependency tree、failure matrix、性能与rollback说明；逐项复核Spec无语义回退。只有取得明确repository URL/id、凭证注入方式和用户/CI发布授权后才执行远端deploy；凭证只通过外部secret注入，不进入命令记录或manifest；deploy后从空仓库下载并复核checksum。
 - **文件（≤3）**：release manifest、traceability matrix、final review report。
-- **验收**：1)G0–G4全部通过；2)每个Required有代码和测试证据；3)人工批准前不构建可上线包。
+- **验收**：1)G0–G4及远端发布门禁G1c全部通过；2)每个Required有代码和测试证据；3)若未授权远端deploy，代码审查可完成但release状态保持`BLOCKED_NOT_AUTHORIZED`。
 
 ## 全局禁止项
 
