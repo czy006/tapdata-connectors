@@ -83,6 +83,7 @@ DEPENDENCY_CLOSE_FAILED_RETAINED / IO_CLOSE_FAILED_RETAINED
 ### 5.3 Factory与写路径
 
 - proof reason仅`STOP | DDL | FACTORY_ROLLBACK`；fatal write只设置sticky fence与`failureOrigin=WRITE_PATH`，不能启动或冒充STOP teardown。
+- PreparedWriter按两个独立提交闭合：19A通过`FileStoreTable.newWrite(commitUser)`取得具体`TableWriteImpl`并在任何first-use前绑定IO/Compaction；19B迁移最后一个bucket factory测试seam并删除过渡raw overload。19B完成前不得宣称生产raw writer类型边界已经闭合。
 - Factory fixed safety order：proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → lease release。
 - GlobalIndex创建后立即staged-own；只有`endBoostrap`成功才transfer，外部注入对象是`IOManager`且不得被assigner close。
 - Context/generation持有一个全生命周期WRITER physical lease；每次write/commit只获取operation admission并在表锁后revalidate，不重复申请physical lease。

@@ -161,12 +161,19 @@
 - **文件（≤3）**：`PaimonCompactionRuntime.java`、runtime test、executor fixture。
 - **验收**：1)blocked worker时writer/IO close=0；2)shutdown后拒绝late submit；3)TERMINATED事件只在worker实际返回后发布。
 
-### Task 19：建立PreparedWriter类型边界
+### Task 19A：建立PreparedWriter生产类型边界
 
 - **依赖**：Task 18。
-- **工作**：在first write/restore/prepare前注入Compaction executor；strategy factory只接收prepared type；construction scope精确记录submission flag。
-- **文件（≤4）**：prepared runtime类、bucket runtime factory、factory interface、prepared writer test。
-- **验收**：1)生产raw writer不可越过边界；2)五模式编译接入；3)构造期submission计数为0。
+- **工作**：通过具体`TableWriteImpl`在first write/restore/prepare前注入IOManager与Compaction executor；新增prepared holder并让Context Factory只调用prepared strategy入口；construction scope精确记录submission flag。为保持本提交≤4文件，既有bucket factory测试使用的raw overload仅允许暂时降为package-private，不能作为Task 19完成结论。
+- **文件（≤4）**：prepared runtime类、Context Factory、strategy factory、Context Factory test。
+- **验收**：1)Context Factory生产路径不能把raw writer交给strategy factory；2)五模式生产接入；3)构造期submission计数为0；4)保持`newCommit(commitUser).ignoreEmptyCommit(false)`语义。
+
+### Task 19B：关闭最后一个raw strategy factory测试seam
+
+- **依赖**：Task 19A。
+- **工作**：迁移`PaimonBucketWriterStrategyFactoryTest`到prepared holder，并从strategy factory彻底删除package-private raw overload。
+- **文件（≤2）**：strategy factory、strategy factory test。
+- **验收**：1)源码中strategy factory不存在接受raw context/writer的`create`入口；2)五模式测试全部通过；3)生产和测试都只能通过prepared type。
 
 ### Task 20：实现不落盘RuntimeTableFactory
 
