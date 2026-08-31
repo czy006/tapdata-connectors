@@ -39,14 +39,13 @@ import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.WriteListResult;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileSystem;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.*;
 import org.apache.paimon.data.*;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.fs.FileIO;
-import org.apache.paimon.fs.hadoop.HadoopFileIO;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.Schema;
@@ -63,7 +62,6 @@ import org.apache.paimon.utils.SnapshotManager;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.LocalDate;
@@ -333,23 +331,25 @@ public class PaimonService implements AutoCloseable {
 		try {
 			config.validate();
 
-		// Clean up stale paimon-io-* spill dirs left by abnormally terminated JVMs (OOM/crash/SIGKILL),
-		// which would otherwise accumulate and exhaust local disk. Live dirs owned by active sibling
-		// tasks in this JVM are protected and never deleted.
-		cleanupStaleSpillDirs();
+			// Clean up stale paimon-io-* spill dirs left by abnormally terminated JVMs
+			// (OOM/crash/SIGKILL), which would otherwise accumulate and exhaust local disk. Live dirs
+			// owned by active sibling tasks in this JVM are protected and never deleted.
+			cleanupStaleSpillDirs();
 
-		Options options = new Options();
-		options.set("warehouse", config.getFullWarehousePath());
+			Options options = new Options();
+			options.set("warehouse", config.getFullWarehousePath());
+			PaimonRuntimeGate.configureRequiredOptions(options);
 
-		// Configure storage based on type
-		configureStorage(options);
+			// Configure storage based on type
+			configureStorage(options);
 
-		// Create catalog context with Hadoop configuration (for S3A, etc.)
-		Configuration hadoopConf = buildHadoopConfiguration();
-		CatalogContext context = CatalogContext.create(options, hadoopConf);
+			// Create catalog context with Hadoop configuration (for S3A, etc.)
+			Configuration hadoopConf = buildHadoopConfiguration();
+			CatalogContext context = CatalogContext.create(options, hadoopConf);
 
-		// Create catalog
+			// Create and verify the exact catalog-owned runtime before publishing RUNNING.
 			catalog = CatalogFactory.createCatalog(context);
+			PaimonRuntimeGate.verify(catalog, new Path(config.getFullWarehousePath()));
 			lifecycle.publishRunning();
 		} catch (Throwable failure) {
 			recordStickyFailure(failure);
@@ -1633,34 +1633,26 @@ public class PaimonService implements AutoCloseable {
 		// Clear every Connector-owned table-derived cache, matching the single-table DDL path.
 		clearAllTableDerivedCaches();
 
-		// Close old catalog if exists
+		// Close the exact Catalog-owned FileIO. Paimon's FileSystemCatalog.close() is a no-op, so the
+		// Connector remains the lexical owner and must close this handle explicitly.
 		if (catalog != null) {
+			Catalog catalogToClose = catalog;
 			try {
-				if (catalog instanceof CachingCatalog) {
-					CachingCatalog cachingCatalog = (CachingCatalog) catalog;
-					Catalog wrapped = cachingCatalog.wrapped();
-					if (wrapped instanceof FileSystemCatalog) {
-						FileSystemCatalog fileSystemCatalog = (FileSystemCatalog) wrapped;
-						FileIO fileIO = null;
-						try {
-							fileIO = fileSystemCatalog.fileIO();
-						} catch (Throwable fileIoLookupFailure) {
-							failure = appendFailure(failure, fileIoLookupFailure);
-						}
-
-						// Proactively close FileSystem instances cached by HadoopFileIO before FileIO.
-						closeHadoopFileIOCachedFileSystems(fileIO);
-						if (fileIO != null) {
-							try {
-								fileIO.close();
-							} catch (Throwable fileIoCloseFailure) {
-								failure = appendFailure(failure, fileIoCloseFailure);
-							}
-						}
+				FileIO fileIO = null;
+				try {
+					fileIO = PaimonRuntimeGate.catalogFileIO(catalogToClose);
+				} catch (Throwable fileIoLookupFailure) {
+					failure = appendFailure(failure, fileIoLookupFailure);
+				}
+				if (fileIO != null) {
+					try {
+						fileIO.close();
+					} catch (Throwable fileIoCloseFailure) {
+						failure = appendFailure(failure, fileIoCloseFailure);
 					}
 				}
 
-				catalog.close();
+				catalogToClose.close();
 			} catch (Throwable catalogCloseFailure) {
 				failure = appendFailure(failure, catalogCloseFailure);
 			} finally {
@@ -1683,55 +1675,6 @@ public class PaimonService implements AutoCloseable {
 		}
 		if (failure != null) {
 			rethrow(failure);
-		}
-	}
-
-	/**
-	 * Best-effort close for cached Hadoop FileSystem instances inside Paimon HadoopFileIO.
-	 * <p>
-	 * HadoopFileIO may cache FileSystem instances (e.g., in a field named "fsMap"). Even if
-	 * Hadoop global FileSystem cache is disabled, this internal cache can still keep an S3A
-	 * FileSystem whose thread factory captured a Task ThreadGroup that will be destroyed later.
-	 */
-	private void closeHadoopFileIOCachedFileSystems(Object fileIO) {
-		if (!(fileIO instanceof HadoopFileIO)) {
-			return;
-		}
-
-		try {
-			Field fsMapField = fileIO.getClass().getDeclaredField("fsMap");
-			fsMapField.setAccessible(true);
-			Object fsMapObject = fsMapField.get(fileIO);
-			if (!(fsMapObject instanceof Map)) {
-				return;
-			}
-
-			Map<?, ?> fsMap = (Map<?, ?>) fsMapObject;
-			if (fsMap.isEmpty()) {
-				return;
-			}
-
-			// Copy values first to avoid ConcurrentModificationException in case close triggers internal updates.
-			List<Object> fileSystems = new ArrayList<>(fsMap.values());
-			for (Object fs : fileSystems) {
-				if (fs instanceof FileSystem) {
-					try {
-						((FileSystem) fs).close();
-					} catch (Exception ignore) {
-						// Ignore close errors
-					}
-				}
-			}
-
-			try {
-				fsMap.clear();
-			} catch (Exception ignore) {
-				// Ignore clear errors
-			}
-		} catch (NoSuchFieldException ignore) {
-			// HadoopFileIO implementation differs; ignore.
-		} catch (Throwable ignore) {
-			// Best-effort only
 		}
 	}
 
