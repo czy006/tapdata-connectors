@@ -3,6 +3,7 @@ package io.tapdata.connector.paimon.service;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -134,8 +135,8 @@ class PaimonWriteCloseModelTest {
         assertEquals(PaimonWriteCloseModel.DelegateCloseStatus.NOT_ATTEMPTED, io.status());
         assertEquals(0, ioCloseCount.get());
         assertEquals(
-                PaimonWriteCloseModel.CloseState.DEPENDENCY_CLOSE_FAILED_RETAINED,
-                progress.retainedOrClosedState(true, maintenance));
+                PaimonWriteCloseModel.DelegateTerminalEvidence.DEPENDENCY_FAILED_RETAINED,
+                progress.terminalEvidence(true, maintenance));
     }
 
     @Test
@@ -187,8 +188,8 @@ class PaimonWriteCloseModelTest {
         assertSame(ioFailure, second.failure());
         assertEquals(1, ioCloseCount.get());
         assertEquals(
-                PaimonWriteCloseModel.CloseState.IO_CLOSE_FAILED_RETAINED,
-                progress.retainedOrClosedState(
+                PaimonWriteCloseModel.DelegateTerminalEvidence.IO_FAILED_RETAINED,
+                progress.terminalEvidence(
                         true, PaimonWriteCloseModel.MaintenanceOutcome.success()));
     }
 
@@ -200,9 +201,30 @@ class PaimonWriteCloseModelTest {
         assertThrows(
                 IllegalStateException.class,
                 () ->
-                        progress.retainedOrClosedState(
+                        progress.terminalEvidence(
                                 true,
                                 PaimonWriteCloseModel.MaintenanceOutcome.waiting()));
+    }
+
+    @Test
+    void delegateEvidenceCannotMintResourceClosedSuccessBeforeSpillCleanup() {
+        PaimonWriteCloseModel.DelegateCloseProgress progress =
+                new PaimonWriteCloseModel.DelegateCloseProgress();
+        progress.closeWriterOnce(() -> {});
+        progress.closeCommitterOnce(() -> {});
+        progress.closeIoOnceIfSafe(
+                true, PaimonWriteCloseModel.MaintenanceOutcome.success(), () -> {});
+
+        assertEquals(
+                PaimonWriteCloseModel.DelegateTerminalEvidence.IO_CLOSED,
+                progress.terminalEvidence(
+                        true, PaimonWriteCloseModel.MaintenanceOutcome.success()));
+        for (Method method :
+                PaimonWriteCloseModel.DelegateCloseProgress.class.getDeclaredMethods()) {
+            assertFalse(
+                    method.getReturnType() == PaimonWriteCloseModel.CloseState.class,
+                    "dependency-only helper must not mint a resource CloseState: " + method);
+        }
     }
 
     private static PhysicalTableWriterLease lease() {

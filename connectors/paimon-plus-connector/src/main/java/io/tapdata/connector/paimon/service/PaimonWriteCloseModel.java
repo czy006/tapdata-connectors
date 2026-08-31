@@ -67,6 +67,18 @@ public final class PaimonWriteCloseModel {
         FAILED_RETAINED
     }
 
+    /**
+     * Terminal evidence for dependency delegates only.
+     *
+     * <p>{@code IO_CLOSED} deliberately is not a resource {@link CloseState}: the delegate model
+     * cannot observe exact spill unregister and therefore cannot mint {@code CLOSED_SUCCESS}.
+     */
+    public enum DelegateTerminalEvidence {
+        DEPENDENCY_FAILED_RETAINED,
+        IO_FAILED_RETAINED,
+        IO_CLOSED
+    }
+
     public interface CloseAction {
         void close() throws Exception;
     }
@@ -279,7 +291,7 @@ public final class PaimonWriteCloseModel {
             return io;
         }
 
-        public synchronized CloseState retainedOrClosedState(
+        public synchronized DelegateTerminalEvidence terminalEvidence(
                 boolean compactionTerminated, MaintenanceOutcome maintenance) {
             Objects.requireNonNull(maintenance, "maintenance");
             if (!compactionTerminated || maintenance.status() == MaintenanceStatus.WAITING) {
@@ -288,13 +300,13 @@ public final class PaimonWriteCloseModel {
             if (!writer.succeeded()
                     || !committer.succeeded()
                     || maintenance.status() != MaintenanceStatus.SUCCESS) {
-                return CloseState.DEPENDENCY_CLOSE_FAILED_RETAINED;
+                return DelegateTerminalEvidence.DEPENDENCY_FAILED_RETAINED;
             }
             if (io.status() == DelegateCloseStatus.FAILED_RETAINED) {
-                return CloseState.IO_CLOSE_FAILED_RETAINED;
+                return DelegateTerminalEvidence.IO_FAILED_RETAINED;
             }
             if (io.status() == DelegateCloseStatus.SUCCEEDED) {
-                return CloseState.CLOSED_SUCCESS;
+                return DelegateTerminalEvidence.IO_CLOSED;
             }
             throw new IllegalStateException("IO close has not completed");
         }

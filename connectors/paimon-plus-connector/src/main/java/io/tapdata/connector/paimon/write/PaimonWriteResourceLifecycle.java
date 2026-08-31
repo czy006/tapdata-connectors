@@ -571,9 +571,9 @@ final class PaimonWriteResourceLifecycle {
         }
 
         if (!compactionRuntime.terminated()
-                || dependencyProgress.retainedOrClosedState(
+                || dependencyProgress.terminalEvidence(
                                 compactionRuntime.terminated(), maintenanceOutcome)
-                        != PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS) {
+                        != PaimonWriteCloseModel.DelegateTerminalEvidence.IO_CLOSED) {
             operation.retain(
                     retainedDependencyState(operation),
                     new IllegalStateException(
