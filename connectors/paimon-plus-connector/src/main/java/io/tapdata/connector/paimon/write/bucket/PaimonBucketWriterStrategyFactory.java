@@ -1,5 +1,8 @@
 package io.tapdata.connector.paimon.write.bucket;
 
+import io.tapdata.connector.paimon.schema.PaimonWriteSemanticContract;
+import io.tapdata.connector.paimon.write.PaimonPreparedWriterRuntime;
+
 import org.apache.paimon.table.BucketMode;
 
 import java.util.Collections;
@@ -41,12 +44,38 @@ public final class PaimonBucketWriterStrategyFactory {
         return checked == BucketMode.HASH_DYNAMIC || checked == BucketMode.KEY_DYNAMIC;
     }
 
-    public static PaimonBucketWriterStrategy create(PaimonBucketWriterStrategyContext context)
+    /** Production construction entry; an unprepared raw writer cannot cross this boundary. */
+    public static PaimonBucketWriterStrategy create(
+            PaimonPreparedWriterRuntime preparedWriter,
+            String tableKey,
+            String commitUser,
+            PaimonWriteSemanticContract writeSemanticContract,
+            PaimonBucketWriterRuntimeFactory runtimeFactory)
+            throws Exception {
+        Objects.requireNonNull(preparedWriter, "preparedWriter");
+        Objects.requireNonNull(tableKey, "tableKey");
+        Objects.requireNonNull(commitUser, "commitUser");
+        Objects.requireNonNull(writeSemanticContract, "writeSemanticContract");
+        Objects.requireNonNull(runtimeFactory, "runtimeFactory");
+        return create(
+                new PaimonBucketWriterStrategyContext(
+                        tableKey,
+                        preparedWriter.runtimeTable(),
+                        preparedWriter.transferWriterToStrategy(),
+                        commitUser,
+                        preparedWriter.ioManager(),
+                        writeSemanticContract),
+                runtimeFactory);
+    }
+
+    /* Transitional test seam removed by Task 19B after existing strategy tests migrate. */
+    static PaimonBucketWriterStrategy create(PaimonBucketWriterStrategyContext context)
             throws Exception {
         return create(context, DefaultPaimonBucketWriterRuntimeFactory.INSTANCE);
     }
 
-    public static PaimonBucketWriterStrategy create(
+    /* Transitional test seam removed by Task 19B after existing strategy tests migrate. */
+    static PaimonBucketWriterStrategy create(
             PaimonBucketWriterStrategyContext context,
             PaimonBucketWriterRuntimeFactory runtimeFactory)
             throws Exception {

@@ -3,7 +3,6 @@ package io.tapdata.connector.paimon.write;
 import io.tapdata.connector.paimon.write.bucket.DefaultPaimonBucketWriterRuntimeFactory;
 import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterRuntimeFactory;
 import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterStrategy;
-import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterStrategyContext;
 import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterStrategyFactory;
 
 import io.tapdata.connector.paimon.schema.PaimonWriteSemanticContract;
@@ -18,8 +17,7 @@ import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.StreamTableCommit;
-import org.apache.paimon.table.sink.StreamTableWrite;
-import org.apache.paimon.table.sink.StreamWriteBuilder;
+import org.apache.paimon.table.sink.TableWriteImpl;
 
 import java.util.Collections;
 import java.util.List;
@@ -130,14 +128,10 @@ public final class PaimonTableWriteContextFactory {
             throw new IllegalArgumentException(
                     "Paimon write semantic contract mode mismatch for " + tableKey);
         }
-        // Build writer and committer from the same StreamWriteBuilder so both carry one stable
-        // commitUser. Paimon 1.3.2 forwards that user to both newWrite and newCommit; separating
-        // builders/users would break exact-envelope filterAndCommit recovery.
-        // Source: paimon-core/src/main/java/org/apache/paimon/table/sink/
-        // StreamWriteBuilderImpl.java#withCommitUser/#newWrite/#newCommit, lines 64-76.
-        // Baseline: apache/paimon@5c59e6cb01ed0b29563371f56e14fcade4597a2e.
-        StreamWriteBuilder builder =
-                fileStoreTable.newStreamWriteBuilder().withCommitUser(commitUser);
+        // Expand StreamWriteBuilderImpl's two calls so the concrete TableWriteImpl can receive the
+        // connector-owned IO manager and compaction executor before it crosses the prepared type
+        // boundary. newCommit(commitUser).ignoreEmptyCommit(false) preserves the builder's exact
+        // streaming commit semantics. Source: Paimon 1.3.2 StreamWriteBuilderImpl, lines 64-76.
         boolean requiresIoManager =
                 PaimonBucketWriterStrategyFactory.requiresIoManager(fileStoreTable.bucketMode())
                         || fileStoreTable.coreOptions().writeBufferSpillable();
@@ -149,7 +143,8 @@ public final class PaimonTableWriteContextFactory {
 
         IOManager ioManager = null;
         List<String> spillDirs = Collections.emptyList();
-        StreamTableWrite rawWriter = null;
+        TableWriteImpl<?> rawWriter = null;
+        PaimonCompactionRuntime compactionRuntime = null;
         PaimonTableCommitter tableCommitter = null;
         PaimonBucketWriterStrategy writerStrategy = null;
         try {
@@ -158,23 +153,34 @@ public final class PaimonTableWriteContextFactory {
                         PaimonSpillDirCleaner.resolveAndCreateIOManager(configuredTmpDirs);
                 ioManager = built.ioManager();
                 spillDirs = built.spillDirs();
-                rawWriter = (StreamTableWrite) builder.newWrite().withIOManager(ioManager);
-            } else {
-                rawWriter = builder.newWrite();
             }
 
-            StreamTableCommit rawCommitter = builder.newCommit();
+            compactionRuntime =
+                    new PaimonCompactionRuntime(tableKey + "-" + nextCommitIdentifier);
+            rawWriter = fileStoreTable.newWrite(commitUser);
+            PaimonPreparedWriterRuntime preparedWriter =
+                    PaimonPreparedWriterRuntime.bind(
+                            tableKey + "/" + nextCommitIdentifier,
+                            fileStoreTable,
+                            rawWriter,
+                            ioManager,
+                            compactionRuntime);
+
+            StreamTableCommit rawCommitter =
+                    fileStoreTable.newCommit(commitUser).ignoreEmptyCommit(false);
             tableCommitter = new PaimonStreamTableCommitter(rawCommitter);
             writerStrategy =
                     PaimonBucketWriterStrategyFactory.create(
-                            new PaimonBucketWriterStrategyContext(
-                                    tableKey,
-                                    fileStoreTable,
-                                    rawWriter,
-                                    commitUser,
-                                    ioManager,
-                                    writeSemanticContract),
+                            preparedWriter,
+                            tableKey,
+                            commitUser,
+                            writeSemanticContract,
                             runtimeFactory);
+            if (preparedWriter.compactionSubmissionObserved()) {
+                throw new IllegalStateException(
+                        "Paimon compaction was submitted before Context publication for "
+                                + tableKey);
+            }
 
             return new PaimonTableWriteContext(
                     tableKey,
@@ -191,6 +197,11 @@ public final class PaimonTableWriteContextFactory {
                     fileStoreTable.bucketMode() == BucketMode.KEY_DYNAMIC
                             ? PaimonDynamicBucketPollutedException.wrapIfPolluted(tableKey, e)
                             : e;
+            boolean compactionTerminated =
+                    shutdownUnusedCompactionRuntime(compactionRuntime, failure);
+            if (!compactionTerminated) {
+                throw failure;
+            }
             if (writerStrategy != null) {
                 closeSuppressed(writerStrategy, failure);
             }
@@ -219,6 +230,30 @@ public final class PaimonTableWriteContextFactory {
             closeable.close();
         } catch (Exception closeError) {
             original.addSuppressed(closeError);
+        }
+    }
+
+    private static boolean shutdownUnusedCompactionRuntime(
+            PaimonCompactionRuntime runtime, Exception original) {
+        if (runtime == null) {
+            return true;
+        }
+        // Closing admission is mandatory even when an invariant-breaking construction-time
+        // submission was observed. Dependency close is still gated on positive termination, so a
+        // running task can never race writer or IOManager close.
+        runtime.beginShutdown();
+        try {
+            if (runtime.awaitTermination(Long.MAX_VALUE)) {
+                return true;
+            }
+            original.addSuppressed(
+                    new IllegalStateException(
+                            "Unused Paimon compaction runtime did not terminate"));
+            return false;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            original.addSuppressed(interrupted);
+            return false;
         }
     }
 }

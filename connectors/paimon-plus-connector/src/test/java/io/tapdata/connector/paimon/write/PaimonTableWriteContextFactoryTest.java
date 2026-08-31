@@ -1,6 +1,8 @@
 package io.tapdata.connector.paimon.write;
 
 import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterRuntimeFactory;
+import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterStrategy;
+import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterStrategyFactory;
 
 import io.tapdata.connector.paimon.schema.PaimonWriteSemanticContract;
 import io.tapdata.connector.paimon.schema.PaimonWriteSemanticContractResolver;
@@ -15,18 +17,25 @@ import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
-import org.apache.paimon.table.sink.StreamTableCommit;
-import org.apache.paimon.table.sink.StreamTableWrite;
-import org.apache.paimon.table.sink.StreamWriteBuilder;
+import org.apache.paimon.table.sink.TableCommitImpl;
+import org.apache.paimon.table.sink.TableWriteImpl;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
 import java.util.Collections;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -53,6 +62,9 @@ class PaimonTableWriteContextFactoryTest {
         order.verify(fixture.committer).close();
         verify(fixture.writer).close();
         verify(fixture.committer).close();
+        verify(fixture.table).newWrite(COMMIT_USER);
+        verify(fixture.table).newCommit(COMMIT_USER);
+        verify(fixture.committer).ignoreEmptyCommit(false);
     }
 
     @Test
@@ -80,7 +92,7 @@ class PaimonTableWriteContextFactoryTest {
     void committerCreationFailureMustCloseAlreadyCreatedWriter() throws Exception {
         Fixture fixture = new Fixture(BucketMode.HASH_FIXED);
         RuntimeException failure = new RuntimeException("committer creation failed");
-        when(fixture.builder.newCommit()).thenThrow(failure);
+        when(fixture.table.newCommit(COMMIT_USER)).thenThrow(failure);
 
         RuntimeException thrown = assertThrows(RuntimeException.class, fixture::create);
 
@@ -132,7 +144,7 @@ class PaimonTableWriteContextFactoryTest {
                                 PaimonTableWriteContext.CommitStateStore.NOOP,
                                 fixture.runtimeFactory));
 
-        verify(fixture.table, never()).newStreamWriteBuilder();
+        verify(fixture.table, never()).newWrite(any());
     }
 
     @Test
@@ -159,7 +171,7 @@ class PaimonTableWriteContextFactoryTest {
         org.junit.jupiter.api.Assertions.assertTrue(
                 thrown.getMessage()
                         .contains("PAIMON_UNSUPPORTED_CROSS_PARTITION_MERGE_ENGINE"));
-        verify(fixture.table, never()).newStreamWriteBuilder();
+        verify(fixture.table, never()).newWrite(any());
     }
 
     @Test
@@ -172,12 +184,94 @@ class PaimonTableWriteContextFactoryTest {
         }
     }
 
+    @Test
+    void preparedBoundaryMustBindBeforeTransferAndFirstWriterUse() throws Exception {
+        Fixture fixture = new Fixture(BucketMode.HASH_FIXED);
+        IOManager ioManager = mock(IOManager.class);
+        PaimonCompactionRuntime compactionRuntime =
+                new PaimonCompactionRuntime("prepared-boundary");
+        PaimonWriteSemanticContract contract =
+                PaimonWriteSemanticContractResolver.resolve("default.t", fixture.table);
+        when(fixture.writer.prepareCommit(false, 0L)).thenReturn(Collections.emptyList());
+
+        PaimonPreparedWriterRuntime prepared =
+                PaimonPreparedWriterRuntime.bind(
+                        "default.t/1",
+                        fixture.table,
+                        fixture.writer,
+                        ioManager,
+                        compactionRuntime);
+        assertFalse(prepared.writerTransferred());
+        assertFalse(prepared.compactionSubmissionObserved());
+
+        PaimonBucketWriterStrategy strategy =
+                PaimonBucketWriterStrategyFactory.create(
+                        prepared,
+                        "default.t",
+                        COMMIT_USER,
+                        contract,
+                        fixture.runtimeFactory);
+        assertTrue(prepared.writerTransferred());
+        assertFalse(prepared.compactionSubmissionObserved());
+        assertThrows(IllegalStateException.class, prepared::transferWriterToStrategy);
+        strategy.prepareCommit(0L);
+
+        InOrder order = inOrder(fixture.writer);
+        order.verify(fixture.writer).withIOManager(ioManager);
+        order.verify(fixture.writer).withCompactExecutor(any(ExecutorService.class));
+        order.verify(fixture.writer).prepareCommit(false, 0L);
+
+        compactionRuntime.beginShutdown();
+        assertTrue(compactionRuntime.awaitTermination(Long.MAX_VALUE));
+        strategy.close();
+    }
+
+    @Test
+    void constructionSubmissionMustDrainBeforeWriterClose() throws Exception {
+        Fixture fixture = new Fixture(BucketMode.HASH_FIXED);
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        CountDownLatch allowWorkerReturn = new CountDownLatch(1);
+        when(fixture.writer.withCompactExecutor(any(ExecutorService.class)))
+                .thenAnswer(
+                        invocation -> {
+                            ExecutorService executor = invocation.getArgument(0);
+                            executor.execute(
+                                    () -> {
+                                        workerStarted.countDown();
+                                        try {
+                                            allowWorkerReturn.await();
+                                        } catch (InterruptedException interrupted) {
+                                            Thread.currentThread().interrupt();
+                                        }
+                                    });
+                            return fixture.writer;
+                        });
+        ExecutorService factoryCaller = Executors.newSingleThreadExecutor();
+        try {
+            Future<PaimonTableWriteContext> result = factoryCaller.submit(fixture::create);
+            assertTrue(workerStarted.await(5L, TimeUnit.SECONDS));
+            verify(fixture.writer, never()).close();
+
+            allowWorkerReturn.countDown();
+            ExecutionException failure =
+                    assertThrows(
+                            ExecutionException.class,
+                            () -> result.get(5L, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof IllegalStateException);
+            assertTrue(failure.getCause().getMessage().contains("after binding"));
+            verify(fixture.writer).close();
+        } finally {
+            allowWorkerReturn.countDown();
+            factoryCaller.shutdownNow();
+            assertTrue(factoryCaller.awaitTermination(5L, TimeUnit.SECONDS));
+        }
+    }
+
     private static final class Fixture {
         private final FileStoreTable table = mock(FileStoreTable.class);
         private final CoreOptions coreOptions = mock(CoreOptions.class);
-        private final StreamWriteBuilder builder = mock(StreamWriteBuilder.class);
-        private final StreamTableWrite writer = mock(StreamTableWrite.class);
-        private final StreamTableCommit committer = mock(StreamTableCommit.class);
+        private final TableWriteImpl writer = mock(TableWriteImpl.class);
+        private final TableCommitImpl committer = mock(TableCommitImpl.class);
         private final PaimonBucketWriterRuntimeFactory runtimeFactory =
                 mock(PaimonBucketWriterRuntimeFactory.class);
 
@@ -199,11 +293,11 @@ class PaimonTableWriteContextFactoryTest {
             when(coreOptions.mergeEngine()).thenReturn(MergeEngine.DEDUPLICATE);
             when(coreOptions.changelogProducer()).thenReturn(ChangelogProducer.NONE);
             when(coreOptions.rowkindField()).thenReturn(Optional.empty());
-            when(table.newStreamWriteBuilder()).thenReturn(builder);
-            when(builder.withCommitUser(COMMIT_USER)).thenReturn(builder);
-            when(builder.newWrite()).thenReturn(writer);
+            when(table.newWrite(COMMIT_USER)).thenReturn(writer);
             when(writer.withIOManager(any(IOManager.class))).thenReturn(writer);
-            when(builder.newCommit()).thenReturn(committer);
+            when(writer.withCompactExecutor(any(ExecutorService.class))).thenReturn(writer);
+            when(table.newCommit(COMMIT_USER)).thenReturn(committer);
+            when(committer.ignoreEmptyCommit(false)).thenReturn(committer);
         }
 
         private PaimonTableWriteContext create() throws Exception {
