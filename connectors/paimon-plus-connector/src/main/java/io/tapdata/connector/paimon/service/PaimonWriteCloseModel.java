@@ -3,17 +3,17 @@ package io.tapdata.connector.paimon.service;
 import java.util.Objects;
 
 /** Proof, state, and exactly-once dependency-close model for one writer generation. */
-final class PaimonWriteCloseModel {
+public final class PaimonWriteCloseModel {
 
     private PaimonWriteCloseModel() {}
 
-    enum InitiatingReason {
+    public enum InitiatingReason {
         STOP,
         DDL,
         FACTORY_ROLLBACK
     }
 
-    enum FailureOrigin {
+    public enum FailureOrigin {
         NONE,
         WRITE_PATH,
         DDL_PATH,
@@ -22,7 +22,7 @@ final class PaimonWriteCloseModel {
         DEPENDENCY_CLOSE
     }
 
-    enum CloseState {
+    public enum CloseState {
         WAITING_COMPACTION(true, false, false),
         WAITING_COMMIT_MAINTENANCE(true, false, false),
         CLOSE_DEFERRED_TERMINATION(true, false, false),
@@ -41,37 +41,38 @@ final class PaimonWriteCloseModel {
             this.retained = retained;
         }
 
-        boolean isActiveWaiting() {
+        public boolean isActiveWaiting() {
             return activeWaiting;
         }
 
-        boolean isTerminal() {
+        public boolean isTerminal() {
             return terminal;
         }
 
-        boolean isRetained() {
+        public boolean isRetained() {
             return retained;
         }
     }
 
-    enum MaintenanceStatus {
+    public enum MaintenanceStatus {
         SUCCESS,
         FAILED_DRAINED,
         WAITING
     }
 
-    enum DelegateCloseStatus {
+    public enum DelegateCloseStatus {
         NOT_ATTEMPTED,
+        IN_PROGRESS,
         SUCCEEDED,
         FAILED_RETAINED
     }
 
-    interface CloseAction {
+    public interface CloseAction {
         void close() throws Exception;
     }
 
     /** Immutable proof minted only after the caller has established a reason-specific barrier. */
-    static final class QuiescenceProof {
+    public static final class QuiescenceProof {
         private final PhysicalTableWriterLease lease;
         private final InitiatingReason initiatingReason;
         private final FailureOrigin failureOrigin;
@@ -142,20 +143,32 @@ final class PaimonWriteCloseModel {
             return lease;
         }
 
-        InitiatingReason initiatingReason() {
+        /**
+         * Returns the opaque, immutable lease capability without exposing its package-private
+         * implementation type across the service/write boundary.
+         */
+        public Object generationCapability() {
+            return lease;
+        }
+
+        public boolean matchesGenerationCapability(Object expectedCapability) {
+            return lease.equals(expectedCapability);
+        }
+
+        public InitiatingReason initiatingReason() {
             return initiatingReason;
         }
 
-        FailureOrigin failureOrigin() {
+        public FailureOrigin failureOrigin() {
             return failureOrigin;
         }
 
-        long proofEpoch() {
+        public long proofEpoch() {
             return proofEpoch;
         }
     }
 
-    static final class MaintenanceOutcome {
+    public static final class MaintenanceOutcome {
         private static final MaintenanceOutcome SUCCESS =
                 new MaintenanceOutcome(MaintenanceStatus.SUCCESS, null);
         private static final MaintenanceOutcome WAITING =
@@ -169,128 +182,34 @@ final class PaimonWriteCloseModel {
             this.failure = failure;
         }
 
-        static MaintenanceOutcome success() {
+        public static MaintenanceOutcome success() {
             return SUCCESS;
         }
 
-        static MaintenanceOutcome failedDrained(Throwable failure) {
+        public static MaintenanceOutcome failedDrained(Throwable failure) {
             return new MaintenanceOutcome(
                     MaintenanceStatus.FAILED_DRAINED,
                     Objects.requireNonNull(failure, "failure"));
         }
 
-        static MaintenanceOutcome waiting() {
+        public static MaintenanceOutcome waiting() {
             return WAITING;
         }
 
-        MaintenanceStatus status() {
+        public MaintenanceStatus status() {
             return status;
         }
 
-        Throwable failure() {
+        public Throwable failure() {
             return failure;
         }
     }
 
-    /**
-     * Monotonic state holder for one close operation.
-     *
-     * <p>A DDL caller may stop waiting without terminating the operation. Only a valid STOP proof
-     * for the same exact generation can resume that deferred operation. Once retained, the first
-     * terminal state and failure are sticky for the rest of the process.
-     */
-    static final class CloseOperation {
-        private final QuiescenceProof initiatingProof;
-        private CloseState state = CloseState.WAITING_COMPACTION;
-        private Throwable terminalFailure;
-
-        CloseOperation(QuiescenceProof initiatingProof) {
-            this.initiatingProof = Objects.requireNonNull(initiatingProof, "initiatingProof");
-        }
-
-        synchronized CloseState state() {
-            return state;
-        }
-
-        synchronized Throwable terminalFailure() {
-            return terminalFailure;
-        }
-
-        synchronized void recordCompactionTerminated() {
-            requireState(CloseState.WAITING_COMPACTION);
-            state = CloseState.WAITING_COMMIT_MAINTENANCE;
-        }
-
-        synchronized void deferTermination() {
-            if (initiatingProof.initiatingReason() != InitiatingReason.DDL) {
-                throw new IllegalStateException(
-                        "Only a DDL caller may defer an active close operation");
-            }
-            if (state != CloseState.WAITING_COMPACTION
-                    && state != CloseState.WAITING_COMMIT_MAINTENANCE) {
-                throw new IllegalStateException("Close operation is not actively waiting");
-            }
-            state = CloseState.CLOSE_DEFERRED_TERMINATION;
-        }
-
-        synchronized void resumeForStop(
-                QuiescenceProof stopProof, CloseState waitingPhase) {
-            Objects.requireNonNull(stopProof, "stopProof");
-            if (state != CloseState.CLOSE_DEFERRED_TERMINATION) {
-                throw new IllegalStateException("Only a deferred operation can be joined by STOP");
-            }
-            if (stopProof.initiatingReason() != InitiatingReason.STOP
-                    || !initiatingProof.lease().equals(stopProof.lease())) {
-                throw new IllegalStateException(
-                        "STOP join proof must match the exact deferred generation");
-            }
-            if (waitingPhase != CloseState.WAITING_COMPACTION
-                    && waitingPhase != CloseState.WAITING_COMMIT_MAINTENANCE) {
-                throw new IllegalArgumentException("waitingPhase must be an active wait phase");
-            }
-            state = waitingPhase;
-        }
-
-        synchronized CloseState retain(CloseState retainedState, Throwable failure) {
-            Objects.requireNonNull(retainedState, "retainedState");
-            Objects.requireNonNull(failure, "failure");
-            if (state.isTerminal()) {
-                return state;
-            }
-            if (!retainedState.isRetained()) {
-                throw new IllegalArgumentException("The requested state is not retained");
-            }
-            state = retainedState;
-            terminalFailure = failure;
-            return state;
-        }
-
-        synchronized void recordClosedSuccess(
-                boolean compactionTerminated,
-                MaintenanceOutcome maintenance,
-                DelegateCloseProgress progress) {
-            requireState(CloseState.WAITING_COMMIT_MAINTENANCE);
-            CloseState proven =
-                    Objects.requireNonNull(progress, "progress")
-                            .retainedOrClosedState(compactionTerminated, maintenance);
-            if (proven != CloseState.CLOSED_SUCCESS) {
-                throw new IllegalStateException(
-                        "A close operation needs complete successful dependency evidence");
-            }
-            state = proven;
-        }
-
-        private void requireState(CloseState expected) {
-            if (state != expected) {
-                throw new IllegalStateException(
-                        "Expected close state " + expected + " but was " + state);
-            }
-        }
-    }
-
-    static final class DelegateCloseOutcome {
+    public static final class DelegateCloseOutcome {
         private static final DelegateCloseOutcome NOT_ATTEMPTED =
                 new DelegateCloseOutcome(DelegateCloseStatus.NOT_ATTEMPTED, null);
+        private static final DelegateCloseOutcome IN_PROGRESS =
+                new DelegateCloseOutcome(DelegateCloseStatus.IN_PROGRESS, null);
         private static final DelegateCloseOutcome SUCCEEDED =
                 new DelegateCloseOutcome(DelegateCloseStatus.SUCCEEDED, null);
 
@@ -308,66 +227,59 @@ final class PaimonWriteCloseModel {
                     Objects.requireNonNull(failure, "failure"));
         }
 
-        DelegateCloseStatus status() {
+        public DelegateCloseStatus status() {
             return status;
         }
 
-        Throwable failure() {
+        public Throwable failure() {
             return failure;
         }
 
-        boolean succeeded() {
+        public boolean succeeded() {
             return status == DelegateCloseStatus.SUCCEEDED;
         }
     }
 
     /** Per-dependency monotonic progress; a delegate that threw is never invoked again. */
-    static final class DelegateCloseProgress {
+    public static final class DelegateCloseProgress {
         private DelegateCloseOutcome writer = DelegateCloseOutcome.NOT_ATTEMPTED;
         private DelegateCloseOutcome committer = DelegateCloseOutcome.NOT_ATTEMPTED;
         private DelegateCloseOutcome io = DelegateCloseOutcome.NOT_ATTEMPTED;
 
-        synchronized DelegateCloseOutcome closeWriterOnce(CloseAction closeAction) {
-            if (writer.status() == DelegateCloseStatus.NOT_ATTEMPTED) {
-                writer = invoke(closeAction);
-            }
-            return writer;
+        public DelegateCloseOutcome closeWriterOnce(CloseAction closeAction) {
+            return closeOnce(Resource.WRITER, closeAction);
         }
 
-        synchronized DelegateCloseOutcome closeCommitterOnce(CloseAction closeAction) {
-            if (committer.status() == DelegateCloseStatus.NOT_ATTEMPTED) {
-                committer = invoke(closeAction);
-            }
-            return committer;
+        public DelegateCloseOutcome closeCommitterOnce(CloseAction closeAction) {
+            return closeOnce(Resource.COMMITTER, closeAction);
         }
 
-        synchronized DelegateCloseOutcome closeIoOnceIfSafe(
+        public DelegateCloseOutcome closeIoOnceIfSafe(
                 boolean compactionTerminated,
                 MaintenanceOutcome maintenance,
                 CloseAction closeAction) {
             Objects.requireNonNull(maintenance, "maintenance");
-            if (!canReleaseIo(compactionTerminated, writer, maintenance, committer)) {
-                return io;
+            synchronized (this) {
+                if (!canReleaseIo(compactionTerminated, writer, maintenance, committer)) {
+                    return io;
+                }
             }
-            if (io.status() == DelegateCloseStatus.NOT_ATTEMPTED) {
-                io = invoke(closeAction);
-            }
-            return io;
+            return closeOnce(Resource.IO, closeAction);
         }
 
-        synchronized DelegateCloseOutcome writerOutcome() {
+        public synchronized DelegateCloseOutcome writerOutcome() {
             return writer;
         }
 
-        synchronized DelegateCloseOutcome committerOutcome() {
+        public synchronized DelegateCloseOutcome committerOutcome() {
             return committer;
         }
 
-        synchronized DelegateCloseOutcome ioOutcome() {
+        public synchronized DelegateCloseOutcome ioOutcome() {
             return io;
         }
 
-        synchronized CloseState retainedOrClosedState(
+        public synchronized CloseState retainedOrClosedState(
                 boolean compactionTerminated, MaintenanceOutcome maintenance) {
             Objects.requireNonNull(maintenance, "maintenance");
             if (!compactionTerminated || maintenance.status() == MaintenanceStatus.WAITING) {
@@ -399,9 +311,61 @@ final class PaimonWriteCloseModel {
                 return DelegateCloseOutcome.failed(failure);
             }
         }
+
+        private DelegateCloseOutcome closeOnce(Resource resource, CloseAction closeAction) {
+            Objects.requireNonNull(closeAction, "closeAction");
+            synchronized (this) {
+                DelegateCloseOutcome current = outcome(resource);
+                if (current.status() != DelegateCloseStatus.NOT_ATTEMPTED) {
+                    return current;
+                }
+                setOutcome(resource, DelegateCloseOutcome.IN_PROGRESS);
+            }
+
+            DelegateCloseOutcome completed = invoke(closeAction);
+            synchronized (this) {
+                setOutcome(resource, completed);
+                return completed;
+            }
+        }
+
+        private DelegateCloseOutcome outcome(Resource resource) {
+            switch (resource) {
+                case WRITER:
+                    return writer;
+                case COMMITTER:
+                    return committer;
+                case IO:
+                    return io;
+                default:
+                    throw new IllegalStateException("Unknown close resource " + resource);
+            }
+        }
+
+        private void setOutcome(Resource resource, DelegateCloseOutcome outcome) {
+            switch (resource) {
+                case WRITER:
+                    writer = outcome;
+                    return;
+                case COMMITTER:
+                    committer = outcome;
+                    return;
+                case IO:
+                    io = outcome;
+                    return;
+                default:
+                    throw new IllegalStateException("Unknown close resource " + resource);
+            }
+        }
+
+        private enum Resource {
+            WRITER,
+            COMMITTER,
+            IO
+        }
     }
 
-    static boolean canReleaseIo(
+    public static boolean canReleaseIo(
             boolean compactionTerminated,
             DelegateCloseOutcome writer,
             MaintenanceOutcome maintenance,
