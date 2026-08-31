@@ -4,10 +4,10 @@ import io.tapdata.connector.paimon.commit.PaimonCommitStateStore;
 
 import io.tapdata.connector.paimon.exception.PaimonDynamicBucketPollutedException;
 import io.tapdata.connector.paimon.util.PaimonSpillDirCleaner;
+import io.tapdata.connector.paimon.write.bucket.DefaultPaimonBucketWriterRuntimeFactory;
 import io.tapdata.entity.utils.cache.KVMap;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.crosspartition.GlobalIndexAssigner;
-import org.apache.paimon.crosspartition.IndexBootstrap;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.reader.RecordReader;
@@ -21,6 +21,33 @@ import java.util.Objects;
 public final class PaimonDynamicBucketPreflight {
 
     private static final String MARKER_PREFIX = "paimon.hash-dynamic-preflight-v1.";
+    private static final PreflightRuntimeFactory PRODUCTION_RUNTIME =
+            new PreflightRuntimeFactory() {
+                @Override
+                public FileStoreTable createRuntimeTable(FileStoreTable source) {
+                    return PaimonRuntimeTableFactory.create(source);
+                }
+
+                @Override
+                public PreflightIoOwner createIoOwner(String configuredTmpDirs) {
+                    PaimonSpillDirCleaner.IOManagerBuildResult built =
+                            PaimonSpillDirCleaner.resolveAndCreateIOManager(configuredTmpDirs);
+                    return new PreflightIoOwner(built.ioManager(), built.spillDirs());
+                }
+
+                @Override
+                public GlobalIndexAssigner createAssigner(FileStoreTable runtimeTable) {
+                    return DefaultPaimonBucketWriterRuntimeFactory.INSTANCE
+                            .createGlobalIndexAssigner(runtimeTable);
+                }
+
+                @Override
+                public RecordReader<InternalRow> createBootstrapReader(
+                        FileStoreTable runtimeTable) throws Exception {
+                    return DefaultPaimonBucketWriterRuntimeFactory.INSTANCE
+                            .createIndexBootstrapReader(runtimeTable);
+                }
+            };
 
     private PaimonDynamicBucketPreflight() {
     }
@@ -67,49 +94,111 @@ public final class PaimonDynamicBucketPreflight {
 
     private static void validateExactPrimaryKeyUniqueness(
             String tableKey, FileStoreTable table, String configuredTmpDirs) throws Exception {
-        IOManager ioManager = null;
-        GlobalIndexAssigner checker = null;
-        List<String> spillDirs = Collections.emptyList();
-        Long snapshotBefore = table.snapshotManager().latestSnapshotIdFromFileSystem();
-        Exception failure = null;
+        validateExactPrimaryKeyUniqueness(
+                tableKey, table, configuredTmpDirs, PRODUCTION_RUNTIME);
+    }
+
+    static void validateExactPrimaryKeyUniqueness(
+            String tableKey,
+            FileStoreTable table,
+            String configuredTmpDirs,
+            PreflightRuntimeFactory runtimeFactory) throws Exception {
+        Objects.requireNonNull(runtimeFactory, "runtimeFactory");
+        PreflightIoOwner ioOwner = null;
+        GlobalIndexAssigner staged = null;
+        BootstrapDrainState bootstrapDrain = new BootstrapDrainState();
+        Throwable failure = null;
         try {
-            PaimonSpillDirCleaner.IOManagerBuildResult built =
-                    PaimonSpillDirCleaner.resolveAndCreateIOManager(configuredTmpDirs);
-            ioManager = built.ioManager();
-            spillDirs = built.spillDirs();
-            FileStoreTable validationTable = withoutIndexTtl(table);
-            checker = new GlobalIndexAssigner(validationTable);
-            checker.open(0L, ioManager, 1, 0, (row, bucket) -> { });
-            try (RecordReader<InternalRow> reader =
-                         new IndexBootstrap(validationTable).bootstrap(1, 0)) {
-                RecordReader.RecordIterator<InternalRow> batch;
-                while ((batch = reader.readBatch()) != null) {
-                    try {
-                        InternalRow row;
-                        while ((row = batch.next()) != null) {
-                            checker.bootstrapKey(row);
-                        }
-                    } finally {
-                        batch.releaseBatch();
-                    }
-                }
-            }
-            checker.endBoostrap(false);
-            Long snapshotAfter = table.snapshotManager().latestSnapshotIdFromFileSystem();
+            FileStoreTable runtimeTable = Objects.requireNonNull(
+                    runtimeFactory.createRuntimeTable(table), "runtime table");
+            requireAsyncDisabled(runtimeTable);
+            FileStoreTable validationTable = withoutIndexTtl(runtimeTable);
+            requireAsyncDisabled(validationTable);
+
+            ioOwner = Objects.requireNonNull(
+                    runtimeFactory.createIoOwner(configuredTmpDirs), "preflight IO owner");
+            staged = Objects.requireNonNull(
+                    runtimeFactory.createAssigner(validationTable), "preflight assigner");
+            Long snapshotBefore =
+                    validationTable.snapshotManager().latestSnapshotIdFromFileSystem();
+            staged.open(0L, ioOwner.ioManager(), 1, 0, (row, bucket) -> { });
+            bootstrap(
+                    staged,
+                    runtimeFactory.createBootstrapReader(validationTable),
+                    bootstrapDrain);
+            staged.endBoostrap(false);
+            Long snapshotAfter =
+                    validationTable.snapshotManager().latestSnapshotIdFromFileSystem();
             if (!Objects.equals(snapshotBefore, snapshotAfter)) {
                 throw new IllegalStateException(
                         "Paimon table changed during HASH_DYNAMIC pollution preflight; "
                                 + "only one write job per physical table is supported");
             }
-        } catch (Exception e) {
-            failure = PaimonDynamicBucketPollutedException.wrapIfPolluted(tableKey, e);
-        } finally {
-            failure = close(checker, failure);
-            failure = close(ioManager, failure);
-            PaimonSpillDirCleaner.unregisterLiveDirs(spillDirs);
+        } catch (Throwable operationFailure) {
+            failure = wrapIfPolluted(tableKey, operationFailure);
+        }
+
+        boolean checkerClosed = false;
+        if (staged != null) {
+            Throwable closeFailure = close(staged);
+            checkerClosed = closeFailure == null;
+            failure = merge(failure, closeFailure);
+        } else {
+            checkerClosed = true;
+        }
+        if (ioOwner != null && checkerClosed && bootstrapDrain.cleanupSucceeded()) {
+            Throwable closeFailure = close(ioOwner.ioManager());
+            if (closeFailure == null) {
+                closeFailure = unregister(ioOwner.spillDirs());
+            }
+            failure = merge(failure, closeFailure);
+        }
+
+        if (failure != null) {
+            rethrow(failure);
+        }
+    }
+
+    private static void bootstrap(
+            GlobalIndexAssigner checker,
+            RecordReader<InternalRow> bootstrapReader,
+            BootstrapDrainState drainState)
+            throws Exception {
+        RecordReader<InternalRow> reader =
+                Objects.requireNonNull(bootstrapReader, "index bootstrap reader");
+        Throwable failure = null;
+        try {
+            RecordReader.RecordIterator<InternalRow> batch;
+            while ((batch = reader.readBatch()) != null) {
+                Throwable batchFailure = null;
+                try {
+                    InternalRow row;
+                    while ((row = batch.next()) != null) {
+                        checker.bootstrapKey(row);
+                    }
+                } catch (Throwable iterationFailure) {
+                    batchFailure = iterationFailure;
+                }
+                try {
+                    batch.releaseBatch();
+                } catch (Throwable releaseFailure) {
+                    drainState.cleanupFailed();
+                    batchFailure = merge(batchFailure, releaseFailure);
+                }
+                if (batchFailure != null) {
+                    rethrow(batchFailure);
+                }
+            }
+        } catch (Throwable operationFailure) {
+            failure = operationFailure;
+        }
+        Throwable readerCloseFailure = close(reader);
+        if (readerCloseFailure != null) {
+            drainState.cleanupFailed();
+            failure = merge(failure, readerCloseFailure);
         }
         if (failure != null) {
-            throw failure;
+            rethrow(failure);
         }
     }
 
@@ -127,18 +216,96 @@ public final class PaimonDynamicBucketPreflight {
                 CoreOptions.CROSS_PARTITION_UPSERT_INDEX_TTL.key(), null));
     }
 
-    private static Exception close(AutoCloseable closeable, Exception failure) {
-        if (closeable == null) {
-            return failure;
+    private static void requireAsyncDisabled(FileStoreTable table) {
+        if (table.coreOptions().fileReaderAsyncEnabled()) {
+            throw new IllegalArgumentException(
+                    "HASH_DYNAMIC preflight requires file-reader-async-enabled=false");
         }
-        try {
-            closeable.close();
-        } catch (Exception closeError) {
-            if (failure == null) {
-                return closeError;
-            }
-            failure.addSuppressed(closeError);
+    }
+
+    private static Throwable wrapIfPolluted(String tableKey, Throwable failure) {
+        if (failure instanceof Exception) {
+            return PaimonDynamicBucketPollutedException.wrapIfPolluted(tableKey, failure);
         }
         return failure;
+    }
+
+    private static Throwable close(AutoCloseable closeable) {
+        try {
+            closeable.close();
+            return null;
+        } catch (Throwable closeFailure) {
+            return closeFailure;
+        }
+    }
+
+    private static Throwable unregister(List<String> spillDirs) {
+        try {
+            PaimonSpillDirCleaner.unregisterLiveDirs(spillDirs);
+            return null;
+        } catch (Throwable unregisterFailure) {
+            return unregisterFailure;
+        }
+    }
+
+    private static Throwable merge(Throwable primary, Throwable secondary) {
+        if (primary == null) {
+            return secondary;
+        }
+        if (secondary != null && primary != secondary) {
+            primary.addSuppressed(secondary);
+        }
+        return primary;
+    }
+
+    private static void rethrow(Throwable failure) throws Exception {
+        if (failure instanceof Exception) {
+            throw (Exception) failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        throw new RuntimeException(failure);
+    }
+
+    interface PreflightRuntimeFactory {
+        FileStoreTable createRuntimeTable(FileStoreTable source) throws Exception;
+
+        PreflightIoOwner createIoOwner(String configuredTmpDirs) throws Exception;
+
+        GlobalIndexAssigner createAssigner(FileStoreTable runtimeTable) throws Exception;
+
+        RecordReader<InternalRow> createBootstrapReader(FileStoreTable runtimeTable)
+                throws Exception;
+    }
+
+    static final class PreflightIoOwner {
+        private final IOManager ioManager;
+        private final List<String> spillDirs;
+
+        PreflightIoOwner(IOManager ioManager, List<String> spillDirs) {
+            this.ioManager = Objects.requireNonNull(ioManager, "ioManager");
+            this.spillDirs = Objects.requireNonNull(spillDirs, "spillDirs");
+        }
+
+        IOManager ioManager() {
+            return ioManager;
+        }
+
+        List<String> spillDirs() {
+            return spillDirs;
+        }
+    }
+
+    private static final class BootstrapDrainState {
+        private boolean cleanupSucceeded = true;
+
+        private void cleanupFailed() {
+            cleanupSucceeded = false;
+        }
+
+        private boolean cleanupSucceeded() {
+            return cleanupSucceeded;
+        }
     }
 }

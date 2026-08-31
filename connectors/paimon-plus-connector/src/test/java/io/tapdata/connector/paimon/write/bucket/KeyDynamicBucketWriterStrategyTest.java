@@ -1,4 +1,5 @@
 package io.tapdata.connector.paimon.write.bucket;
+
 import io.tapdata.connector.paimon.schema.PaimonWriteSemanticContract;
 import io.tapdata.connector.paimon.schema.PaimonWriteSemanticContractTestFactory;
 
@@ -21,17 +22,23 @@ import org.apache.paimon.utils.SnapshotManager;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -42,6 +49,46 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class KeyDynamicBucketWriterStrategyTest {
+
+    @Test
+    void productionFactoryMustRejectAsyncEnabledTables() {
+        FileStoreTable asyncTable = mock(FileStoreTable.class);
+        org.apache.paimon.CoreOptions asyncOptions = mock(org.apache.paimon.CoreOptions.class);
+        when(asyncTable.coreOptions()).thenReturn(asyncOptions);
+        when(asyncOptions.fileReaderAsyncEnabled()).thenReturn(true);
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> DefaultPaimonBucketWriterRuntimeFactory.INSTANCE
+                        .createGlobalIndexAssigner(asyncTable));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> DefaultPaimonBucketWriterRuntimeFactory.INSTANCE
+                        .createIndexBootstrapReader(asyncTable));
+    }
+
+    @Test
+    void productionPathMustUseOneAsyncDisabledRuntimeTableWithoutParallelBootstrap()
+            throws Exception {
+        Fixture fixture = new Fixture();
+
+        fixture.create();
+
+        verify(fixture.table).copy(anyMap());
+        verify(fixture.runtime).createGlobalIndexAssigner(fixture.runtimeTable);
+        verify(fixture.runtime).createIndexBootstrapReader(fixture.runtimeTable);
+        assertFalse(fixture.runtimeTable.coreOptions().fileReaderAsyncEnabled());
+        assertClassOmits(
+                DefaultPaimonBucketWriterRuntimeFactory.class,
+                "org/apache/paimon/crosspartition/IndexBootstrap",
+                "org/apache/paimon/io/SplitsParallelReadUtil",
+                "org/apache/paimon/utils/ParallelExecution");
+        assertClassOmits(
+                KeyDynamicBucketWriterStrategy.class,
+                "org/apache/paimon/crosspartition/IndexBootstrap",
+                "org/apache/paimon/io/SplitsParallelReadUtil",
+                "org/apache/paimon/utils/ParallelExecution");
+    }
 
     @Test
     void constructionMustOpenAssignerWithExpectedSingleWriterArguments() throws Exception {
@@ -92,6 +139,28 @@ class KeyDynamicBucketWriterStrategyTest {
     }
 
     @Test
+    void iterationFailureMustRetainReleaseAndReaderCloseFailuresInOrder() throws Exception {
+        Fixture fixture = new Fixture();
+        RecordReader.RecordIterator<InternalRow> batch = mock(RecordReader.RecordIterator.class);
+        IOException iterationFailure = new IOException("iteration failed");
+        RuntimeException releaseFailure = new RuntimeException("release failed");
+        IOException readerCloseFailure = new IOException("reader close failed");
+        when(batch.next()).thenThrow(iterationFailure);
+        doThrow(releaseFailure).when(batch).releaseBatch();
+        doThrow(readerCloseFailure).when(fixture.reader).close();
+        when(fixture.reader.readBatch()).thenReturn(batch);
+
+        Exception thrown = assertThrows(Exception.class, fixture::create);
+
+        assertSame(iterationFailure, thrown);
+        assertEquals(Arrays.asList(releaseFailure, readerCloseFailure),
+                Arrays.asList(thrown.getSuppressed()));
+        verify(batch).releaseBatch();
+        verify(fixture.reader).close();
+        verify(fixture.assigner).close();
+    }
+
+    @Test
     void endBootstrapMustRunOnceAfterReaderExhausted() throws Exception {
         Fixture fixture = new Fixture();
 
@@ -127,7 +196,56 @@ class KeyDynamicBucketWriterStrategyTest {
         assertSame(openFailure, thrown);
         assertEquals(1, thrown.getSuppressed().length);
         assertSame(closeFailure, thrown.getSuppressed()[0]);
-        verify(fixture.runtime, never()).createIndexBootstrapReader(fixture.table);
+        verify(fixture.runtime, never()).createIndexBootstrapReader(fixture.runtimeTable);
+        verify(fixture.ioManager, never()).close();
+    }
+
+    @Test
+    void readerCreationFailureMustCloseStagedAssignerAndPropagateSynchronously()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        IOException failure = new IOException("reader create failed");
+        when(fixture.runtime.createIndexBootstrapReader(fixture.runtimeTable))
+                .thenThrow(failure);
+
+        assertSame(failure, assertThrows(IOException.class, fixture::create));
+
+        verify(fixture.assigner).close();
+        verify(fixture.ioManager, never()).close();
+    }
+
+    @Test
+    void endBootstrapFailureMustRemainPrimaryAndSuppressSingleAssignerCloseFailure()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        Exception endFailure = new Exception("end bootstrap failed");
+        IOException closeFailure = new IOException("assigner close failed");
+        doThrow(endFailure).when(fixture.assigner).endBoostrap(false);
+        doThrow(closeFailure).when(fixture.assigner).close();
+
+        Exception thrown = assertThrows(Exception.class, fixture::create);
+
+        assertSame(endFailure, thrown);
+        assertEquals(Collections.singletonList(closeFailure), Arrays.asList(thrown.getSuppressed()));
+        verify(fixture.assigner).close();
+        verify(fixture.reader).close();
+        verify(fixture.ioManager, never()).close();
+    }
+
+    @Test
+    void snapshotReadFailureMustCloseStagedAssignerAndPropagateSynchronously()
+            throws Exception {
+        Fixture fixture = new Fixture();
+        RuntimeException snapshotFailure = new RuntimeException("snapshot read failed");
+        when(fixture.snapshotManager.latestSnapshotIdFromFileSystem())
+                .thenThrow(snapshotFailure);
+
+        assertSame(snapshotFailure, assertThrows(RuntimeException.class, fixture::create));
+
+        verify(fixture.assigner).close();
+        verify(fixture.assigner, never())
+                .open(anyLong(), any(IOManager.class), anyInt(), anyInt(), any());
+        verify(fixture.ioManager, never()).close();
     }
 
     @Test
@@ -275,10 +393,12 @@ class KeyDynamicBucketWriterStrategyTest {
         KeyDynamicBucketWriterStrategy strategy = fixture.create();
 
         strategy.close();
+        strategy.close();
 
         InOrder order = inOrder(fixture.assigner, fixture.writer);
         order.verify(fixture.assigner).close();
         order.verify(fixture.writer).close();
+        verify(fixture.ioManager, never()).close();
     }
 
     @Test
@@ -303,8 +423,33 @@ class KeyDynamicBucketWriterStrategyTest {
         return batch;
     }
 
+    private static void assertClassOmits(Class<?> type, String... forbiddenNames)
+            throws IOException {
+        String resource = "/" + type.getName().replace('.', '/') + ".class";
+        byte[] bytecode;
+        try (InputStream input = type.getResourceAsStream(resource);
+                ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            if (input == null) {
+                throw new IOException("Missing class resource " + resource);
+            }
+            byte[] buffer = new byte[4096];
+            int read;
+            while ((read = input.read(buffer)) >= 0) {
+                output.write(buffer, 0, read);
+            }
+            bytecode = output.toByteArray();
+        }
+        String constantPool = new String(bytecode, StandardCharsets.ISO_8859_1);
+        for (String forbiddenName : forbiddenNames) {
+            assertFalse(
+                    constantPool.contains(forbiddenName),
+                    () -> type.getName() + " references forbidden " + forbiddenName);
+        }
+    }
+
     private static final class Fixture {
         private final FileStoreTable table = mock(FileStoreTable.class);
+        private final FileStoreTable runtimeTable = mock(FileStoreTable.class);
         private final StreamTableWrite writer = mock(StreamTableWrite.class);
         private final IOManager ioManager = mock(IOManager.class);
         private final GlobalIndexAssigner assigner = mock(GlobalIndexAssigner.class);
@@ -313,6 +458,8 @@ class KeyDynamicBucketWriterStrategyTest {
         private final RecordReader<InternalRow> reader = mock(RecordReader.class);
         private final SnapshotManager snapshotManager = mock(SnapshotManager.class);
         private final RowType rowType = mock(RowType.class);
+        private final org.apache.paimon.CoreOptions runtimeOptions =
+                mock(org.apache.paimon.CoreOptions.class);
         private BiConsumer<InternalRow, Integer> collector;
 
         private Fixture() throws Exception {
@@ -322,9 +469,13 @@ class KeyDynamicBucketWriterStrategyTest {
             when(table.rowType()).thenReturn(rowType);
             when(rowType.getFieldNames()).thenReturn(Arrays.asList("pt", "id"));
             when(table.snapshotManager()).thenReturn(snapshotManager);
+            when(table.copy(anyMap())).thenReturn(runtimeTable);
+            when(runtimeTable.coreOptions()).thenReturn(runtimeOptions);
+            when(runtimeOptions.fileReaderAsyncEnabled()).thenReturn(false);
+            when(runtimeTable.snapshotManager()).thenReturn(snapshotManager);
             when(snapshotManager.latestSnapshotIdFromFileSystem()).thenReturn(10L, 10L);
-            when(runtime.createGlobalIndexAssigner(table)).thenReturn(assigner);
-            when(runtime.createIndexBootstrapReader(table)).thenReturn(reader);
+            when(runtime.createGlobalIndexAssigner(runtimeTable)).thenReturn(assigner);
+            when(runtime.createIndexBootstrapReader(runtimeTable)).thenReturn(reader);
             when(reader.readBatch()).thenReturn(null);
             doAnswer(invocation -> {
                 collector = invocation.getArgument(4);
