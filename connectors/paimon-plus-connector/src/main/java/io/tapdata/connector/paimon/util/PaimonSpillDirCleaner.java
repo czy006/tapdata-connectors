@@ -5,56 +5,51 @@ import org.apache.paimon.disk.IOManagerImpl;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.file.DirectoryStream;
-import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
+import java.nio.file.Paths;
+import java.nio.file.SecureDirectoryStream;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 
 /**
- * Tracks Paimon {@code paimon-io-<uuid>} spill directories owned by live IOManagers and cleans up
- * stale ones left behind by abnormally terminated JVMs (OOM/crash/SIGKILL).
- *
- * <p>The normal task-stop path closes the IOManager, which deletes its own spill dir. When the JVM
- * dies abnormally that cleanup never runs, so the dirs accumulate and exhaust local disk. Startup
- * cleanup removes such leftovers. A JVM registry handles local ownership and a sibling advisory
- * file lock proves cross-process ownership before age-based deletion is allowed.
+ * Owns Paimon spill-manager locks and removes stale managers only through stable local path
+ * capabilities and descriptor-relative operations.
  */
 public final class PaimonSpillDirCleaner {
 
-    /** Prefix of spill directories created by Paimon IOManager: {@code paimon-io-<uuid>}. */
     static final String SPILL_DIR_PREFIX = "paimon-io-";
     static final String OWNER_LOCK_SUFFIX = ".tapdata-owner.lock";
+    private static final int MAX_SECURE_TREE_DEPTH = 256;
 
-    /** An unlocked spill dir untouched for longer than this is treated as stale. */
     public static final long DEFAULT_STALE_GRACE_MS = TimeUnit.MINUTES.toMillis(10);
 
-    /** Canonical paths of spill dirs owned by live IOManagers in this JVM. */
     private static final Set<String> LIVE_DIRS = ConcurrentHashMap.newKeySet();
-    /** Cross-process advisory owner locks keyed by canonical spill directory. */
     private static final Map<String, OwnerLock> OWNER_LOCKS = new ConcurrentHashMap<>();
+    private static final BeforeDeleteHook NOOP_BEFORE_DELETE = (root, managerName) -> {};
+    private static final SecureRootOpener PLATFORM_SECURE_ROOT =
+            PaimonSpillPathCapability.ApprovedRoot::openSecure;
 
-    private PaimonSpillDirCleaner() {
-    }
+    private PaimonSpillDirCleaner() {}
 
-    /**
-     * Returns the sum of {@code left} and {@code right} unless it would overflow {@link Long#MAX_VALUE},
-     * in which case {@code Long.MAX_VALUE} is returned. {@code right <= 0} is returned as {@code left + right}
-     * (the non-overflowing direction).
-     */
     public static long saturatedAdd(long left, long right) {
         if (right > 0L && left > Long.MAX_VALUE - right) {
             return Long.MAX_VALUE;
@@ -62,16 +57,6 @@ public final class PaimonSpillDirCleaner {
         return left + right;
     }
 
-    /**
-     * Resolves the configured temporary-directory list to a non-blank value. When {@code configuredTmpDirs}
-     * is blank, falls back to {@code java.io.tmpdir} and then to the process working directory. The
-     * returned value may be a comma-separated multi-path string; callers that need individual roots
-     * should use {@link #splitTmpDirRoots(String)}.
-     *
-     * <p>The working-directory default (rather than {@code "/tmp"}) is intentional: Paimon spill and
-     * S3A upload buffers are meant to share the same disk, and {@code /tmp} frequently lives on a
-     * separate, smaller partition.
-     */
     public static String resolveTmpDirs(String configuredTmpDirs) {
         if (configuredTmpDirs == null || configuredTmpDirs.trim().isEmpty()) {
             return System.getProperty("java.io.tmpdir", new File(".").getAbsolutePath());
@@ -79,31 +64,32 @@ public final class PaimonSpillDirCleaner {
         return configuredTmpDirs;
     }
 
-    /**
-     * Splits a resolved temporary-directory list (as produced by {@link #resolveTmpDirs(String)}) into
-     * individual roots. This is a thin wrapper over Paimon's {@link IOManagerImpl#splitPaths}: it
-     * splits on comma / path-separator and does not trim whitespace or drop empty segments, so
-     * callers that need clean roots must sanitize the entries themselves.
-     */
     public static String[] splitTmpDirRoots(String resolvedTmpDirs) {
         return IOManagerImpl.splitPaths(resolvedTmpDirs);
     }
 
     /**
-     * Resolves the temporary-directory list, creates a Paimon {@link IOManager} over it, and registers
-     * the resulting spill directories with {@link #registerLiveDirs(IOManager)}. The returned
-     * {@link IOManagerBuildResult} carries both the manager and the registered paths; callers must
-     * {@link IOManager#close()} the manager and {@link #unregisterLiveDirs(List)} the paths on failure
-     * and shutdown.
+     * Creates an IOManager and acquires exact owner locks for every manager directory.
+     *
+     * <p>Registration failure closes the unreturned manager. No caller can receive an IOManager
+     * whose spill directory lacks a stable approved-root capability.
      */
     public static IOManagerBuildResult resolveAndCreateIOManager(String configuredTmpDirs) {
         String[] roots = splitTmpDirRoots(resolveTmpDirs(configuredTmpDirs));
         IOManager ioManager = IOManager.create(roots);
-        List<String> spillDirs = registerLiveDirs(ioManager);
-        return new IOManagerBuildResult(ioManager, spillDirs);
+        try {
+            List<String> spillDirs = registerLiveDirs(ioManager);
+            return new IOManagerBuildResult(ioManager, spillDirs);
+        } catch (RuntimeException failure) {
+            try {
+                ioManager.close();
+            } catch (Exception closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
     }
 
-    /** Carries the products of {@link #resolveAndCreateIOManager(String)} for caller cleanup. */
     public static final class IOManagerBuildResult {
         private final IOManager ioManager;
         private final List<String> spillDirs;
@@ -123,60 +109,72 @@ public final class PaimonSpillDirCleaner {
     }
 
     /**
-     * Materialize and register the spill directories owned by the given IOManager so startup
-     * cleanup never deletes them while they are in use by this JVM.
-     *
-     * @return canonical paths of the registered spill directories (to be passed to {@link #unregisterLiveDirs})
+     * Registers only strict, direct-child Paimon UUID manager directories under a stable local root.
      */
     public static List<String> registerLiveDirs(IOManager ioManager) {
-        List<String> paths = spillDirPaths(ioManager);
+        Objects.requireNonNull(ioManager, "ioManager");
+        List<Path> managers = spillDirPaths(ioManager);
         List<String> registered = new ArrayList<>();
         try {
-            for (String path : paths) {
-                OwnerLock ownerLock = OwnerLock.tryAcquire(lockFile(path));
+            for (Path manager : managers) {
+                OwnerLock ownerLock = OwnerLock.tryAcquireManager(manager, true);
                 if (ownerLock == null) {
                     throw new IllegalStateException(
-                            "Paimon spill directory is already owned by another process");
+                            "Paimon spill manager lacks an exclusive stable owner capability");
                 }
+                String path = ownerLock.managerPath();
                 OwnerLock raced = OWNER_LOCKS.putIfAbsent(path, ownerLock);
                 if (raced != null) {
-                    ownerLock.close();
+                    ownerLock.close(false);
                     throw new IllegalStateException(
-                            "Paimon spill directory is already registered in this JVM");
+                            "Paimon spill manager is already registered in this JVM");
                 }
                 LIVE_DIRS.add(path);
                 registered.add(path);
             }
-            return paths;
-        } catch (RuntimeException e) {
-            unregisterLiveDirs(registered);
-            throw e;
+            return registered;
+        } catch (RuntimeException failure) {
+            try {
+                unregisterLiveDirs(registered);
+            } catch (RuntimeException rollbackFailure) {
+                failure.addSuppressed(rollbackFailure);
+            }
+            throw failure;
         }
     }
 
-    /** Remove previously registered spill directories from the live set. */
+    /** Releases only the exact owner locks named by the registration result. */
     public static void unregisterLiveDirs(List<String> spillDirs) {
+        RuntimeException failure = null;
         if (spillDirs != null) {
             for (String path : spillDirs) {
                 LIVE_DIRS.remove(path);
                 OwnerLock ownerLock = OWNER_LOCKS.remove(path);
                 if (ownerLock != null) {
-                    ownerLock.close();
-                    deleteQuietly(ownerLock.file);
+                    try {
+                        ownerLock.close(true);
+                    } catch (RuntimeException closeFailure) {
+                        if (failure == null) {
+                            failure = closeFailure;
+                        } else {
+                            failure.addSuppressed(closeFailure);
+                        }
+                    }
                 }
             }
         }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
-    private static List<String> spillDirPaths(IOManager ioManager) {
-        List<String> paths = new ArrayList<>();
+    private static List<Path> spillDirPaths(IOManager ioManager) {
+        List<Path> paths = new ArrayList<>();
         if (ioManager instanceof IOManagerImpl) {
-            // Note: getSpillingDirectories() lazily creates the dirs if absent, which is what we want
-            // so the dir exists and is protected from the moment a sibling cleanup could observe it.
             File[] dirs = ((IOManagerImpl) ioManager).getSpillingDirectories();
             if (dirs != null) {
                 for (File dir : dirs) {
-                    paths.add(canonical(dir));
+                    paths.add(dir.toPath().toAbsolutePath().normalize());
                 }
             }
         }
@@ -184,264 +182,742 @@ public final class PaimonSpillDirCleaner {
     }
 
     /**
-     * Delete stale {@code paimon-io-*} spill directories under the given roots. A directory is
-     * deleted only when it is not owned by a live IOManager in this JVM, its cross-process owner
-     * lock can be acquired, and it has not been modified within {@code graceMs}.
+     * Deletes stale managers and reports only the lowercase UUID manager id to the callback.
      *
-     * @param roots     temp roots to scan
-     * @param graceMs   freshness window protecting recently active / racing dirs
-     * @param onDeleted optional callback invoked per deleted dir with (canonicalPath, bytesDeleted)
-     * @return number of stale directories deleted
+     * <p>The callback never receives the configured root or a credential-bearing URI.
      */
-    public static int cleanupStaleSpillDirs(String[] roots, long graceMs, BiConsumer<String, Long> onDeleted) {
-        return cleanupStaleSpillDirs(roots, graceMs, onDeleted, Files::delete);
+    public static int cleanupStaleSpillDirs(
+            String[] roots, long graceMs, BiConsumer<String, Long> onDeleted) {
+        return cleanupStaleSpillDirs(roots, graceMs, onDeleted, null);
+    }
+
+    /**
+     * Deletes stale managers while rejecting a temp root equal to the configured local warehouse.
+     */
+    public static int cleanupStaleSpillDirs(
+            String[] roots,
+            long graceMs,
+            BiConsumer<String, Long> onDeleted,
+            String warehouseRoot) {
+        return cleanupStaleSpillDirs(
+                roots,
+                graceMs,
+                onDeleted,
+                warehouseRoot,
+                NOOP_BEFORE_DELETE,
+                PLATFORM_SECURE_ROOT);
     }
 
     static int cleanupStaleSpillDirs(
             String[] roots,
             long graceMs,
             BiConsumer<String, Long> onDeleted,
-            DeleteAction deleteAction) {
+            String warehouseRoot,
+            BeforeDeleteHook beforeDelete) {
+        return cleanupStaleSpillDirs(
+                roots,
+                graceMs,
+                onDeleted,
+                warehouseRoot,
+                beforeDelete,
+                PLATFORM_SECURE_ROOT);
+    }
+
+    static int cleanupStaleSpillDirs(
+            String[] roots,
+            long graceMs,
+            BiConsumer<String, Long> onDeleted,
+            String warehouseRoot,
+            BeforeDeleteHook beforeDelete,
+            SecureRootOpener secureRootOpener) {
         if (roots == null) {
             return 0;
         }
-        if (deleteAction == null) {
-            throw new IllegalArgumentException("Delete action must not be null");
+        if (graceMs < 0L) {
+            throw new IllegalArgumentException("graceMs must not be negative");
         }
+        Objects.requireNonNull(beforeDelete, "beforeDelete");
+        Objects.requireNonNull(secureRootOpener, "secureRootOpener");
         int deleted = 0;
         long now = System.currentTimeMillis();
-        for (String root : roots) {
-            if (root == null || root.trim().isEmpty()) {
+        Path workspace = Paths.get(System.getProperty("user.dir", "."));
+        for (String configuredRoot : roots) {
+            PaimonSpillPathCapability.ApprovedRoot approvedRoot =
+                    PaimonSpillPathCapability.approveRoot(
+                            configuredRoot, workspace, warehouseRoot);
+            if (approvedRoot == null) {
                 continue;
             }
-            File rootDir = new File(root.trim());
-            File[] children = rootDir.listFiles((dir, name) -> name.startsWith(SPILL_DIR_PREFIX));
-            if (children == null) {
-                continue;
-            }
-            for (File child : children) {
-                Path spillPath = child.toPath().toAbsolutePath().normalize();
-                if (!Files.isDirectory(spillPath, LinkOption.NOFOLLOW_LINKS)) {
+            SecureDirectoryStream<Path> scanRoot = null;
+            try {
+                scanRoot = secureRootOpener.open(approvedRoot);
+                if (scanRoot == null) {
                     continue;
                 }
-                String path = canonical(child);
-                if (LIVE_DIRS.contains(path)) {
-                    continue;
-                }
-                File ownerFile = lockFile(spillPath.toString());
-                if (!ownerFile.isFile()) {
-                    // Rolling-upgrade compatibility: older connector versions did not publish an
-                    // owner lock. Such a directory may still be active in an old JVM, so absence of
-                    // a lock file is not permission to delete it. Legacy leftovers require an
-                    // operator-controlled cleanup after all old tasks have stopped.
-                    continue;
-                }
-                OwnerLock cleanupLock = OwnerLock.tryAcquire(ownerFile);
-                if (cleanupLock == null) {
-                    // Another JVM still owns this spill directory. Age alone is never sufficient
-                    // evidence that a RocksDB/IOManager directory is inactive.
-                    continue;
-                }
-                boolean removeOwnerFile = false;
-                try {
-                    long newestModified;
+                for (Path entry : scanRoot) {
+                    Path managerName = entry.getFileName();
+                    if (managerName == null
+                            || !PaimonSpillPathCapability.isStrictManagerName(
+                                    managerName.toString())) {
+                        continue;
+                    }
+                    BasicFileAttributes observed =
+                            PaimonSpillPathCapability.readRelative(scanRoot, managerName);
+                    Object managerIdentity =
+                            PaimonSpillPathCapability.stableIdentity(observed);
+                    if (!observed.isDirectory()
+                            || observed.isSymbolicLink()
+                            || managerIdentity == null) {
+                        continue;
+                    }
+                    String managerPath =
+                            approvedRoot.realPath().resolve(managerName).toString();
+                    if (LIVE_DIRS.contains(managerPath)) {
+                        continue;
+                    }
+                    OwnerLock cleanupLock =
+                            OwnerLock.tryAcquire(
+                                    approvedRoot,
+                                    managerName,
+                                    false,
+                                    secureRootOpener);
+                    if (cleanupLock == null) {
+                        continue;
+                    }
+                    boolean managerDeleted = false;
                     try {
-                        newestModified = newestModified(spillPath);
-                    } catch (IOException | SecurityException inspectionFailure) {
-                        // Fail closed. Keep the owner marker so a later scan can retry.
-                        continue;
-                    }
-                    if (now - newestModified < graceMs) {
-                        continue;
-                    }
-                    DeletionResult result = deleteRecursively(spillPath, deleteAction);
-                    if (result.success) {
-                        removeOwnerFile = true;
+                        TreeNode tree =
+                                scanTree(
+                                        cleanupLock.rootStream,
+                                        managerName,
+                                        cleanupLock.managerIdentity);
+                        if (tree == null || now - tree.newestModified < graceMs) {
+                            continue;
+                        }
+                        beforeDelete.run(approvedRoot.realPath(), managerName.toString());
+                        if (!approvedRoot.isCurrent()
+                                || !cleanupLock.identitiesCurrent()
+                                || !deleteDirectoryTree(cleanupLock.rootStream, tree)) {
+                            continue;
+                        }
+                        managerDeleted = true;
+                        cleanupLock.deleteOwnerMarker = true;
                         deleted++;
                         if (onDeleted != null) {
-                            onDeleted.accept(path, result.bytesDeleted);
+                            onDeleted.accept(managerId(managerName), tree.regularFileBytes);
                         }
-                    }
-                } finally {
-                    cleanupLock.close();
-                    if (removeOwnerFile) {
-                        deleteQuietly(cleanupLock.file);
+                    } catch (IOException | SecurityException changedOrUnavailable) {
+                        // Fail closed. The exact lock and marker remain unless manager deletion
+                        // completed, and no absolute-path fallback is attempted.
+                    } finally {
+                        cleanupLock.close(managerDeleted);
                     }
                 }
+            } catch (IOException | SecurityException unavailable) {
+                // An unprovable root or provider capability is a skip, never deletion authority.
+            } finally {
+                closeDirectoryStream(scanRoot);
             }
         }
         return deleted;
     }
 
-    /** Newest lastModified across the dir and its direct children without following links. */
-    private static long newestModified(Path dir) throws IOException {
-        long newest =
-                Files.getLastModifiedTime(dir, LinkOption.NOFOLLOW_LINKS).toMillis();
-        try (DirectoryStream<Path> children = Files.newDirectoryStream(dir)) {
-            for (Path child : children) {
-                long m =
-                        Files.getLastModifiedTime(child, LinkOption.NOFOLLOW_LINKS).toMillis();
-                if (m > newest) {
-                    newest = m;
+    private static String managerId(Path managerName) {
+        return managerName.toString().substring(SPILL_DIR_PREFIX.length());
+    }
+
+    private static TreeNode scanTree(
+            SecureDirectoryStream<Path> parent, Path name, Object expectedIdentity)
+            throws IOException {
+        BasicFileAttributes attributes =
+                PaimonSpillPathCapability.readRelative(parent, name);
+        Object identity = PaimonSpillPathCapability.stableIdentity(attributes);
+        if (!attributes.isDirectory()
+                || attributes.isSymbolicLink()
+                || !PaimonSpillPathCapability.sameStableIdentity(
+                        expectedIdentity, identity)) {
+            return null;
+        }
+        DirectoryStream<Path> opened =
+                parent.newDirectoryStream(name, LinkOption.NOFOLLOW_LINKS);
+        SecureDirectoryStream<Path> directory =
+                PaimonSpillPathCapability.requireSecure(opened);
+        if (directory == null) {
+            opened.close();
+            return null;
+        }
+        try {
+            return scanOpenedDirectory(
+                    name,
+                    identity,
+                    attributes.lastModifiedTime().toMillis(),
+                    directory,
+                    0);
+        } finally {
+            directory.close();
+        }
+    }
+
+    private static TreeNode scanOpenedDirectory(
+            Path name,
+            Object identity,
+            long lastModified,
+            SecureDirectoryStream<Path> directory,
+            int depth)
+            throws IOException {
+        if (depth > MAX_SECURE_TREE_DEPTH) {
+            return null;
+        }
+        List<TreeNode> children = new ArrayList<>();
+        long bytes = 0L;
+        long newest = lastModified;
+        for (Path entry : directory) {
+            Path childName = entry.getFileName();
+            if (childName == null) {
+                return null;
+            }
+            BasicFileAttributes attributes =
+                    PaimonSpillPathCapability.readRelative(directory, childName);
+            Object childIdentity =
+                    PaimonSpillPathCapability.stableIdentity(attributes);
+            if (attributes.isSymbolicLink() || childIdentity == null) {
+                return null;
+            }
+            TreeNode child;
+            if (attributes.isDirectory()) {
+                DirectoryStream<Path> opened =
+                        directory.newDirectoryStream(
+                                childName, LinkOption.NOFOLLOW_LINKS);
+                SecureDirectoryStream<Path> childDirectory =
+                        PaimonSpillPathCapability.requireSecure(opened);
+                if (childDirectory == null) {
+                    opened.close();
+                    return null;
                 }
+                try {
+                    child =
+                            scanOpenedDirectory(
+                                    childName,
+                                    childIdentity,
+                                    attributes.lastModifiedTime().toMillis(),
+                                    childDirectory,
+                                    depth + 1);
+                } finally {
+                    childDirectory.close();
+                }
+                if (child == null) {
+                    return null;
+                }
+            } else if (attributes.isRegularFile()) {
+                child =
+                        TreeNode.file(
+                                childName,
+                                childIdentity,
+                                attributes.lastModifiedTime().toMillis(),
+                                attributes.size());
+            } else {
+                return null;
+            }
+            children.add(child);
+            bytes = saturatedAdd(bytes, child.regularFileBytes);
+            if (child.newestModified > newest) {
+                newest = child.newestModified;
             }
         }
-        return newest;
+        return TreeNode.directory(name, identity, newest, bytes, children);
     }
 
-    /** Delete a tree without following symbolic links. */
-    private static DeletionResult deleteRecursively(Path root, DeleteAction deleteAction) {
-        DeletingFileVisitor visitor = new DeletingFileVisitor(deleteAction);
+    private static boolean deleteDirectoryTree(
+            SecureDirectoryStream<Path> parent, TreeNode directoryNode) {
         try {
-            Files.walkFileTree(root, visitor);
-        } catch (IOException | SecurityException traversalFailure) {
-            visitor.failed = true;
+            if (!matches(parent, directoryNode, true)) {
+                return false;
+            }
+            DirectoryStream<Path> opened =
+                    parent.newDirectoryStream(
+                            directoryNode.name, LinkOption.NOFOLLOW_LINKS);
+            SecureDirectoryStream<Path> directory =
+                    PaimonSpillPathCapability.requireSecure(opened);
+            if (directory == null) {
+                opened.close();
+                return false;
+            }
+            try {
+                Map<String, TreeNode> expected = new HashMap<>();
+                for (TreeNode child : directoryNode.children) {
+                    expected.put(child.name.toString(), child);
+                }
+                int observedCount = 0;
+                for (Path entry : directory) {
+                    Path childName = entry.getFileName();
+                    TreeNode child =
+                            childName == null ? null : expected.get(childName.toString());
+                    if (child == null || !matches(directory, child, child.directory)) {
+                        return false;
+                    }
+                    observedCount++;
+                }
+                if (observedCount != expected.size()) {
+                    return false;
+                }
+                for (TreeNode child : directoryNode.children) {
+                    boolean childDeleted;
+                    if (child.directory) {
+                        childDeleted = deleteDirectoryTree(directory, child);
+                    } else {
+                        childDeleted = deleteFile(directory, child);
+                    }
+                    if (!childDeleted) {
+                        return false;
+                    }
+                }
+            } finally {
+                directory.close();
+            }
+            if (!matches(parent, directoryNode, true)) {
+                return false;
+            }
+            parent.deleteDirectory(directoryNode.name);
+            return true;
+        } catch (IOException | SecurityException changed) {
+            return false;
         }
-        boolean rootDeleted = Files.notExists(root, LinkOption.NOFOLLOW_LINKS);
-        return new DeletionResult(!visitor.failed && rootDeleted, visitor.bytesDeleted);
     }
 
-    static String canonical(File file) {
+    private static boolean deleteFile(
+            SecureDirectoryStream<Path> parent, TreeNode fileNode) {
         try {
-            return file.getCanonicalPath();
-        } catch (IOException e) {
-            return file.getAbsolutePath();
+            if (!matches(parent, fileNode, false)) {
+                return false;
+            }
+            parent.deleteFile(fileNode.name);
+            return true;
+        } catch (IOException | SecurityException changed) {
+            return false;
         }
     }
 
-    private static File lockFile(String canonicalSpillDir) {
-        File spillDir = new File(canonicalSpillDir);
-        return new File(
-                spillDir.getParentFile(), "." + spillDir.getName() + OWNER_LOCK_SUFFIX);
+    private static boolean matches(
+            SecureDirectoryStream<Path> parent, TreeNode node, boolean directory)
+            throws IOException {
+        BasicFileAttributes current =
+                PaimonSpillPathCapability.readRelative(parent, node.name);
+        return !current.isSymbolicLink()
+                && (directory ? current.isDirectory() : current.isRegularFile())
+                && PaimonSpillPathCapability.sameStableIdentity(
+                        node.identity,
+                        PaimonSpillPathCapability.stableIdentity(current));
     }
 
-    private static void deleteQuietly(File file) {
-        if (file != null && file.exists()) {
-            // Best effort. A stale unlocked owner file is harmless and is reused by the next scan.
-            file.delete();
+    private static void closeDirectoryStream(DirectoryStream<Path> stream) {
+        if (stream != null) {
+            try {
+                stream.close();
+            } catch (IOException closeFailure) {
+                throw new IllegalStateException(
+                        "Failed to close a spill directory capability", closeFailure);
+            }
         }
     }
 
     @FunctionalInterface
-    interface DeleteAction {
-        void delete(Path path) throws IOException;
+    interface BeforeDeleteHook {
+        void run(Path approvedRoot, String managerName) throws IOException;
     }
 
-    private static final class DeletingFileVisitor extends SimpleFileVisitor<Path> {
-        private final DeleteAction deleteAction;
-        private long bytesDeleted;
-        private boolean failed;
-
-        private DeletingFileVisitor(DeleteAction deleteAction) {
-            this.deleteAction = deleteAction;
-        }
-
-        @Override
-        public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) {
-            long fileBytes = attributes.isRegularFile() ? attributes.size() : 0L;
-            delete(file, fileBytes);
-            return FileVisitResult.CONTINUE;
-        }
-
-        @Override
-        public FileVisitResult visitFileFailed(Path file, IOException failure) {
-            failed = true;
-            return FileVisitResult.CONTINUE;
-        }
-
-        @Override
-        public FileVisitResult postVisitDirectory(Path dir, IOException failure) {
-            if (failure != null) {
-                failed = true;
-            }
-            delete(dir, 0L);
-            return FileVisitResult.CONTINUE;
-        }
-
-        private void delete(Path path, long fileBytes) {
-            try {
-                deleteAction.delete(path);
-                bytesDeleted = saturatedAdd(bytesDeleted, fileBytes);
-            } catch (IOException | SecurityException deleteFailure) {
-                failed = true;
-            }
-        }
+    @FunctionalInterface
+    interface SecureRootOpener {
+        SecureDirectoryStream<Path> open(
+                PaimonSpillPathCapability.ApprovedRoot approvedRoot)
+                throws IOException;
     }
 
-    private static final class DeletionResult {
-        private final boolean success;
-        private final long bytesDeleted;
+    private static final class TreeNode {
+        private final Path name;
+        private final Object identity;
+        private final boolean directory;
+        private final long newestModified;
+        private final long regularFileBytes;
+        private final List<TreeNode> children;
 
-        private DeletionResult(boolean success, long bytesDeleted) {
-            this.success = success;
-            this.bytesDeleted = bytesDeleted;
+        private TreeNode(
+                Path name,
+                Object identity,
+                boolean directory,
+                long newestModified,
+                long regularFileBytes,
+                List<TreeNode> children) {
+            this.name = name;
+            this.identity = identity;
+            this.directory = directory;
+            this.newestModified = newestModified;
+            this.regularFileBytes = regularFileBytes;
+            this.children = children;
+        }
+
+        private static TreeNode file(
+                Path name, Object identity, long modified, long bytes) {
+            return new TreeNode(
+                    name,
+                    identity,
+                    false,
+                    modified,
+                    bytes,
+                    java.util.Collections.emptyList());
+        }
+
+        private static TreeNode directory(
+                Path name,
+                Object identity,
+                long newest,
+                long bytes,
+                List<TreeNode> children) {
+            return new TreeNode(name, identity, true, newest, bytes, children);
         }
     }
 
     private static final class OwnerLock {
-        private final File file;
-        private final RandomAccessFile randomAccessFile;
+        private final PaimonSpillPathCapability.ApprovedRoot approvedRoot;
+        private final SecureDirectoryStream<Path> rootStream;
+        private final Path managerName;
+        private final Path ownerName;
+        private final Path ownerAbsolutePath;
+        private final Object managerIdentity;
+        private final Object ownerIdentity;
         private final FileChannel channel;
         private final FileLock lock;
+        private boolean deleteOwnerMarker;
 
         private OwnerLock(
-                File file,
-                RandomAccessFile randomAccessFile,
+                PaimonSpillPathCapability.ApprovedRoot approvedRoot,
+                SecureDirectoryStream<Path> rootStream,
+                Path managerName,
+                Path ownerName,
+                Path ownerAbsolutePath,
+                Object managerIdentity,
+                Object ownerIdentity,
                 FileChannel channel,
                 FileLock lock) {
-            this.file = file;
-            this.randomAccessFile = randomAccessFile;
+            this.approvedRoot = approvedRoot;
+            this.rootStream = rootStream;
+            this.managerName = managerName;
+            this.ownerName = ownerName;
+            this.ownerAbsolutePath = ownerAbsolutePath;
+            this.managerIdentity = managerIdentity;
+            this.ownerIdentity = ownerIdentity;
             this.channel = channel;
             this.lock = lock;
         }
 
-        private static OwnerLock tryAcquire(File file) {
-            RandomAccessFile randomAccessFile = null;
+        private static OwnerLock tryAcquireManager(Path manager, boolean createMarker) {
+            Path normalized = manager.toAbsolutePath().normalize();
+            Path parent = normalized.getParent();
+            Path name = normalized.getFileName();
+            if (parent == null
+                    || name == null
+                    || !PaimonSpillPathCapability.isStrictManagerName(
+                            name.toString())) {
+                return null;
+            }
+            PaimonSpillPathCapability.ApprovedRoot approved =
+                    PaimonSpillPathCapability.approveRoot(
+                            parent.toString(),
+                            Paths.get(System.getProperty("user.dir", ".")),
+                            null);
+            if (approved == null
+                    || !approved.realPath().resolve(name).normalize().equals(normalized)) {
+                return null;
+            }
+            return tryAcquireWithoutDeletionCapability(approved, name, createMarker);
+        }
+
+        /**
+         * Acquires the live-owner marker without requiring destructive directory capability.
+         * Registration uses only exact absolute paths plus root/manager/marker identity checks;
+         * platforms without {@link SecureDirectoryStream} can therefore still spill normally.
+         */
+        private static OwnerLock tryAcquireWithoutDeletionCapability(
+                PaimonSpillPathCapability.ApprovedRoot approvedRoot,
+                Path managerName,
+                boolean createMarker) {
             FileChannel channel = null;
+            FileLock fileLock = null;
             try {
-                randomAccessFile = new RandomAccessFile(file, "rw");
-                channel = randomAccessFile.getChannel();
-                FileLock lock = channel.tryLock();
-                if (lock == null) {
-                    closeQuietly(channel, randomAccessFile);
+                if (!approvedRoot.isCurrent()) {
                     return null;
                 }
-                return new OwnerLock(file, randomAccessFile, channel, lock);
-            } catch (OverlappingFileLockException e) {
-                closeQuietly(channel, randomAccessFile);
+                Path managerPath = approvedRoot.realPath().resolve(managerName);
+                BasicFileAttributes managerAttributes =
+                        PaimonSpillPathCapability.readAbsolute(managerPath);
+                Object managerIdentity =
+                        PaimonSpillPathCapability.stableIdentity(managerAttributes);
+                if (!managerAttributes.isDirectory()
+                        || managerAttributes.isSymbolicLink()
+                        || managerIdentity == null) {
+                    return null;
+                }
+                Path ownerName = ownerName(managerName);
+                Path ownerPath = approvedRoot.realPath().resolve(ownerName);
+                Set<OpenOption> options = ownerOpenOptions(createMarker);
+                channel = FileChannel.open(ownerPath, options);
+                BasicFileAttributes ownerAttributes =
+                        PaimonSpillPathCapability.readAbsolute(ownerPath);
+                Object ownerIdentity =
+                        PaimonSpillPathCapability.stableIdentity(ownerAttributes);
+                if (!ownerAttributes.isRegularFile()
+                        || ownerAttributes.isSymbolicLink()
+                        || ownerIdentity == null) {
+                    closeAcquisition(null, channel, null);
+                    return null;
+                }
+                fileLock = channel.tryLock();
+                if (fileLock == null) {
+                    closeAcquisition(null, channel, null);
+                    return null;
+                }
+                OwnerLock ownerLock =
+                        new OwnerLock(
+                                approvedRoot,
+                                null,
+                                managerName,
+                                ownerName,
+                                ownerPath,
+                                managerIdentity,
+                                ownerIdentity,
+                                channel,
+                                fileLock);
+                if (!ownerLock.identitiesCurrent()) {
+                    ownerLock.close(false);
+                    return null;
+                }
+                return ownerLock;
+            } catch (OverlappingFileLockException unavailable) {
+                closeAcquisition(fileLock, channel, null);
                 return null;
-            } catch (IOException | RuntimeException e) {
-                closeQuietly(channel, randomAccessFile);
-                // Cleanup must fail closed: inability to prove exclusive ownership means skip.
+            } catch (IOException | RuntimeException unavailable) {
+                closeAcquisition(fileLock, channel, null);
                 return null;
             }
         }
 
-        private void close() {
+        private static OwnerLock tryAcquire(
+                PaimonSpillPathCapability.ApprovedRoot approvedRoot,
+                Path managerName,
+                boolean createMarker,
+                SecureRootOpener secureRootOpener) {
+            SecureDirectoryStream<Path> rootStream = null;
+            SeekableByteChannel openedChannel = null;
+            FileLock fileLock = null;
+            try {
+                rootStream = secureRootOpener.open(approvedRoot);
+                if (rootStream == null || !approvedRoot.isCurrent()) {
+                    closeDirectoryStream(rootStream);
+                    return null;
+                }
+                BasicFileAttributes managerAttributes =
+                        PaimonSpillPathCapability.readRelative(
+                                rootStream, managerName);
+                Object managerIdentity =
+                        PaimonSpillPathCapability.stableIdentity(
+                                managerAttributes);
+                if (!managerAttributes.isDirectory()
+                        || managerAttributes.isSymbolicLink()
+                        || managerIdentity == null) {
+                    closeDirectoryStream(rootStream);
+                    return null;
+                }
+                Path ownerName = ownerName(managerName);
+                Set<OpenOption> options = ownerOpenOptions(createMarker);
+                openedChannel = rootStream.newByteChannel(ownerName, options);
+                if (!(openedChannel instanceof FileChannel)) {
+                    openedChannel.close();
+                    closeDirectoryStream(rootStream);
+                    return null;
+                }
+                BasicFileAttributes ownerAttributes =
+                        PaimonSpillPathCapability.readRelative(
+                                rootStream, ownerName);
+                Object ownerIdentity =
+                        PaimonSpillPathCapability.stableIdentity(ownerAttributes);
+                if (!ownerAttributes.isRegularFile()
+                        || ownerAttributes.isSymbolicLink()
+                        || ownerIdentity == null) {
+                    openedChannel.close();
+                    closeDirectoryStream(rootStream);
+                    return null;
+                }
+                FileChannel channel = (FileChannel) openedChannel;
+                fileLock = channel.tryLock();
+                if (fileLock == null) {
+                    channel.close();
+                    closeDirectoryStream(rootStream);
+                    return null;
+                }
+                OwnerLock ownerLock =
+                        new OwnerLock(
+                                approvedRoot,
+                                rootStream,
+                                managerName,
+                                ownerName,
+                                approvedRoot.realPath().resolve(ownerName),
+                                managerIdentity,
+                                ownerIdentity,
+                                channel,
+                                fileLock);
+                if (!ownerLock.identitiesCurrent()) {
+                    ownerLock.close(false);
+                    return null;
+                }
+                return ownerLock;
+            } catch (OverlappingFileLockException unavailable) {
+                closeAcquisition(fileLock, openedChannel, rootStream);
+                return null;
+            } catch (IOException | RuntimeException unavailable) {
+                closeAcquisition(fileLock, openedChannel, rootStream);
+                return null;
+            }
+        }
+
+        private static Path ownerName(Path managerName) {
+            return managerName.resolveSibling(
+                    "." + managerName + OWNER_LOCK_SUFFIX);
+        }
+
+        private static Set<OpenOption> ownerOpenOptions(boolean createMarker) {
+            Set<OpenOption> options =
+                    new HashSet<>(
+                            Arrays.asList(
+                                    StandardOpenOption.READ,
+                                    StandardOpenOption.WRITE,
+                                    LinkOption.NOFOLLOW_LINKS));
+            if (createMarker) {
+                options.add(StandardOpenOption.CREATE);
+            }
+            return options;
+        }
+
+        private String managerPath() {
+            return approvedRoot.realPath().resolve(managerName).toString();
+        }
+
+        private boolean identitiesCurrent() {
+            try {
+                BasicFileAttributes manager;
+                BasicFileAttributes owner;
+                if (rootStream == null) {
+                    manager =
+                            PaimonSpillPathCapability.readAbsolute(
+                                    approvedRoot.realPath().resolve(managerName));
+                    owner = PaimonSpillPathCapability.readAbsolute(ownerAbsolutePath);
+                } else {
+                    manager =
+                            PaimonSpillPathCapability.readRelative(
+                                    rootStream, managerName);
+                    owner =
+                            PaimonSpillPathCapability.readRelative(
+                                    rootStream, ownerName);
+                }
+                return approvedRoot.isCurrent()
+                        && manager.isDirectory()
+                        && !manager.isSymbolicLink()
+                        && owner.isRegularFile()
+                        && !owner.isSymbolicLink()
+                        && PaimonSpillPathCapability.sameStableIdentity(
+                                managerIdentity,
+                                PaimonSpillPathCapability.stableIdentity(manager))
+                        && PaimonSpillPathCapability.sameStableIdentity(
+                                ownerIdentity,
+                                PaimonSpillPathCapability.stableIdentity(owner));
+            } catch (IOException | RuntimeException changed) {
+                return false;
+            }
+        }
+
+        private void close(boolean managerDeleted) {
+            IOException failure = null;
             try {
                 lock.release();
-            } catch (IOException ignored) {
-                // Best effort; closing the channel also releases the process lock.
+            } catch (IOException releaseFailure) {
+                failure = releaseFailure;
             }
-            closeQuietly(channel, randomAccessFile);
+            try {
+                channel.close();
+            } catch (IOException closeFailure) {
+                failure = append(failure, closeFailure);
+            }
+            if ((managerDeleted || deleteOwnerMarker) && approvedRoot.isCurrent()) {
+                try {
+                    BasicFileAttributes owner =
+                            rootStream == null
+                                    ? PaimonSpillPathCapability.readAbsolute(ownerAbsolutePath)
+                                    : PaimonSpillPathCapability.readRelative(
+                                            rootStream, ownerName);
+                    if (owner.isRegularFile()
+                            && !owner.isSymbolicLink()
+                            && PaimonSpillPathCapability.sameStableIdentity(
+                                    ownerIdentity,
+                                    PaimonSpillPathCapability.stableIdentity(owner))) {
+                        if (rootStream == null) {
+                            Files.delete(ownerAbsolutePath);
+                        } else {
+                            rootStream.deleteFile(ownerName);
+                        }
+                    }
+                } catch (IOException deleteFailure) {
+                    failure = append(failure, deleteFailure);
+                }
+            }
+            if (rootStream != null) {
+                try {
+                    rootStream.close();
+                } catch (IOException closeFailure) {
+                    failure = append(failure, closeFailure);
+                }
+            }
+            if (failure != null) {
+                throw new IllegalStateException(
+                        "Failed to close an exact spill owner capability", failure);
+            }
         }
 
-        private static void closeQuietly(
-                FileChannel channel, RandomAccessFile randomAccessFile) {
+        private static void closeAcquisition(
+                FileLock lock,
+                SeekableByteChannel channel,
+                DirectoryStream<Path> stream) {
+            IOException failure = null;
+            if (lock != null) {
+                try {
+                    lock.release();
+                } catch (IOException releaseFailure) {
+                    failure = releaseFailure;
+                }
+            }
             if (channel != null) {
                 try {
                     channel.close();
-                } catch (IOException ignored) {
-                    // Best effort.
+                } catch (IOException closeFailure) {
+                    failure = append(failure, closeFailure);
                 }
             }
-            if (randomAccessFile != null) {
+            if (stream != null) {
                 try {
-                    randomAccessFile.close();
-                } catch (IOException ignored) {
-                    // Best effort.
+                    stream.close();
+                } catch (IOException closeFailure) {
+                    failure = append(failure, closeFailure);
                 }
             }
+            if (failure != null) {
+                throw new IllegalStateException(
+                        "Failed to roll back a spill owner capability", failure);
+            }
+        }
+
+        private static IOException append(IOException first, IOException next) {
+            if (first == null) {
+                return next;
+            }
+            first.addSuppressed(next);
+            return first;
         }
     }
 }

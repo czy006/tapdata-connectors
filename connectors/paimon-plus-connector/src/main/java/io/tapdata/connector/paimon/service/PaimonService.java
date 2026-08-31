@@ -374,12 +374,19 @@ public class PaimonService implements AutoCloseable {
 			int deleted = PaimonSpillDirCleaner.cleanupStaleSpillDirs(
 					roots,
 					PaimonSpillDirCleaner.DEFAULT_STALE_GRACE_MS,
-					(path, bytes) -> log.info("Removed stale Paimon spill dir {} ({} bytes)", path, bytes));
+					(managerId, bytes) ->
+							log.info(
+									"Removed stale Paimon spill manager {} ({} bytes)",
+									managerId,
+									bytes),
+					config.getFullWarehousePath());
 			if (deleted > 0) {
-				log.info("Cleaned up {} stale Paimon spill dir(s) under {}", deleted, tmpDirs);
+				log.info("Cleaned up {} stale Paimon spill manager(s)", deleted);
 			}
 		} catch (Exception e) {
-			log.warn("Failed to clean up stale Paimon spill dirs: {}", e.getMessage());
+			log.warn(
+					"PAIMON_SPILL_CLEANUP_SKIPPED failureType={}",
+					e.getClass().getSimpleName());
 		}
 	}
 
