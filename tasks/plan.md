@@ -107,93 +107,29 @@ DEPENDENCY_CLOSE_FAILED_RETAINED / IO_CLOSE_FAILED_RETAINED
 ## 6. 架构与依赖图
 
 ```mermaid
-flowchart TD
-    T0[0 Baseline] --> T2[2 Structured API]
-    T0 --> T4[4 FileDeletion drain]
-    T0 --> T6[6 Async reader option]
-    T0 --> T7[7 GlobalIndex cleanup]
-    T0 --> T8[8 Secured wrapper non-owning]
-    T2 --> T3A[3A Manifest lazy consumers]
-    T3A --> T3B[3B Remaining lazy consumers]
-    T2 --> T5[5 Maintenance lifecycle]
-    T3B --> T5
-    T8 --> T9[9 FileIO access probe]
-    T8 --> T10[10 Hadoop owned entry]
-    T9 --> T10
-    T2 --> T11[11 Capability ABI]
-    T5 --> T11
-    T6 --> T11
-    T7 --> T11
-    T10 --> T11
-    T11 --> T12[12 Maven closure]
-    T12 --> T13[13 Publish artifacts / G1b]
-    T4 --> T13
-
-    T13 --> T14[14 Connector dependency gate]
-    T14 --> T15[15 Coordinator admission]
-    T14 --> T16[16 Lease/proof state]
-    T14 --> T17[17 Spill path capability]
-    T15 --> T17
-    T16 --> T17
-    T14 --> T18[18 Compaction runtime]
-    T14 --> T20[20 Runtime table]
-    T14 --> T30[30 Read scope core]
-    T18 --> T19[19 Prepared writer]
-    T2 --> T21[21 Sequential bootstrap]
-    T3B --> T21
-    T6 --> T21
-    T20 --> T21
-    T7 --> T22[22 HASH preflight / staged index]
-    T17 --> T22
-    T20 --> T22
-    T21 --> T22
-    T5 --> T23[23 Maintenance adapter]
-    T16 --> T24[24 Write lifecycle]
-    T18 --> T24
-    T19 --> T24
-    T23 --> T24
-    T17 --> T25[25 Factory rollback]
-    T20 --> T25
-    T22 --> T25
-    T24 --> T25
-    T25 --> T26[26 Context activation]
-    T26 --> T27[27 Real spill test]
-    T15 --> T28[28 Service coordinator adoption]
-    T16 --> T28
-    T26 --> T28
-    T24 --> T29[29 STOP/write-failure]
-    T28 --> T29
-    T2 --> T30
-    T3B --> T30
-    T15 --> T30
-    T16 --> T30
-    G0{{G0 Q4}} --> T31[31 DDL orchestration]
-    T16 --> T31
-    T29 --> T31
-    T30 --> T31
-    T20 --> T32[32 Read integration]
-    T21 --> T32
-    T28 --> T32
-    T30 --> T32
-    T31 --> T32
-    T15 --> T33[33 Global barrier]
-    T16 --> T33
-    T29 --> T33
-    T30 --> T33
-    T32 --> T33
-    T9 --> T34[34 Hadoop integration]
-    T10 --> T34
-    T14 --> T34
-    T33 --> T34
-    T22 --> T35[35 Bucket/E2E]
-    T27 --> T35
-    T31 --> T35
-    T32 --> T35
-    T34 --> T35
-    T35 --> T36[36 Test execution gate]
-    T36 --> T37[37 Performance/deployment]
-    T37 --> T38[38 Release evidence]
+graph TD
+    G1A["G1a: source baseline"] --> A["Phase A: Paimon structured lifecycle; Tasks 0 and 2-7"]
+    A --> B["Phase B: Hadoop ownership and artifacts; Tasks 8-13"]
+    B --> G1B["G1b: immutable artifact closure"]
+    G1B --> C["Phase C: Connector write lifecycle; Tasks 14-27"]
+    C --> D0["Phase D foundation: Service, STOP, and read scope; Tasks 28-30"]
+    D0 --> DDL["DDL orchestration; Task 31"]
+    G0{"G0: DDL deadline decision"} -.->|blocks this task and downstream only| DDL
+    DDL --> D1["Read integration, global barrier, and Hadoop integration; Tasks 32-34"]
+    D1 --> E["Phase E: regression, performance, and release; Tasks 35-38"]
+    E --> G4["G4: executed-test evidence"]
 ```
+
+任务级依赖以 [`tasks/todo.md`](todo.md) 每个 Task 的“依赖”字段为规范来源。纯 Markdown 阶段关系如下：
+
+| 阶段 | Task | 前置门禁 | 阶段出口 |
+|---|---|---|---|
+| A：Paimon structured lifecycle | 0、2–7 | G1a | structured 0/1-item drain、maintenance、async reader、GlobalIndex测试通过 |
+| B：Hadoop ownership与制品 | 8–13 | A | G1b：effective POM、dependency tree、checksum、capability闭合 |
+| C：Connector write lifecycle | 14–27 | G1b | Factory fixed rollback与真实spill测试通过 |
+| D0：Service/STOP/read scope基础 | 28–30 | C | 不依赖G0；完成Service、STOP与read scope owner接入 |
+| D1：DDL与global barrier | 31–34 | D0；Task 31额外依赖G0 | read/DDL/global cleanup/Hadoop实际实例收口 |
+| E：回归与发布 | 35–38 | D | G4：关键Surefire XML中`tests > 0`且全量测试通过 |
 
 ## 7. 实施阶段与 Checkpoint
 
