@@ -1,13 +1,18 @@
 package io.tapdata.connector.paimon.service;
 
+import io.tapdata.connector.paimon.write.PaimonTableWriteContext;
+import io.tapdata.connector.paimon.write.PaimonWriteResourceLifecycle;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -37,10 +42,350 @@ final class PaimonServiceResourceCoordinator {
             new LinkedHashMap<>();
     private final Map<Long, ReadBorrow> retainedBorrows = new LinkedHashMap<>();
     private final Map<String, TableReadFence> tableReadFences = new LinkedHashMap<>();
+    private final Map<String, PaimonWriteGenerationOwnership> activeWriteGenerations =
+            new LinkedHashMap<>();
+    private final Map<String, PaimonWriteGenerationOwnership> retainedWriteGenerations =
+            new LinkedHashMap<>();
+    private final Map<String, PaimonWriteGenerationOwnership> ownershipTransfers =
+            new LinkedHashMap<>();
+    private final Map<String, PaimonWriteGenerationOwnership> activeDdlActions =
+            new LinkedHashMap<>();
+    private final Map<String, PaimonTableWriteContext> writeContexts;
+    private final String serviceOwnerId;
+    private final PhysicalTableWriterLease.Registry physicalLeaseRegistry;
+    private final Runnable acquisitionReservedObserver;
     private long nextRegistrationId;
     private long nextBorrowId;
     private long nextFenceId;
     private ServiceReadFence serviceReadFence;
+
+    PaimonServiceResourceCoordinator() {
+        this(
+                UUID.randomUUID().toString(),
+                PhysicalTableWriterLease.jvmRegistry(),
+                new LinkedHashMap<>(),
+                () -> {});
+    }
+
+    PaimonServiceResourceCoordinator(
+            String serviceOwnerId, PhysicalTableWriterLease.Registry physicalLeaseRegistry) {
+        this(serviceOwnerId, physicalLeaseRegistry, new LinkedHashMap<>(), () -> {});
+    }
+
+    PaimonServiceResourceCoordinator(
+            String serviceOwnerId,
+            PhysicalTableWriterLease.Registry physicalLeaseRegistry,
+            Runnable acquisitionReservedObserver) {
+        this(
+                serviceOwnerId,
+                physicalLeaseRegistry,
+                new LinkedHashMap<>(),
+                acquisitionReservedObserver);
+    }
+
+    PaimonServiceResourceCoordinator(
+            String serviceOwnerId,
+            PhysicalTableWriterLease.Registry physicalLeaseRegistry,
+            Map<String, PaimonTableWriteContext> writeContexts,
+            Runnable acquisitionReservedObserver) {
+        requireNonBlank(serviceOwnerId, "Service owner id");
+        this.serviceOwnerId = serviceOwnerId;
+        this.physicalLeaseRegistry =
+                Objects.requireNonNull(physicalLeaseRegistry, "physicalLeaseRegistry");
+        this.writeContexts = Objects.requireNonNull(writeContexts, "writeContexts");
+        this.acquisitionReservedObserver =
+                Objects.requireNonNull(acquisitionReservedObserver, "acquisitionReservedObserver");
+    }
+
+    /**
+     * Reserves coordinator ownership before entering the JVM registry, then acquires the exact
+     * physical slot without nesting the two locks. The reservation itself blocks the global-close
+     * barrier while the registry operation is in flight.
+     */
+    PaimonWriteGenerationOwnership acquireWriterGeneration(
+            String physicalTableHash, String logicalTableKey) {
+        requireNonBlank(physicalTableHash, "Physical table hash");
+        requireNonBlank(logicalTableKey, "Logical table key");
+        PhysicalTableWriterLease lease =
+                PhysicalTableWriterLease.newGeneration(
+                        physicalTableHash,
+                        logicalTableKey,
+                        serviceOwnerId,
+                        PhysicalTableWriterLease.Purpose.WRITER);
+        PaimonWriteGenerationOwnership ownership =
+                new PaimonWriteGenerationOwnership(lease);
+        synchronized (admissionLock) {
+            if (serviceReadFence != null) {
+                throw new AdmissionRejectedException(
+                        "Paimon service write admission is fenced");
+            }
+            if (activeWriteGenerations.containsKey(logicalTableKey)
+                    || hasRetainedWriteGenerationLocked(logicalTableKey)) {
+                throw new AdmissionRejectedException(
+                        "Paimon writer generation already exists for " + logicalTableKey);
+            }
+            activeWriteGenerations.put(logicalTableKey, ownership);
+        }
+
+        try {
+            acquisitionReservedObserver.run();
+        } catch (RuntimeException | Error observerFailure) {
+            synchronized (admissionLock) {
+                removeActiveExpectedLocked(ownership);
+                ownership.markAcquireFailed();
+            }
+            throw observerFailure;
+        }
+        boolean acquired = physicalLeaseRegistry.tryAcquire(lease);
+        synchronized (admissionLock) {
+            if (!acquired) {
+                removeActiveExpectedLocked(ownership);
+                ownership.markAcquireFailed();
+                throw new AdmissionRejectedException(
+                        "Physical Paimon table already has an active writer");
+            }
+            ownership.markLeaseActive();
+            return ownership;
+        }
+    }
+
+    PaimonWriteGenerationOwnership.LifecycleBinding prepareLifecycleBinding(
+            PaimonWriteGenerationOwnership expectedOwnership) {
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            return expectedOwnership.newLifecycleBinding();
+        }
+    }
+
+    void publishContext(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonTableWriteContext context) {
+        Objects.requireNonNull(context, "context");
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            if (expectedOwnership.phase()
+                    != PaimonWriteGenerationOwnership.Phase.LEASE_ACTIVE) {
+                throw new IllegalStateException(
+                        "Writer generation is not awaiting Context publication");
+            }
+            if (!expectedOwnership.physicalLease().logicalTableKey().equals(context.tableKey())) {
+                throw new IllegalArgumentException(
+                        "Context table key does not match the writer generation");
+            }
+            if (writeContexts.containsKey(context.tableKey())) {
+                throw new IllegalStateException(
+                        "A Context is already published for " + context.tableKey());
+            }
+            context.attachGenerationOwnership(expectedOwnership.newContextPublication());
+            writeContexts.put(context.tableKey(), context);
+        }
+    }
+
+    void beginStopFinalization(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonTableWriteContext expectedContext,
+            PaimonWriteResourceLifecycle.CloseOutcome resourceClosedEvidence) {
+        PaimonWriteGenerationOwnership.FinalizationClaim claim;
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            requireExactContextLocked(expectedOwnership, expectedContext);
+            PaimonWriteGenerationOwnership.Phase claimOrigin =
+                    expectedOwnership.phase();
+            if (claimOrigin != PaimonWriteGenerationOwnership.Phase.CONTEXT_ACTIVE
+                    && claimOrigin
+                            != PaimonWriteGenerationOwnership.Phase.DDL_TRANSFER_PREPARED) {
+                throw new IllegalStateException(
+                        "STOP cannot claim writer generation from " + claimOrigin);
+            }
+            claim =
+                    expectedOwnership.prepareClosedSuccessClaim(
+                            claimOrigin,
+                            expectedContext,
+                            resourceClosedEvidence,
+                            PaimonWriteCloseModel.InitiatingReason.STOP);
+        }
+        claimFinalizationOutsideAdmissionLock(expectedOwnership, claim);
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            if (!removeExactContextLocked(expectedOwnership, expectedContext)) {
+                IllegalStateException failure =
+                        new IllegalStateException(
+                                "STOP exact Context compare-remove was rejected");
+                expectedOwnership.retainClaimedContextFailure(
+                        expectedContext, claim, failure);
+                retainClaimedContextFailureLocked(expectedOwnership);
+                throw failure;
+            }
+            expectedOwnership.beginStopFinalization(expectedContext, claim);
+            ownershipTransfers.remove(ownershipKey(expectedOwnership));
+        }
+    }
+
+    boolean completeStopFinalization(PaimonWriteGenerationOwnership expectedOwnership)
+            throws InterruptedException {
+        return completeExactReleaseAfterValidatedClose(
+                expectedOwnership,
+                PaimonWriteGenerationOwnership.Phase.STOP_FINALIZING,
+                "STOP exact physical writer lease release was rejected");
+    }
+
+    boolean releaseUnpublishedGeneration(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonWriteResourceLifecycle.CloseOutcome safeRollbackEvidence)
+            throws InterruptedException {
+        return completeExactRelease(
+                expectedOwnership,
+                PaimonWriteGenerationOwnership.Phase.LEASE_ACTIVE,
+                safeRollbackEvidence,
+                PaimonWriteCloseModel.InitiatingReason.FACTORY_ROLLBACK,
+                "Factory exact physical writer lease release was rejected");
+    }
+
+    void prepareDdlTransfer(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonTableWriteContext expectedContext) {
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            expectedOwnership.prepareDdlTransfer(expectedContext);
+        }
+    }
+
+    /** Claims effective DDL finalizer authority before exact Context detach. */
+    PaimonWriteGenerationOwnership.DdlDetachPermit authorizeDdlDetach(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonTableWriteContext expectedContext,
+            PaimonWriteResourceLifecycle.CloseOutcome resourceClosedEvidence) {
+        PaimonWriteGenerationOwnership.FinalizationClaim claim;
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            requireExactContextLocked(expectedOwnership, expectedContext);
+            claim =
+                    expectedOwnership.prepareClosedSuccessClaim(
+                            PaimonWriteGenerationOwnership.Phase.DDL_TRANSFER_PREPARED,
+                            expectedContext,
+                            resourceClosedEvidence,
+                            PaimonWriteCloseModel.InitiatingReason.DDL);
+        }
+        claimFinalizationOutsideAdmissionLock(expectedOwnership, claim);
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            return expectedOwnership.authorizeDdlDetach(expectedContext, claim);
+        }
+    }
+
+    /** Atomically expected-removes the coordinator-owned Context and confirms the same lease transfer. */
+    boolean detachExactContextForDdl(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonTableWriteContext expectedContext,
+            PaimonWriteGenerationOwnership.DdlDetachPermit detachPermit) {
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            expectedOwnership.validateDdlDetachPermit(expectedContext, detachPermit);
+            if (!removeExactContextLocked(expectedOwnership, expectedContext)) {
+                IllegalStateException failure =
+                        new IllegalStateException(
+                                "DDL exact Context compare-remove was rejected");
+                expectedOwnership.retainDdlDetachFailure(
+                        expectedContext, detachPermit, failure);
+                retainClaimedContextFailureLocked(expectedOwnership);
+                return false;
+            }
+            ContextDetachReceipt receipt =
+                    new ContextDetachReceipt(expectedOwnership, expectedContext);
+            expectedOwnership.confirmContextDetached(
+                    expectedContext, detachPermit, receipt);
+            String key = ownershipKey(expectedOwnership);
+            if (ownershipTransfers.put(key, expectedOwnership) != null) {
+                throw new IllegalStateException("DDL ownership transfer is already registered");
+            }
+            return true;
+        }
+    }
+
+    void completeDdlTransfer(PaimonWriteGenerationOwnership expectedOwnership) {
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            String key = ownershipKey(expectedOwnership);
+            if (ownershipTransfers.get(key) != expectedOwnership) {
+                throw new IllegalStateException(
+                        "DDL transfer identity does not match the active writer generation");
+            }
+            expectedOwnership.completeDdlTransfer();
+            activeDdlActions.put(key, expectedOwnership);
+            ownershipTransfers.remove(key);
+        }
+    }
+
+    void retainDdlResourceFailure(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonWriteResourceLifecycle.CloseOutcome retainedEvidence) {
+        PaimonWriteGenerationOwnership.FinalizationClaim claim;
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            PaimonTableWriteContext expectedContext = exactContextLocked(expectedOwnership);
+            claim =
+                    expectedOwnership.prepareRetainedClaim(
+                            PaimonWriteGenerationOwnership.Phase.DDL_TRANSFER_PREPARED,
+                            expectedContext,
+                            retainedEvidence,
+                            PaimonWriteCloseModel.InitiatingReason.DDL);
+        }
+        claimFinalizationOutsideAdmissionLock(expectedOwnership, claim);
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            String key = ownershipKey(expectedOwnership);
+            expectedOwnership.retainDdlResourceFailure(claim);
+            retainedWriteGenerations.put(key, expectedOwnership);
+            ownershipTransfers.remove(key);
+            removeActiveExpectedLocked(expectedOwnership);
+        }
+    }
+
+    /**
+     * Retains a completed DDL action scope. Task 31 owns the success path and will expose release
+     * only from the action executor after both action and unconditional cleanup have succeeded.
+     */
+    void retainDdlActionFailure(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            Throwable actionOrCleanupFailure) {
+        Objects.requireNonNull(actionOrCleanupFailure, "actionOrCleanupFailure");
+        String key = ownershipKey(expectedOwnership);
+        synchronized (admissionLock) {
+            requireActiveDdlOwnedLocked(expectedOwnership, key);
+            expectedOwnership.beginDdlRetention();
+        }
+
+        RetainedDdlActionLease retainedLease;
+        try {
+            retainedLease =
+                    physicalLeaseRegistry.retainAfterDdlFailure(
+                            expectedOwnership.physicalLease(), actionOrCleanupFailure);
+        } catch (Throwable registryFailure) {
+            Throwable transitionFailure = transitionFailure(registryFailure);
+            RetainedDdlActionLease transitionedRetainedLease =
+                    retainedLease(registryFailure);
+            synchronized (admissionLock) {
+                requireActiveOwnedLocked(expectedOwnership);
+                retainRegistryTransitionFailureLocked(
+                        expectedOwnership,
+                        actionOrCleanupFailure,
+                        transitionedRetainedLease);
+            }
+            // Publish the conservative retained state before enriching diagnostics. Even an
+            // unexpected failure from Throwable.addSuppressed must not leave the carrier in the
+            // DDL_RETAIN_IN_PROGRESS intermediate phase.
+            if (transitionFailure != actionOrCleanupFailure) {
+                actionOrCleanupFailure.addSuppressed(transitionFailure);
+            }
+            rethrowUnchecked(transitionFailure);
+            throw new IllegalStateException(
+                    "Physical lease registry transition failed", transitionFailure);
+        }
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            retainLocked(expectedOwnership, actionOrCleanupFailure, retainedLease);
+        }
+    }
 
     ReadAdmission admitRead(
             String readOperationId, String serviceOwnerId, Collection<String> requestedTableKeys) {
@@ -166,15 +511,333 @@ final class PaimonServiceResourceCoordinator {
         }
     }
 
-    boolean canCloseGlobalResources() {
+    int activeWriteGenerationCount() {
         synchronized (admissionLock) {
-            return serviceReadFence != null
-                    && activeReads.isEmpty()
-                    && activeBorrows.isEmpty()
-                    && retainedReads.isEmpty()
-                    && retainedBorrows.isEmpty()
-                    && tableReadFences.isEmpty();
+            return activeWriteGenerations.size();
         }
+    }
+
+    int retainedWriteGenerationCount() {
+        synchronized (admissionLock) {
+            return retainedWriteGenerations.size();
+        }
+    }
+
+    int ownershipTransferCount() {
+        synchronized (admissionLock) {
+            return ownershipTransfers.size();
+        }
+    }
+
+    int activeDdlActionCount() {
+        synchronized (admissionLock) {
+            return activeDdlActions.size();
+        }
+    }
+
+    boolean canCloseGlobalResources() {
+        boolean coordinatorClear;
+        synchronized (admissionLock) {
+            coordinatorClear =
+                    serviceReadFence != null
+                            && activeReads.isEmpty()
+                            && activeBorrows.isEmpty()
+                            && retainedReads.isEmpty()
+                            && retainedBorrows.isEmpty()
+                            && tableReadFences.isEmpty()
+                            && activeWriteGenerations.isEmpty()
+                            && retainedWriteGenerations.isEmpty()
+                            && ownershipTransfers.isEmpty()
+                            && activeDdlActions.isEmpty()
+                            && writeContexts.isEmpty();
+        }
+        return coordinatorClear
+                && physicalLeaseRegistry.snapshotOwnedBy(serviceOwnerId).totalCount() == 0;
+    }
+
+    private boolean completeExactRelease(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonWriteGenerationOwnership.Phase expectedPhase,
+            PaimonWriteResourceLifecycle.CloseOutcome resourceClosedEvidence,
+            PaimonWriteCloseModel.InitiatingReason expectedReason,
+            String rejectedMessage)
+            throws InterruptedException {
+        Objects.requireNonNull(expectedOwnership, "expectedOwnership");
+        PaimonWriteGenerationOwnership.FinalizationClaim claim;
+        synchronized (admissionLock) {
+            requireOwnedByThisService(expectedOwnership);
+            if (expectedOwnership.releaseOperation() != null) {
+                // FACTORY_ROLLBACK is deliberately single-owner and never joinable. Future callers
+                // added to this generic path must define an explicit scenario join matrix first.
+                throw new IllegalStateException(
+                        "Physical release is already owned by another finalizer");
+            }
+            requireActiveOwnedLocked(expectedOwnership);
+            claim =
+                    expectedOwnership.prepareClosedSuccessClaim(
+                            expectedPhase,
+                            null,
+                            resourceClosedEvidence,
+                            expectedReason);
+        }
+        claimFinalizationOutsideAdmissionLock(expectedOwnership, claim);
+        PaimonWriteGenerationOwnership.ReleaseOperation operation;
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            operation = expectedOwnership.beginRelease(claim);
+        }
+        return finishExactRelease(expectedOwnership, operation, rejectedMessage);
+    }
+
+    private boolean completeExactReleaseAfterValidatedClose(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonWriteGenerationOwnership.Phase expectedPhase,
+            String rejectedMessage)
+            throws InterruptedException {
+        Objects.requireNonNull(expectedOwnership, "expectedOwnership");
+        PaimonWriteGenerationOwnership.ReleaseOperation operation;
+        boolean owner;
+        synchronized (admissionLock) {
+            requireOwnedByThisService(expectedOwnership);
+            operation = expectedOwnership.releaseOperation();
+            owner = operation == null;
+            if (owner) {
+                requireActiveOwnedLocked(expectedOwnership);
+                operation = expectedOwnership.beginReleaseAfterValidatedClose(expectedPhase);
+            } else {
+                operation.requireJoinReason(PaimonWriteCloseModel.InitiatingReason.STOP);
+            }
+        }
+        return owner
+                ? finishExactRelease(expectedOwnership, operation, rejectedMessage)
+                : operation.awaitResult();
+    }
+
+    private boolean finishExactRelease(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonWriteGenerationOwnership.ReleaseOperation operation,
+            String rejectedMessage) {
+        final boolean released;
+        try {
+            released =
+                    physicalLeaseRegistry.releaseActive(expectedOwnership.physicalLease());
+        } catch (Throwable registryFailure) {
+            Throwable transitionFailure = transitionFailure(registryFailure);
+            synchronized (admissionLock) {
+                requireActiveOwnedLocked(expectedOwnership);
+                retainRegistryTransitionFailureLocked(
+                        expectedOwnership,
+                        transitionFailure,
+                        retainedLease(registryFailure));
+            }
+            operation.complete(false, transitionFailure);
+            rethrowUnchecked(transitionFailure);
+            throw new IllegalStateException(
+                    "Physical lease registry transition failed", transitionFailure);
+        }
+        synchronized (admissionLock) {
+            requireActiveOwnedLocked(expectedOwnership);
+            if (released) {
+                removeActiveExpectedLocked(expectedOwnership);
+                expectedOwnership.release();
+                operation.complete(true, null);
+                return true;
+            }
+            IllegalStateException rejection = new IllegalStateException(rejectedMessage);
+            retainLocked(
+                    expectedOwnership,
+                    rejection,
+                    null);
+            // A false expected-value transition is a normal compare rejection, not a registry
+            // execution failure. The sticky cause lives on the retained carrier; every STOP
+            // joiner observes the same boolean false contract as the release owner.
+            operation.complete(false, null);
+            return false;
+        }
+    }
+
+    private void retainLocked(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            Throwable failure,
+            RetainedDdlActionLease retainedLease) {
+        String key = ownershipKey(expectedOwnership);
+        expectedOwnership.retain(failure, retainedLease);
+        retainedWriteGenerations.put(key, expectedOwnership);
+        ownershipTransfers.remove(key);
+        activeDdlActions.remove(key);
+        removeActiveExpectedLocked(expectedOwnership);
+    }
+
+    private void retainRegistryTransitionFailureLocked(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            Throwable failure,
+            RetainedDdlActionLease retainedLease) {
+        String key = ownershipKey(expectedOwnership);
+        expectedOwnership.retainRegistryTransitionFailure(failure, retainedLease);
+        retainedWriteGenerations.put(key, expectedOwnership);
+        ownershipTransfers.remove(key);
+        activeDdlActions.remove(key);
+        removeActiveExpectedLocked(expectedOwnership);
+    }
+
+    private void claimFinalizationOutsideAdmissionLock(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonWriteGenerationOwnership.FinalizationClaim claim) {
+        try {
+            claim.claimOutsideCoordinatorLock();
+        } catch (RuntimeException | Error claimFailure) {
+            synchronized (admissionLock) {
+                requireActiveOwnedLocked(expectedOwnership);
+                expectedOwnership.rollbackFinalizationClaim(claim);
+            }
+            throw claimFailure;
+        }
+    }
+
+    private PaimonTableWriteContext exactContextLocked(
+            PaimonWriteGenerationOwnership expectedOwnership) {
+        String tableKey = expectedOwnership.physicalLease().logicalTableKey();
+        PaimonTableWriteContext context = writeContexts.get(tableKey);
+        if (context == null || !expectedOwnership.ownsContext(context)) {
+            throw new IllegalStateException(
+                    "Coordinator Context does not match the exact active writer generation");
+        }
+        return context;
+    }
+
+    private void requireExactContextLocked(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonTableWriteContext expectedContext) {
+        if (exactContextLocked(expectedOwnership) != expectedContext) {
+            throw new IllegalStateException(
+                    "Context identity does not match the coordinator-owned writer generation");
+        }
+    }
+
+    private boolean removeExactContextLocked(
+            PaimonWriteGenerationOwnership expectedOwnership,
+            PaimonTableWriteContext expectedContext) {
+        String tableKey = expectedOwnership.physicalLease().logicalTableKey();
+        return expectedOwnership.ownsContext(expectedContext)
+                && writeContexts.remove(tableKey, expectedContext);
+    }
+
+    private void retainClaimedContextFailureLocked(
+            PaimonWriteGenerationOwnership expectedOwnership) {
+        String key = ownershipKey(expectedOwnership);
+        retainedWriteGenerations.put(key, expectedOwnership);
+        ownershipTransfers.remove(key);
+        activeDdlActions.remove(key);
+        removeActiveExpectedLocked(expectedOwnership);
+    }
+
+    private void requireActiveOwnedLocked(
+            PaimonWriteGenerationOwnership expectedOwnership) {
+        requireOwnedByThisService(expectedOwnership);
+        if (activeWriteGenerations.get(
+                        expectedOwnership.physicalLease().logicalTableKey())
+                != expectedOwnership) {
+            throw new IllegalStateException(
+                    "Writer generation is not the exact active ownership carrier");
+        }
+    }
+
+    private void requireOwnedByThisService(
+            PaimonWriteGenerationOwnership expectedOwnership) {
+        Objects.requireNonNull(expectedOwnership, "expectedOwnership");
+        if (!expectedOwnership.ownedBy(serviceOwnerId)) {
+            throw new IllegalArgumentException(
+                    "Writer generation belongs to another Paimon service");
+        }
+    }
+
+    private void requireActiveDdlOwnedLocked(
+            PaimonWriteGenerationOwnership expectedOwnership, String key) {
+        requireActiveOwnedLocked(expectedOwnership);
+        if (activeDdlActions.get(key) != expectedOwnership) {
+            throw new IllegalStateException(
+                    "DDL action scope does not match the writer generation");
+        }
+    }
+
+    private void removeActiveExpectedLocked(
+            PaimonWriteGenerationOwnership expectedOwnership) {
+        String logicalTableKey = expectedOwnership.physicalLease().logicalTableKey();
+        if (activeWriteGenerations.get(logicalTableKey) != expectedOwnership) {
+            throw new IllegalStateException(
+                    "Cannot remove a writer generation that is no longer the exact active carrier");
+        }
+        activeWriteGenerations.remove(logicalTableKey);
+    }
+
+    private boolean hasRetainedWriteGenerationLocked(String logicalTableKey) {
+        for (PaimonWriteGenerationOwnership ownership : retainedWriteGenerations.values()) {
+            if (ownership.physicalLease().logicalTableKey().equals(logicalTableKey)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String ownershipKey(PaimonWriteGenerationOwnership ownership) {
+        return ownership.physicalLease().ownerToken();
+    }
+
+    /** Unforgeable proof minted only after this coordinator exact-removes its Context map entry. */
+    static final class ContextDetachReceipt {
+        private final PaimonWriteGenerationOwnership ownership;
+        private final PaimonTableWriteContext context;
+        private final AtomicBoolean consumed = new AtomicBoolean();
+
+        private ContextDetachReceipt(
+                PaimonWriteGenerationOwnership ownership,
+                PaimonTableWriteContext context) {
+            this.ownership = Objects.requireNonNull(ownership, "ownership");
+            this.context = Objects.requireNonNull(context, "context");
+        }
+
+        void consumeFor(
+                PaimonWriteGenerationOwnership expectedOwnership,
+                Object expectedContext) {
+            if (ownership != expectedOwnership || context != expectedContext) {
+                throw new IllegalStateException(
+                        "Context detach receipt does not match the exact generation");
+            }
+            if (!consumed.compareAndSet(false, true)) {
+                throw new IllegalStateException("Context detach receipt was already consumed");
+            }
+        }
+    }
+
+    private static void rethrowIfFatal(Throwable failure) {
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+    }
+
+    private static void rethrowUnchecked(Throwable failure) {
+        if (failure instanceof RuntimeException) {
+            throw (RuntimeException) failure;
+        }
+        rethrowIfFatal(failure);
+    }
+
+    private static Throwable transitionFailure(Throwable registryFailure) {
+        if (registryFailure
+                instanceof PhysicalTableWriterLease.Registry.RegistryTransitionException) {
+            return ((PhysicalTableWriterLease.Registry.RegistryTransitionException) registryFailure)
+                    .transitionFailure();
+        }
+        return registryFailure;
+    }
+
+    private static RetainedDdlActionLease retainedLease(Throwable registryFailure) {
+        if (registryFailure
+                instanceof PhysicalTableWriterLease.Registry.RegistryTransitionException) {
+            return ((PhysicalTableWriterLease.Registry.RegistryTransitionException) registryFailure)
+                    .retainedLease();
+        }
+        return null;
     }
 
     private boolean completeBorrow(ReadBorrow expectedBorrow, Completion completion) {

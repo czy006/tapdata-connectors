@@ -1,0 +1,57 @@
+graph TD
+    OC["Active scenario ownership carrier"] --> P{"Scenario"}
+    P -->|STOP| SW["Close exact generation resources"]
+    SW --> SO["Resource CLOSED_SUCCESS with effective STOP authority"]
+    SO --> S1["Service expected-removes exact Context"]
+    S1 --> S2["Exact-release WRITER lease"]
+    S2 --> SX{"Lease identity compare-remove succeeded"}
+    SX -->|Yes| S3["Remove active carrier"]
+    SX -->|No| SR["Publish retained ownership carrier without registry gap"]
+
+    P -->|DDL| DC{"Local Context exists"}
+    DC -->|Yes WRITER| DW["Close exact generation resources"]
+    DW --> DO{"Effective finalization authority"}
+    DO -->|STOP joined| S1
+    DO -->|DDL success| DT{"Purpose-aware final action admission"}
+    DC -->|No Context| DN["Acquire DDL_ONLY lease; no writer-resource close"]
+    DN --> DT
+    DT -->|Expired or interrupted| DR["Keep fenced carrier exact Context if present exact lease and read fence; action count zero"]
+    DT -->|STOP wins| DP{"Lease purpose"}
+    DP -->|WRITER| S1
+    DP -->|DDL_ONLY| NS["Exact-release DDL_ONLY lease"]
+    NS --> NX{"Lease identity compare-remove succeeded"}
+    NX -->|Yes| NR["Remove no-Context carrier"]
+    NX -->|No| SR
+    DT -->|DDL admitted| AP{"Lease purpose"}
+    AP -->|WRITER| D0["Claim effective DDL finalizer authority and issue identity-bound one-shot detach permit"]
+    D0 --> D1["Service expected-removes exact Context"]
+    D1 --> DE{"Expected-remove succeeded"}
+    DE -->|No| DR
+    DE -->|Yes| DA["Publish and confirm same WRITER lease transfer"]
+    DA --> DCX{"Transfer confirmation succeeded"}
+    DCX -->|No| DR
+    DCX -->|Yes| D2
+    AP -->|DDL_ONLY| DB["Publish and confirm same DDL_ONLY lease transfer"]
+    DB --> DBX{"Transfer confirmation succeeded"}
+    DBX -->|No| DR
+    DBX -->|Yes| D2
+    D2["Execute synchronous DDL action"]
+    D2 --> D3["Run unconditional cache and guard cleanup"]
+    D3 --> D4{"Action and cleanup succeeded"}
+    D4 -->|Yes| D5["Exact-release DDL action lease"]
+    D4 -->|No| D6["Publish RetainedDdlActionLease without registry gap"]
+    D5 --> DX{"Lease identity compare-remove succeeded"}
+    DX -->|Yes| D7["Remove DDL action carrier"]
+    DX -->|No| D6
+
+    P -->|FACTORY_ROLLBACK| F1{"Construction rollback is SAFE"}
+    F1 -->|Yes| F2["Exact-release unpublished generation lease"]
+    F1 -->|No| F3["Transfer lease and handles to retained generation marker"]
+    F2 --> FX{"Lease identity compare-remove succeeded"}
+    FX -->|Yes| F4["Remove construction carrier"]
+    FX -->|No| F3
+
+    S3 --> Q["Global barrier may re-evaluate only when carriers and this Service lease slots are empty"]
+    NR --> Q
+    D7 --> Q
+    F4 --> Q

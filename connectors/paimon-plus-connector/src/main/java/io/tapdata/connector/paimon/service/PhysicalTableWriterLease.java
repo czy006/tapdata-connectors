@@ -1,11 +1,9 @@
 package io.tapdata.connector.paimon.service;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Immutable, generation-scoped ownership token for one physical Paimon table.
@@ -104,28 +102,6 @@ final class PhysicalTableWriterLease {
     }
 
     @Override
-    public boolean equals(Object other) {
-        if (this == other) {
-            return true;
-        }
-        if (!(other instanceof PhysicalTableWriterLease)) {
-            return false;
-        }
-        PhysicalTableWriterLease that = (PhysicalTableWriterLease) other;
-        return physicalTableHash.equals(that.physicalTableHash)
-                && logicalTableKey.equals(that.logicalTableKey)
-                && serviceOwnerId.equals(that.serviceOwnerId)
-                && generationId.equals(that.generationId)
-                && purpose == that.purpose;
-    }
-
-    @Override
-    public int hashCode() {
-        return Objects.hash(
-                physicalTableHash, logicalTableKey, serviceOwnerId, generationId, purpose);
-    }
-
-    @Override
     public String toString() {
         return "PhysicalTableWriterLease{"
                 + "physicalTableHash='"
@@ -159,95 +135,231 @@ final class PhysicalTableWriterLease {
      */
     static final class Registry {
 
-        private final ConcurrentMap<String, Slot> leases = new ConcurrentHashMap<>();
+        /*
+         * One monitor makes the per-Service snapshot a real linearization point. A weakly
+         * consistent ConcurrentHashMap.values() traversal is insufficient for the global-close
+         * barrier because it could miss an acquire racing on another physical-table key.
+         * Coordinator code must never enter this monitor while holding its admission lock.
+         */
+        private final Object registryLock = new Object();
+        private final Map<String, Slot> leases = new HashMap<>();
+        private final TransitionObserver transitionObserver;
+
+        Registry() {
+            this(TransitionObserver.NOOP);
+        }
+
+        Registry(TransitionObserver transitionObserver) {
+            this.transitionObserver =
+                    Objects.requireNonNull(transitionObserver, "transitionObserver");
+        }
 
         boolean tryAcquire(PhysicalTableWriterLease lease) {
             Objects.requireNonNull(lease, "lease");
-            return leases.putIfAbsent(lease.physicalTableHash, Slot.active(lease)) == null;
+            synchronized (registryLock) {
+                if (leases.containsKey(lease.physicalTableHash)) {
+                    return false;
+                }
+                leases.put(lease.physicalTableHash, Slot.active(lease));
+                return true;
+            }
         }
 
         boolean releaseActive(PhysicalTableWriterLease expected) {
             Objects.requireNonNull(expected, "expected");
-            AtomicBoolean released = new AtomicBoolean();
-            leases.computeIfPresent(
-                    expected.physicalTableHash,
-                    (ignored, current) -> {
-                        if (current.retained == null && current.lease.equals(expected)) {
-                            released.set(true);
-                            return null;
+            boolean released;
+            synchronized (registryLock) {
+                Slot current = leases.get(expected.physicalTableHash);
+                if (current == null
+                        || current.retained != null
+                        || current.releaseInProgress
+                        || current.lease != expected) {
+                    released = false;
+                } else {
+                    // Keep the slot occupied while result publication is in flight. No other
+                    // generation may acquire the physical table before release is fully known.
+                    leases.put(expected.physicalTableHash, Slot.releasing(expected));
+                    released = true;
+                }
+            }
+            try {
+                transitionObserver.afterReleaseActive(expected, released);
+            } catch (RuntimeException | Error transitionFailure) {
+                if (released) {
+                    synchronized (registryLock) {
+                        Slot current = leases.get(expected.physicalTableHash);
+                        if (current != null
+                                && current.lease == expected
+                                && current.releaseInProgress) {
+                            leases.put(expected.physicalTableHash, Slot.active(expected));
                         }
-                        return current;
-                    });
-            return released.get();
+                    }
+                }
+                throw new RegistryTransitionException(null, transitionFailure);
+            }
+            if (released) {
+                synchronized (registryLock) {
+                    Slot current = leases.get(expected.physicalTableHash);
+                    if (current == null
+                            || current.lease != expected
+                            || !current.releaseInProgress) {
+                        throw new IllegalStateException(
+                                "Physical lease release reservation was lost");
+                    }
+                    leases.remove(expected.physicalTableHash);
+                }
+            }
+            return released;
         }
 
         RetainedDdlActionLease retainAfterDdlFailure(
                 PhysicalTableWriterLease expected, Throwable actionFailure) {
             Objects.requireNonNull(expected, "expected");
             Objects.requireNonNull(actionFailure, "actionFailure");
-            AtomicReference<RetainedDdlActionLease> retained = new AtomicReference<>();
-            leases.compute(
-                    expected.physicalTableHash,
-                    (ignored, current) -> {
-                        if (current == null
-                                || current.retained != null
-                                || !current.lease.equals(expected)) {
-                            return current;
-                        }
-                        RetainedDdlActionLease marker =
-                                RetainedDdlActionLease.create(expected, actionFailure);
-                        retained.set(marker);
-                        return Slot.retained(marker);
-                    });
-            RetainedDdlActionLease marker = retained.get();
-            if (marker == null) {
-                throw new IllegalStateException(
-                        "Cannot retain a DDL lease that is not the exact active generation");
+            RetainedDdlActionLease marker;
+            synchronized (registryLock) {
+                Slot current = leases.get(expected.physicalTableHash);
+                if (current == null
+                        || current.retained != null
+                        || current.releaseInProgress
+                        || current.lease != expected) {
+                    throw new IllegalStateException(
+                            "Cannot retain a DDL lease that is not the exact active generation");
+                }
+                marker =
+                        RetainedDdlActionLease.create(expected, actionFailure);
+                leases.put(expected.physicalTableHash, Slot.retained(marker));
+            }
+            try {
+                transitionObserver.afterRetainDdl(expected, marker);
+            } catch (RuntimeException | Error transitionFailure) {
+                throw new RegistryTransitionException(marker, transitionFailure);
             }
             return marker;
         }
 
         boolean releaseRetained(RetainedDdlActionLease expected) {
             Objects.requireNonNull(expected, "expected");
-            AtomicBoolean released = new AtomicBoolean();
-            leases.computeIfPresent(
-                    expected.sourceLease().physicalTableHash,
-                    (ignored, current) -> {
-                        if (current.retained == expected) {
-                            released.set(true);
-                            return null;
-                        }
-                        return current;
-                    });
-            return released.get();
+            synchronized (registryLock) {
+                String physicalTableHash = expected.sourceLease().physicalTableHash;
+                Slot current = leases.get(physicalTableHash);
+                if (current == null || current.retained != expected) {
+                    return false;
+                }
+                leases.remove(physicalTableHash);
+                return true;
+            }
         }
 
         PhysicalTableWriterLease currentLease(String physicalTableHash) {
-            Slot slot = leases.get(requireText(physicalTableHash, "physicalTableHash"));
-            return slot == null ? null : slot.lease;
+            synchronized (registryLock) {
+                Slot slot = leases.get(requireText(physicalTableHash, "physicalTableHash"));
+                return slot == null ? null : slot.lease;
+            }
         }
 
         RetainedDdlActionLease currentRetained(String physicalTableHash) {
-            Slot slot = leases.get(requireText(physicalTableHash, "physicalTableHash"));
-            return slot == null ? null : slot.retained;
+            synchronized (registryLock) {
+                Slot slot = leases.get(requireText(physicalTableHash, "physicalTableHash"));
+                return slot == null ? null : slot.retained;
+            }
+        }
+
+        ServiceLeaseSnapshot snapshotOwnedBy(String serviceOwnerId) {
+            String expectedOwner = requireText(serviceOwnerId, "serviceOwnerId");
+            int active = 0;
+            int retained = 0;
+            synchronized (registryLock) {
+                for (Slot slot : leases.values()) {
+                    if (!slot.lease.serviceOwnerId.equals(expectedOwner)) {
+                        continue;
+                    }
+                    if (slot.retained == null) {
+                        active++;
+                    } else {
+                        retained++;
+                    }
+                }
+            }
+            return new ServiceLeaseSnapshot(active, retained);
+        }
+
+        static final class ServiceLeaseSnapshot {
+            private final int activeCount;
+            private final int retainedCount;
+
+            private ServiceLeaseSnapshot(int activeCount, int retainedCount) {
+                this.activeCount = activeCount;
+                this.retainedCount = retainedCount;
+            }
+
+            int activeCount() {
+                return activeCount;
+            }
+
+            int retainedCount() {
+                return retainedCount;
+            }
+
+            int totalCount() {
+                return activeCount + retainedCount;
+            }
+        }
+
+        interface TransitionObserver {
+            TransitionObserver NOOP = new TransitionObserver() {};
+
+            default void afterReleaseActive(
+                    PhysicalTableWriterLease expected, boolean released) {}
+
+            default void afterRetainDdl(
+                    PhysicalTableWriterLease expected, RetainedDdlActionLease retained) {}
+        }
+
+        /** Reports retained publication failure or a release publication that was rolled back. */
+        static final class RegistryTransitionException extends RuntimeException {
+            private final RetainedDdlActionLease retainedLease;
+
+            private RegistryTransitionException(
+                    RetainedDdlActionLease retainedLease, Throwable transitionFailure) {
+                super("Physical lease registry transitioned but result publication failed",
+                        transitionFailure);
+                this.retainedLease = retainedLease;
+            }
+
+            Throwable transitionFailure() {
+                return getCause();
+            }
+
+            RetainedDdlActionLease retainedLease() {
+                return retainedLease;
+            }
         }
 
         private static final class Slot {
             private final PhysicalTableWriterLease lease;
             private final RetainedDdlActionLease retained;
+            private final boolean releaseInProgress;
 
             private Slot(
-                    PhysicalTableWriterLease lease, RetainedDdlActionLease retained) {
+                    PhysicalTableWriterLease lease,
+                    RetainedDdlActionLease retained,
+                    boolean releaseInProgress) {
                 this.lease = Objects.requireNonNull(lease, "lease");
                 this.retained = retained;
+                this.releaseInProgress = releaseInProgress;
             }
 
             private static Slot active(PhysicalTableWriterLease lease) {
-                return new Slot(lease, null);
+                return new Slot(lease, null, false);
+            }
+
+            private static Slot releasing(PhysicalTableWriterLease lease) {
+                return new Slot(lease, null, true);
             }
 
             private static Slot retained(RetainedDdlActionLease retained) {
-                return new Slot(retained.sourceLease(), retained);
+                return new Slot(retained.sourceLease(), retained, false);
             }
         }
     }

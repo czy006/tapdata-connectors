@@ -6,9 +6,11 @@
 - 事实源：`connectors/paimon-plus-connector/src/doc/paimon-spill-compaction-lifecycle-root-fix-spec.md`（APPROVED FOR PHASED IMPLEMENTATION v5.1）。
 - Connector 实施分支：`codex/paimon-spill-lifecycle-spec-v5`，基线 `develop@3b8e6d982266e430d825b1309038e84f4645d3ef`；Paimon 实施分支：`codex/spill-lifecycle-root-fix`，基线 `1.3.2@c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`；Hadoop 基线：`3.3.6`。
 - 现有工作区：保留用户已有 `pom.xml`、`.run/` 和 Connector 文档变更，不覆盖、不清理。
-- 执行约束：严格按 `tasks/todo.md` 的依赖实施；每项最多修改 5 个文件，RED/GREEN 与证据未完成时不得越过门禁。
+- 执行约束：严格按 `tasks/todo.md` 的依赖实施；每个显式编号实现切片/commit最多修改 5 个文件，RED/GREEN 与证据未完成时不得越过门禁。源码审计扩大范围时先拆子任务，不用“同一Task”规避文件预算。
 
 当前已落地的Paimon切片事实：`f70e5267e`、`98a18ab81`、`60044a2a7`新增并加固additive structured iterator API与escaping wrapper failure retention；`8307184b0`、`844bc1d1b`以RED/GREEN修复`SemaphoredDelegatingExecutor` permit accounting；`0d9bb4a23`、`41957490b`、`67655eb9a`开始迁移manifest、`FileEntry`与incremental scanner consumer。旧`Iterable`/`Iterator` descriptor仍保留。该状态不代表Task 3A/3B调用点全部闭合、maintenance、Core capability、制品闭包或Connector接入完成。
+
+Connector Task 25A已按源码审查拆成25A.1（身份型evidence/registry primitive）与25A.2（dormant carrier/coordinator seam），每个切片独立commit和审查。25A.2只提供Task 25B/26/28将消费的API；Factory/Service生产入口尚未采用前，不得把它标为production-active。
 
 ## 2. 目标与完成定义
 
@@ -84,13 +86,13 @@ DEPENDENCY_CLOSE_FAILED_RETAINED / IO_CLOSE_FAILED_RETAINED
 
 - proof reason仅`STOP | DDL | FACTORY_ROLLBACK`；fatal write只设置sticky fence与`failureOrigin=WRITE_PATH`，不能启动或冒充STOP teardown。
 - PreparedWriter按两个独立提交闭合：19A通过`FileStoreTable.newWrite(commitUser)`取得具体`TableWriteImpl`并在任何first-use前绑定IO/Compaction；19B迁移最后一个bucket factory测试seam并删除过渡raw overload。19B完成前不得宣称生产raw writer类型边界已经闭合。
-- Write-resource fixed safety order：proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → resource `CLOSED_SUCCESS`。physical lease不属于该lifecycle；Factory envelope仅在SAFE rollback后exact-release，retained时转移给retained marker；STOP/DDL由coordinator在Context expected-remove后按场景release或transfer。
+- Write-resource fixed safety order：proof → graceful compaction shutdown → await actual TERMINATED → writer → maintenance closeAndDrain → committer → full-success判定 → IO → spill unregister → resource `CLOSED_SUCCESS`。physical lease不属于该lifecycle；Factory envelope仅在SAFE rollback后exact-release，retained时转移给retained marker。外层finalizer必须按“admission锁内typed reservation → 锁外claim lifecycle authority → admission锁内提交”消费evidence；STOP由coordinator exact-remove Context后release，DDL先完成purpose-aware final admission，再凭identity-bound permit与coordinator-owned Context receipt确认same-lease transfer。
 - GlobalIndex创建后立即staged-own；只有`endBoostrap`成功才transfer，外部注入对象是`IOManager`且不得被assigner close。
 - Context/generation持有一个全生命周期WRITER physical lease；每次write/commit只获取operation admission并在表锁后revalidate，不重复申请physical lease。
 
 ### 5.4 DDL
 
-- 有Context时继续持有其WRITER lease；无Context时申请DDL_ONLY。DDL等待其他foreground/read borrower，绝不等待自己持有的lease。
+- 有Context时继续持有其WRITER lease；无Context时申请DDL_ONLY。两种purpose都进入同一purpose-aware final admission；expired/interrupt保留source carrier/lease/fence，STOP按WRITER/DDL_ONLY purpose exact-finalize，DDL admitted后才允许detach/transfer。DDL等待其他foreground/read borrower，绝不等待自己持有的lease。
 - 先fence目标表read，再request/join child；deadline先于action时保持active deferred，只允许内部STOP join，restart后用户显式重试。
 - 成功或失败都保持当前finally cache/guard cleanup语义；action failure原子转移WRITER/DDL_ONLY到`RetainedDdlActionLease`，callback count=0。
 

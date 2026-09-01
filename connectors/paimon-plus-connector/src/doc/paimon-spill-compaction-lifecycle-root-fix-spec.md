@@ -122,8 +122,8 @@ v5 以本地 Paimon `1.3.2` source JAR、Hadoop `3.3.6` source JAR、Connector �
 - Paimon fork：`codex/spill-lifecycle-root-fix`，基线为`c05f7d1f1b1e5d37e64edab0f2978124d90b64f7`，当前冻结HEAD为`cdd41cd50`。
 - `f70e5267e`至`60ab3ee5f`已交付additive `StructuredIterator`、accepted-runnable ticket、escaping failure retention，并迁移manifest/file-operation、scan、append compaction、Flink/Spark planner等生产consumer；旧JVM descriptor保持不变。
 - `343476768`至`cdd41cd50`已交付显式async reader禁用、structured commit maintenance、strict spill cleanup、GlobalIndex/RocksDB cleanup、owned Hadoop raw FS、Core capability、artifact graph闭包与exact maintenance interruption evidence。
-- Connector分支`codex/paimon-spill-lifecycle-spec-v5`已完成runtime capability gate、async-safe runtime table、maintenance adapter、owned compaction runtime、resource coordinator骨架、exact close model、sequential bootstrap、prepared-writer binding、strict spill cleanup与Task 24 write-resource lifecycle；Task 24聚焦联合回归为42/42。
-- Task 24的`CLOSED_SUCCESS`只证明generation-local writer/maintenance/committer/IO/spill已安全关闭。physical lease已从该lifecycle API、snapshot和测试中移除；Task 25A/25B/25C将分别交付exact ownership carrier、Factory typed construction envelope及bootstrap/preflight retained handoff，随后才进入Context/Service生产接入。
+- Connector分支`codex/paimon-spill-lifecycle-spec-v5`已完成runtime capability gate、async-safe runtime table、maintenance adapter、owned compaction runtime、resource coordinator骨架、exact close model、sequential bootstrap、prepared-writer binding、strict spill cleanup与Task 24 write-resource lifecycle。
+- Task 24的`CLOSED_SUCCESS`只证明generation-local writer/maintenance/committer/IO/spill已安全关闭。Task 25A当前只实现并验证dormant ownership primitives：身份型generation capability、one-shot lifecycle/Context carrier、场景finalizer与Service-local registry barrier；它尚未被Factory/Service生产调用。Task 25B负责Factory construction envelope与真实acquire/rollback接入，Task 26负责Context生命周期接入，Task 28负责所有Service入口接入；在这些任务完成前不得把Task 25A描述为生产已激活。
 - 当前仍不得宣称全Spec根治完成：Factory、Context、Service STOP/read/DDL/global barrier与actual Catalog-owned Hadoop FileIO集成，以及real-spill/E2E/发布门禁仍按Plan待完成。
 
 ## 1. Objective
@@ -356,7 +356,7 @@ tag 解引用由 `git ls-remote <official-repository> refs/tags/release-X refs/t
 9. [`MergeTreeCompactManager` lines 231-241](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/mergetree/compact/MergeTreeCompactManager.java#L231-L241) 保存 `executor.submit(task)` 返回的实际 Future；只有 Paimon 自己的 `cancelCompaction()` 会执行 `Future.cancel(true)`。
    Bucketed append 也只在条件满足并实际选出任务后提交：full compaction 见 [`BucketedAppendCompactManager` lines 99-123](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/append/BucketedAppendCompactManager.java#L99-L123)，best-effort 见 [`136-153`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/append/BucketedAppendCompactManager.java#L136-L153)。因此 shutdown后“可能触发 submit 的漏入入口”是风险边界，并非每次 write/flush 都必然抛 rejection。
 10. [`MergeTreeCompactManager#close`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/mergetree/compact/MergeTreeCompactManager.java#L286-L291) 直接关闭 rewriter。
-11. [`MergeSorter#spill`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/mergetree/MergeSorter.java#L104-L190) 在 `163` 通过 `IOManager.createChannel()` 创建 spill channel。
+11. [`MergeSorter` spill call path](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/mergetree/MergeSorter.java#L104-L190) 从merge-sort分派进入private `spill()`；[`spill()` lines 159-190](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/mergetree/MergeSorter.java#L159-L190) 在 `163` 通过 `IOManager.createChannel()` 创建 spill channel。
 12. [`IOManagerImpl#close` lines 73-78](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/disk/IOManagerImpl.java#L73-L78) 委托 channel manager。
 13. `FileChannelManagerImpl` 的 [`close` 本体 lines 123-137](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/disk/FileChannelManagerImpl.java#L123-L137) 调用 [`getFileCloser` lines 139-153](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/disk/FileChannelManagerImpl.java#L139-L153) 递归删除 manager 目录。
 14. [`AbstractFileIOChannel`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/disk/AbstractFileIOChannel.java#L52-L63) 在 `58` 打开 `RandomAccessFile`。
@@ -374,7 +374,7 @@ Java 8 [`ExecutorService#shutdown`](https://docs.oracle.com/javase/8/docs/api/ja
   <tr><td>lazy Compaction executor</td><td>509-516</td><td>509-516</td><td>529-536</td></tr>
   <tr><td>`MergeTreeWriter.close`</td><td>342-381</td><td>342-381</td><td>342-381</td></tr>
   <tr><td>`CompactFutureManager`</td><td>31-68</td><td>31-68</td><td>31-68</td></tr>
-  <tr><td>`MergeSorter.spill`</td><td>104-190</td><td>104-190</td><td>112-198</td></tr>
+  <tr><td>`MergeSorter` spill call path / private `spill()`</td><td>104-190 / 159-190</td><td>104-190 / 159-190</td><td>112-198 / 167-198</td></tr>
   <tr><td>`AppendOnlyWriter.close`</td><td>250-267</td><td>250-267</td><td>270-287</td></tr>
   <tr><td>`IOManagerImpl.close`</td><td>73-78</td><td>73-78</td><td>75-80</td></tr>
   <tr><td>`FileChannelManagerImpl.close + getFileCloser`</td><td>123-153</td><td>123-153</td><td>123-153</td></tr>
@@ -522,15 +522,15 @@ static pool 不暴露给 Connector、也不按线程名扫描。安全证明通�
 
 Paimon Flink Connector 证明 concrete seam 被官方代码实际使用，但它现有的 close 顺序不能直接复制：
 
-- [`StoreSinkWriteImpl` lines 61-100](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreSinkWriteImpl.java#L61-L100) 直接持有 `TableWriteImpl<?>` 并调用 `withCompactExecutor`；
-- [`StoreSinkWriteImpl#close` lines 171-178](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreSinkWriteImpl.java#L171-L178) 在 writer close 正常返回后立即关闭 IOManager，没有 termination proof；writer close 抛错时 IO 不会继续关闭，这一点比 TapData 当前聚合式 close 更保守；
-- [`StoreSinkWriteImpl#replace` lines 180-190](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreSinkWriteImpl.java#L180-L190) 创建新 writer 时不会自动继承已注入 executor，证明 executor 注入必须是 **每一个 writer generation** 的不变量；
-- [`CdcRecordStoreMultiWriteOperator` lines 103-146](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/sink/cdc/CdcRecordStoreMultiWriteOperator.java#L103-L146) 创建共享 executor 并注入 writer；
-- [`CdcRecordStoreMultiWriteOperator` lines 134-184](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/sink/cdc/CdcRecordStoreMultiWriteOperator.java#L134-L184) 在 replace 前注入，replace 创建新 writer 后当前 record 直接 write，进一步证明 replacement 必须主动 reinject；
-- [`CdcRecordStoreMultiWriteOperator#close` lines 226-239](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/sink/cdc/CdcRecordStoreMultiWriteOperator.java#L226-L239) 先 close writers，后 `shutdownNow()`，没有 await；
-- [`AppendCompactWorkerOperator#close` lines 104-114](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/AppendCompactWorkerOperator.java#L104-L114) 展示 `shutdownNow()` → `awaitTermination(120s)` → compactor close 的粗略偏序；本 Spec 只复用“termination wait 在 dependency close 前”，不复制 force-stop，也不复制 timeout 后仅 WARN 并继续 close 的 fail-open 行为；
-- [`PrepareCommitOperator` lines 92-120](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/PrepareCommitOperator.java#L92-L120) 的 `prepareCommit(true)` 属于 bounded-input transaction drain，不是通用资源终止 API；
-- [`FlinkSink`](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/FlinkSink.java#L88-L243) 与 [`FlinkWriteSink`](https://github.com/apache/paimon/blob/28dfdfed24877c5f4c36b7c2409794fc8ef79607/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/FlinkWriteSink.java#L50-L70) 负责 topology/committer 连接，不拥有 writer spill executor。
+- [`StoreSinkWriteImpl` lines 61-100](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreSinkWriteImpl.java#L61-L100) 直接持有 `TableWriteImpl<?>` 并调用 `withCompactExecutor`；
+- [`StoreSinkWriteImpl#close` lines 171-178](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreSinkWriteImpl.java#L171-L178) 在 writer close 正常返回后立即关闭 IOManager，没有 termination proof；writer close 抛错时 IO 不会继续关闭，这一点比 TapData 当前聚合式 close 更保守；
+- [`StoreSinkWriteImpl#replace` lines 180-190](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreSinkWriteImpl.java#L180-L190) 创建新 writer 时不会自动继承已注入 executor，证明 executor 注入必须是 **每一个 writer generation** 的不变量；
+- [`CdcRecordStoreMultiWriteOperator` lines 103-146](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/sink/cdc/CdcRecordStoreMultiWriteOperator.java#L103-L146) 创建共享 executor 并注入 writer；
+- [`CdcRecordStoreMultiWriteOperator` lines 134-184](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/sink/cdc/CdcRecordStoreMultiWriteOperator.java#L134-L184) 在 replace 前注入，replace 创建新 writer 后当前 record 直接 write，进一步证明 replacement 必须主动 reinject；
+- [`CdcRecordStoreMultiWriteOperator#close` lines 226-239](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/sink/cdc/CdcRecordStoreMultiWriteOperator.java#L226-L239) 先 close writers，后 `shutdownNow()`，没有 await；
+- [`AppendCompactWorkerOperator#close` lines 104-114](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/AppendCompactWorkerOperator.java#L104-L114) 展示 `shutdownNow()` → `awaitTermination(120s)` → compactor close 的粗略偏序；本 Spec 只复用“termination wait 在 dependency close 前”，不复制 force-stop，也不复制 timeout 后仅 WARN 并继续 close 的 fail-open 行为；
+- [`PrepareCommitOperator` lines 92-120](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/PrepareCommitOperator.java#L92-L120) 的 `prepareCommit(true)` 属于 bounded-input transaction drain，不是通用资源终止 API；
+- [`FlinkSink`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/FlinkSink.java#L88-L243) 与 [`FlinkWriteSink`](https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/FlinkWriteSink.java#L50-L70) 负责 topology/committer 连接，不拥有 writer spill executor。
 
 Flink 1.20.1 的 [`StreamTask` lines 157-218](https://github.com/apache/flink/blob/cb1e7b5571b06ebe3d79f57030663af3e83aefcd/flink-streaming-java/src/main/java/org/apache/flink/streaming/runtime/tasks/StreamTask.java#L157-L218) 说明 operator chain 在同一 task thread 中执行，mailbox 外调用也必须回到 task thread。这种 foreground serialization 仍不能替代 Paimon 自己 executor 的 termination barrier。
 
@@ -879,39 +879,89 @@ graph TD
 
 ![Write resource close固定偏序](assets/write-resource-close-order.svg)
 
+纯 Markdown 固定偏序（与上图逐步等价）：
+
+| 顺序 | 动作 | 失败时的规范结果 |
+|---:|---|---|
+| 1 | 验证exact generation与`STOP / DDL / FACTORY_ROLLBACK` proof | 拒绝本次close，不改变ownership |
+| 2 | exactly-once发起compaction graceful shutdown并等待actual `TERMINATED` | `WAITING`继续同operation；terminal failure转retained |
+| 3 | exactly-once关闭writer、drain maintenance、关闭独立committer | 任一失败聚合为sticky dependency-retained；禁止IO |
+| 4 | 仅三者全成功且`maintainError == null`时exactly-once关闭IOManager | IO失败转`IO_CLOSE_FAILED_RETAINED`；禁止spill unregister |
+| 5 | IO成功后exact-unregister本generation spill owner | 失败转dependency-retained |
+| 6 | spill unregister成功后发布resource `CLOSED_SUCCESS` | 只证明generation-local资源关闭；不释放physical lease |
+
 #### 6.1.2 Scenario-specific ownership finalization
 
 ```mermaid
 graph TD
-    OC["Active scenario ownership carrier"] --> O["Resource CLOSED_SUCCESS"]
-    O --> P{"Initiating scenario"}
-    P -->|STOP| S1["Coordinator expected-removes Context"]
+    OC["Active scenario ownership carrier"] --> P{"Scenario"}
+    P -->|STOP| SW["Close exact generation resources"]
+    SW --> SO["Resource CLOSED_SUCCESS with effective STOP authority"]
+    SO --> S1["Service expected-removes exact Context"]
     S1 --> S2["Exact-release WRITER lease"]
-    S2 --> SX{"Lease compare-remove succeeded"}
+    S2 --> SX{"Lease identity compare-remove succeeded"}
     SX -->|Yes| S3["Remove active carrier"]
     SX -->|No| SR["Publish retained ownership carrier without registry gap"]
-    P -->|DDL| D0["Publish transfer-in-progress in carrier"]
-    D0 --> D1["Atomically expected-remove Context and transfer same lease to DDL action scope"]
-    D1 --> D2["Execute synchronous DDL action"]
-    D2 --> D3["Run unconditional cache invalidation and guard cleanup"]
-    D3 --> D4{"DDL action and cleanup succeeded"}
+
+    P -->|DDL| DC{"Local Context exists"}
+    DC -->|Yes WRITER| DW["Close exact generation resources"]
+    DW --> DO{"Effective finalization authority"}
+    DO -->|STOP joined| S1
+    DO -->|DDL success| DT{"Purpose-aware final action admission"}
+    DC -->|No Context| DN["Acquire DDL_ONLY lease; no writer-resource close"]
+    DN --> DT
+    DT -->|Expired or interrupted| DR["Keep fenced carrier exact Context if present exact lease and read fence; action count zero"]
+    DT -->|STOP wins| DP{"Lease purpose"}
+    DP -->|WRITER| S1
+    DP -->|DDL_ONLY| NS["Exact-release DDL_ONLY lease"]
+    NS --> NX{"Lease identity compare-remove succeeded"}
+    NX -->|Yes| NR["Remove no-Context carrier"]
+    NX -->|No| SR
+    DT -->|DDL admitted| AP{"Lease purpose"}
+    AP -->|WRITER| D0["Claim effective DDL finalizer authority and issue identity-bound one-shot detach permit"]
+    D0 --> D1["Service expected-removes exact Context"]
+    D1 --> DE{"Expected-remove succeeded"}
+    DE -->|No| DR
+    DE -->|Yes| DA["Publish and confirm same WRITER lease transfer"]
+    DA --> DCX{"Transfer confirmation succeeded"}
+    DCX -->|No| DR
+    DCX -->|Yes| D2
+    AP -->|DDL_ONLY| DB["Publish and confirm same DDL_ONLY lease transfer"]
+    DB --> DBX{"Transfer confirmation succeeded"}
+    DBX -->|No| DR
+    DBX -->|Yes| D2
+    D2["Execute synchronous DDL action"]
+    D2 --> D3["Run unconditional cache and guard cleanup"]
+    D3 --> D4{"Action and cleanup succeeded"}
     D4 -->|Yes| D5["Exact-release DDL action lease"]
     D4 -->|No| D6["Publish RetainedDdlActionLease without registry gap"]
+    D5 --> DX{"Lease identity compare-remove succeeded"}
+    DX -->|Yes| D7["Remove DDL action carrier"]
+    DX -->|No| D6
+
     P -->|FACTORY_ROLLBACK| F1{"Construction rollback is SAFE"}
     F1 -->|Yes| F2["Exact-release unpublished generation lease"]
     F1 -->|No| F3["Transfer lease and handles to retained generation marker"]
-    S3 --> Q["Global barrier may re-evaluate only when carriers and this Service lease slots are empty"]
-    D5 --> DX{"Lease compare-remove succeeded"}
-    DX -->|Yes| D7["Remove DDL action carrier"]
-    DX -->|No| D6
-    D7 --> Q
-    F2 --> FX{"Lease compare-remove succeeded"}
+    F2 --> FX{"Lease identity compare-remove succeeded"}
     FX -->|Yes| F4["Remove construction carrier"]
     FX -->|No| F3
+
+    S3 --> Q["Global barrier may re-evaluate only when carriers and this Service lease slots are empty"]
+    NR --> Q
+    D7 --> Q
     F4 --> Q
 ```
 
 ![STOP DDL与Factory场景化lease处理](assets/scenario-lease-finalization.svg)
+
+纯 Markdown 场景合同（与上图逐分支等价）：
+
+| 场景 | resource close / Context规则 | physical lease终态 | compare/异常失败 |
+|---|---|---|---|
+| STOP | exact generation resource outcome的effective authority必须为STOP；随后coordinator从自己拥有的Context registry执行expected-remove | identity compare-release WRITER lease | Context compare-remove、lease release=false或registry异常都先发布retained carrier；异常再原样传播 |
+| DDL（有Context） | 先关闭WRITER generation；effective DDL success后先进入purpose-aware final admission；admitted后以typed reservation锁外claim finalizer authority，才生成identity-bound one-shot detach permit并由coordinator exact-remove Context | old carrier持续强持Context/WRITER lease，直至receipt确认同一lease进入DDL action scope；action+cleanup全成功才release | expired/interrupt保留exact Context/lease/fence且不mint permit；detach/confirm失败转restart-required retained；无ownership空窗 |
+| DDL（无Context） | 不执行writer resource close或expected-remove；DDL_ONLY也必须进入purpose-aware final admission | STOP wins时exact-finalize DDL_ONLY；DDL admitted时确认同一DDL_ONLY lease进入action scope | expired/interrupt/action/cleanup/confirm失败保留DDL_ONLY lease与read fence |
+| FACTORY_ROLLBACK | construction envelope证明SAFE且resource `CLOSED_SUCCESS`；FACTORY不能join任何release operation | identity compare-release unpublished WRITER lease | 非SAFE、compare=false或registry异常转retained construction carrier |
 
 write resource偏序中的任一步失败只发布一次sticky retained结果；未知部分关闭不得在进程内重试。`CLOSED_SUCCESS`仅证明generation-local write资源已关闭，不表示physical lease已释放，也不授权global barrier。`DDL` deadline/interrupt只把同一operation置为deferred，`STOP`只加入该operation；`FACTORY_ROLLBACK`不能被加入。`STOP`等待slice到期只轮转，不能把“等待时间已过”当成termination proof。
 
@@ -924,7 +974,7 @@ write resource偏序中的任一步失败只发布一次sticky retained结果；
 5. patched `HadoopFileIO`拥有由本Service创建的exact raw FS handles；Hadoop static cache container位于所有权边界外，但exact close可移除自己的unique entry；
 6. `PaimonService` 只保留 PDK ingress、业务 flush/callback、Catalog DDL action 与 coordinator orchestration，不再直接实现资源状态机。
 
-物理表lease的所有权不属于IO/spill lifecycle。coordinator或construction envelope始终持有exact lease；通用write lifecycle既不持有release callback，也不在snapshot中发布虚假的`lease=SUCCEEDED`。DDL action必须跨越资源关闭继续持有同一token，因此Context expected-remove与lease owner transfer必须在coordinator短临界区原子完成，不能由通用IO cleanup提前释放。
+物理表lease的所有权不属于IO/spill lifecycle。coordinator或construction envelope始终持有exact lease；通用write lifecycle既不持有release callback，也不在snapshot中发布虚假的`lease=SUCCEEDED`。DDL action必须跨越资源关闭继续持有同一token。coordinator先以短临界区发布barrier-visible typed reservation，锁外消费lifecycle finalizer authority，再以短临界区提交phase；不得在admission lock内取得operation锁。Context registry由coordinator拥有，exact-remove后生成不可伪造、一次性receipt；old carrier在receipt确认同一lease transfer前始终强持Context/lease，不能由调用方用boolean伪造detach成功，也不能由通用IO cleanup提前释放。
 
 ### 6.2 `PaimonServiceResourceCoordinator` 与锁契约
 
@@ -969,7 +1019,7 @@ v1 禁止对 injected Compaction executor 使用 `shutdownNow()` force path。�
 新增 package-private：
 
 ```text
-write/PaimonRuntimeTableFactory.java
+service/PaimonRuntimeTableFactory.java
 write/bucket/PaimonSequentialIndexBootstrap.java
 ```
 
@@ -1232,24 +1282,38 @@ graph TD
     A["Enter DDL ingress"] --> B["Acquire exact table lock"]
     B --> C["Recheck lifecycle and set draining guard"]
     C --> RB["Fence target-table reads and request child stop"]
-    RB --> RC{"Target-table child borrows closed?"}
+    RB --> RC{"Target-table child borrows closed"}
     RC -->|No| RX["Retain read fence and operation; action count is zero"]
     RC -->|Yes| D["Resolve table and physical hash"]
-    D --> E{"Local Context exists?"}
+    D --> E{"Local Context exists"}
     E -->|Yes| F["Verify existing WRITER lease"]
     E -->|No| G["Acquire DDL_ONLY lease"]
     F --> H["Flush and commit with existing false semantics"]
-    G --> I["No writer drain is required"]
-    H --> J["Create DDL proof and close expected generation"]
-    J --> K{"All resource barriers succeeded?"}
-    K -->|No| R["Retain Context, spill, and lease; action and callback counts are zero"]
-    K -->|Yes| L["Expected-remove Context and keep lease"]
-    I --> L
-    L --> AD{"Final action-admission check passed?"}
-    AD -->|Expired| AX["Retain fence and lease; STOP or restart before explicit retry"]
-    AD -->|Admitted or disabled| M["Execute synchronous DDL action"]
+    H --> J["Create DDL proof and close exact generation"]
+    J --> K{"All resource barriers succeeded"}
+    K -->|No| R["Retain exact Context spill and lease; action and callback counts are zero"]
+    K -->|Yes| AD{"Purpose-aware final action-admission"}
+    G --> I["No Context and no writer-resource close"]
+    I --> AD
+    AD -->|STOP wins| SP{"Lease purpose"}
+    SP -->|WRITER| SW["Expected-remove exact Context and exact-release WRITER lease"]
+    SP -->|DDL_ONLY| SN["Exact-release DDL_ONLY lease; no Context operation"]
+    AD -->|Expired or interrupted| AX["Keep fenced carrier exact Context if present exact lease and read fence; action count is zero"]
+    AD -->|DDL admitted| LP{"Lease purpose"}
+    LP -->|WRITER| C1["Claim effective DDL finalizer authority and issue identity-bound one-shot detach permit"]
+    C1 --> L["Service expected-removes exact Context"]
+    L --> LR{"Expected-remove succeeded"}
+    LR -->|No| LX["Consume permit and retain exact Context WRITER lease and read fence; action count is zero"]
+    LR -->|Yes| LT["Publish and confirm same WRITER lease transfer"]
+    LT --> LTC{"Transfer confirmation succeeded"}
+    LTC -->|No| LX
+    LTC -->|Yes| M["Execute synchronous DDL action"]
+    LP -->|DDL_ONLY| LD["Publish and confirm same DDL_ONLY lease transfer"]
+    LD --> LDC{"Transfer confirmation succeeded"}
+    LDC -->|No| DX["Retain DDL_ONLY lease and read fence; action count is zero"]
+    LDC -->|Yes| M
     M --> N["Invalidate caches and clear guards in finally"]
-    N --> O{"DDL action and unconditional cleanup succeeded?"}
+    N --> O{"DDL action and unconditional cleanup succeeded"}
     O -->|Yes| P["Release lease and read fence; run eligible callbacks"]
     O -->|No| Q["Publish RetainedDdlActionLease without registry gap; keep read fence; callback count is zero"]
 ```
@@ -1261,10 +1325,12 @@ graph TD
 1. 取得 DDL ingress 与 exact table lock，并二次校验 lifecycle/sticky fence。
 2. 发布目标表 read fence，request/join 该表 child borrower；未关闭则 `action count = 0`。
 3. 有 Context 时继续持有其 WRITER lease；无 Context 时原子申请 DDL_ONLY lease，绝不等待自己持有的 lease。
-4. 有 Context 时 flush/commit，并用 DDL proof 关闭 expected generation；任一 barrier 失败都保留 Context、spill 与 exact lease。
-5. 在 action 前执行一次最终 admission check；deadline 已过则保持 deferred，只有内部 STOP 可加入原 operation。
-6. action 一旦开始就同步等待结果，不因随后越过 deadline 而强制中断。
-7. success/exception都在`finally`执行cache/guard cleanup；只有action与unconditional cleanup均成功时才释放lease/fence，任一失败都无缝原子转移到`RetainedDdlActionLease`。
+4. 有 Context 时 flush/commit，并用 DDL proof 关闭 expected generation；任一 barrier失败都保留 Context、spill与exact lease；若同operation先被STOP join，则转STOP finalizer且action count=0。
+5. 无 Context 的 DDL_ONLY 分支不执行writer resource close或expected-remove，但取得lease后同样进入purpose-aware final action-admission。
+6. final admission发生时，exact Context（若存在）、source lease、active carrier与read fence必须仍全部存在。deadline/interrupt直接保留这些ownership且不生成detach permit；STOP按lease purpose分别exact-finalize WRITER或DDL_ONLY。
+7. DDL admitted且有Context时，coordinator先发布typed claim reservation，锁外claim effective DDL finalizer authority，再生成绑定exact operation/Context/lease的一次性detach permit；随后由coordinator-owned registry执行exact Context compare-remove，并以不可伪造receipt确认同一WRITER lease transfer。compare-remove或confirm失败时action=0并转restart-required retained。
+8. DDL admitted且无Context时，coordinator确认同一DDL_ONLY lease进入action scope。action一旦开始就同步等待结果，不因随后越过deadline而强制中断。
+9. success/exception都在`finally`执行cache/guard cleanup；只有action与unconditional cleanup均成功时才释放lease/fence，任一失败都无缝原子转移到`RetainedDdlActionLease`。
 
 DDL 细则：
 
@@ -1275,9 +1341,9 @@ DDL 细则：
 - 在任何 table Catalog action前，coordinator原子发布目标表 DDL read fence，拒绝新 child borrow；对已有 child只 request stop并在零协调锁状态等待 resource owner exact-close。deadline/close failure时 action count=0且 fence保留；另一表 child不参与等待；
 - 在表锁内解析当前 `FileStoreTable` 和 physical hash。有 Context 时校验其 WRITER lease；无 Context 时原子获取 DDL_ONLY lease；与另一 Service/retained generation 冲突时 action count=0；
 - 目标表不存在时保持当前 drop/clear 的 idempotent no-op 语义，不创建虚假的 lease；
-- deadline 在 action admission 前到期，或 DDL caller interrupt：action 零执行，callback 零执行，expected Context 与 lease 保留，Context 继续 fenced；DDL 没有隐式后台 worker；interrupt 路径在完成 fencing 后恢复 caller flag；用户必须 STOP/restart 后显式重试该 DDL；
+- deadline 在 purpose-aware final action admission 前到期，或 DDL caller interrupt：action 零执行，callback 零执行，exact Context（若存在）、source lease、active carrier与read fence全部保留；不得mint detach permit。Context继续fenced，DDL没有隐式后台worker；interrupt路径在完成fencing后恢复caller flag；用户必须STOP/restart后显式重试该DDL；
 - DDL 不在 caller 返回后自动执行 action；sticky failure 会拒绝后续普通 DDL，只有 Service `close()` 可以通过内部 FAILED→STOPPING cleanup transition 按 join matrix 加入同一 resource operation；用户必须在任务/Engine restart 后显式重试业务 DDL；
-- Context close成功后才expected-remove；lease继续跨越action与unconditional cleanup。若action或cache invalidation/guard cleanup任一失败，coordinator在同一短临界区把来源为WRITER或DDL_ONLY的exact lease转移给统一`RetainedDdlActionLease`，禁止先release再publish marker；
+- Context close成功且final admission判定DDL获胜后，才可锁外claim finalizer authority并mint detach permit；coordinator-owned Context registry完成identity compare-remove后才签发one-shot receipt，old carrier在receipt被消费前继续强持Context/lease。lease继续跨越action与unconditional cleanup；若detach/transfer/action/cache invalidation/guard cleanup任一失败，coordinator把来源为WRITER或DDL_ONLY的exact lease转移给统一retained carrier，禁止先release或先清carrier再publish marker；
 - cache invalidation、writer-derived-state cleanup、dynamic ingress guard cleanup 保持当前 finally 语义；
 - teardown、DDL action或unconditional cleanup失败会记录sticky firstFailure；随后callback admission返回null。因此已commit reservation保留、offset不acknowledge，不能写成失败后仍执行callback；
 - DDL action与unconditional cleanup均成功且callback admission仍允许时才执行ready callbacks；
@@ -1478,7 +1544,7 @@ src/main/java/io/tapdata/connector/paimon/
   write/PaimonWriteResourceLifecycle.java
   write/PaimonContextCreationFailure.java
   write/PaimonRetainedWriteGeneration.java
-  write/PaimonRuntimeTableFactory.java
+  service/PaimonRuntimeTableFactory.java
   write/bucket/PaimonSequentialIndexBootstrap.java
   write/bucket/PaimonBucketWriterRuntimeFactory.java
   write/bucket/DefaultPaimonBucketWriterRuntimeFactory.java
@@ -1490,6 +1556,7 @@ src/main/java/io/tapdata/connector/paimon/
   write/PaimonTableWriteContext.java
   write/PaimonStreamTableCommitter.java
   service/PaimonServiceResourceCoordinator.java
+  service/PaimonWriteGenerationOwnership.java
   service/PhysicalTableWriterLease.java
   service/RetainedDdlActionLease.java
   service/PaimonDynamicBucketPreflight.java
@@ -1524,7 +1591,7 @@ src/test/java/io/tapdata/connector/paimon/
   write/PaimonCompactionRuntimeTest.java
   write/PaimonWriteResourceLifecycleTest.java
   write/PaimonTableWriteContextFactoryTest.java
-  write/PaimonRuntimeTableFactoryTest.java
+  service/PaimonRuntimeTableFactoryTest.java
   write/bucket/PaimonSequentialIndexBootstrapTest.java
   write/bucket/KeyDynamicBucketWriterStrategyTest.java
   read/PaimonReadResourceScopeTest.java

@@ -343,9 +343,11 @@ class PaimonWriteResourceLifecycleTest {
                 lifecycle.beginClose(
                         proof("generation", PaimonWriteCloseModel.InitiatingReason.STOP));
         assertSame(operation, joined);
-        assertEquals(
-                PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS,
-                lifecycle.awaitAndFinish(joined, Long.MAX_VALUE).state());
+        PaimonWriteResourceLifecycle.CloseOutcome stopped =
+                lifecycle.awaitAndFinish(joined, Long.MAX_VALUE);
+        assertEquals(PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS, stopped.state());
+        assertEquals(PaimonWriteCloseModel.InitiatingReason.DDL, stopped.initiatingReason());
+        assertEquals(PaimonWriteCloseModel.InitiatingReason.STOP, stopped.effectiveReason());
         assertEquals(2, awaits.get());
     }
 
@@ -977,6 +979,68 @@ class PaimonWriteResourceLifecycleTest {
         assertEquals(
                 PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS,
                 second.awaitAndFinish(foreign, Long.MAX_VALUE).state());
+    }
+
+    @Test
+    void finalizationClaimMustLinearizeAgainstDdlToStopJoin() throws Exception {
+        Object stopWinsCapability = new Object();
+        PaimonWriteResourceLifecycle stopWins =
+                emptyLifecycle(
+                        stopWinsCapability,
+                        new PaimonCompactionRuntime("claim-stop-wins"));
+        PaimonWriteResourceLifecycle.CloseOperation ddlOperation =
+                stopWins.beginClose(
+                        proof(
+                                stopWinsCapability,
+                                PaimonWriteCloseModel.InitiatingReason.DDL));
+        PaimonWriteResourceLifecycle.CloseOutcome staleDdlOutcome =
+                stopWins.awaitAndFinish(ddlOperation, Long.MAX_VALUE);
+
+        PaimonWriteResourceLifecycle.CloseOperation stopJoined =
+                stopWins.beginClose(
+                        proof(
+                                stopWinsCapability,
+                                PaimonWriteCloseModel.InitiatingReason.STOP));
+        assertSame(ddlOperation, stopJoined);
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        stopWins.claimClosedSuccess(
+                                staleDdlOutcome,
+                                PaimonWriteCloseModel.InitiatingReason.DDL));
+        PaimonWriteResourceLifecycle.CloseOutcome currentStopOutcome =
+                stopWins.awaitAndFinish(stopJoined, Long.MAX_VALUE);
+        stopWins.claimClosedSuccess(
+                currentStopOutcome, PaimonWriteCloseModel.InitiatingReason.STOP);
+        assertThrows(
+                IllegalStateException.class,
+                () ->
+                        stopWins.claimClosedSuccess(
+                                currentStopOutcome,
+                                PaimonWriteCloseModel.InitiatingReason.STOP));
+
+        Object ddlWinsCapability = new Object();
+        PaimonWriteResourceLifecycle ddlWins =
+                emptyLifecycle(
+                        ddlWinsCapability,
+                        new PaimonCompactionRuntime("claim-ddl-wins"));
+        PaimonWriteResourceLifecycle.CloseOperation ddlWinsOperation =
+                ddlWins.beginClose(
+                        proof(
+                                ddlWinsCapability,
+                                PaimonWriteCloseModel.InitiatingReason.DDL));
+        PaimonWriteResourceLifecycle.CloseOutcome claimedDdlOutcome =
+                ddlWins.awaitAndFinish(ddlWinsOperation, Long.MAX_VALUE);
+        ddlWins.claimClosedSuccess(
+                claimedDdlOutcome, PaimonWriteCloseModel.InitiatingReason.DDL);
+
+        assertThrows(
+                IllegalStateException.class,
+                () ->
+                        ddlWins.beginClose(
+                                proof(
+                                        ddlWinsCapability,
+                                        PaimonWriteCloseModel.InitiatingReason.STOP)));
     }
 
     @Test

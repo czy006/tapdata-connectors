@@ -2,6 +2,11 @@ package io.tapdata.connector.paimon.service;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -118,6 +123,96 @@ class PhysicalTableWriterLeaseTest {
                         registry.retainAfterDdlFailure(
                                 writer("generation-1"), new RuntimeException("stale")));
         assertSame(current, registry.currentLease("physical-hash"));
+    }
+
+    @Test
+    void valueEquivalentLeaseCannotAuthorizeAnExactRegistryTransition() {
+        PhysicalTableWriterLease.Registry registry = new PhysicalTableWriterLease.Registry();
+        PhysicalTableWriterLease exact = writer("generation-1");
+        PhysicalTableWriterLease reconstructed = writer("generation-1");
+        assertTrue(registry.tryAcquire(exact));
+
+        assertFalse(registry.releaseActive(reconstructed));
+        assertThrows(
+                IllegalStateException.class,
+                () ->
+                        registry.retainAfterDdlFailure(
+                                reconstructed, new RuntimeException("forged")));
+        assertSame(exact, registry.currentLease("physical-hash"));
+    }
+
+    @Test
+    void releasePublicationMustKeepPhysicalSlotReservedUntilCompletion() throws Exception {
+        CountDownLatch publicationStarted = new CountDownLatch(1);
+        CountDownLatch allowPublication = new CountDownLatch(1);
+        PhysicalTableWriterLease.Registry registry =
+                new PhysicalTableWriterLease.Registry(
+                        new PhysicalTableWriterLease.Registry.TransitionObserver() {
+                            @Override
+                            public void afterReleaseActive(
+                                    PhysicalTableWriterLease expected, boolean released) {
+                                if (!released) {
+                                    return;
+                                }
+                                publicationStarted.countDown();
+                                try {
+                                    assertTrue(allowPublication.await(5L, TimeUnit.SECONDS));
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    throw new IllegalStateException(
+                                            "Registry observer interrupted", interrupted);
+                                }
+                            }
+                        });
+        PhysicalTableWriterLease exact = writer("generation-1");
+        PhysicalTableWriterLease replacement = writer("generation-2");
+        assertTrue(registry.tryAcquire(exact));
+        AtomicReference<Boolean> released = new AtomicReference<>();
+
+        try (PaimonCoordinatorLockOrderFixture fixture =
+                new PaimonCoordinatorLockOrderFixture()) {
+            Future<?> release =
+                    fixture.submit(() -> released.set(registry.releaseActive(exact)));
+            fixture.await(publicationStarted);
+
+            assertSame(exact, registry.currentLease("physical-hash"));
+            assertFalse(registry.tryAcquire(replacement));
+            assertEquals(1, registry.snapshotOwnedBy("service").activeCount());
+
+            allowPublication.countDown();
+            fixture.await(release);
+        }
+
+        assertTrue(released.get());
+        assertTrue(registry.tryAcquire(replacement));
+    }
+
+    @Test
+    void failedReleasePublicationMustRestoreExactActiveSlot() {
+        RuntimeException publicationFailure = new RuntimeException("publish failed");
+        PhysicalTableWriterLease.Registry registry =
+                new PhysicalTableWriterLease.Registry(
+                        new PhysicalTableWriterLease.Registry.TransitionObserver() {
+                            @Override
+                            public void afterReleaseActive(
+                                    PhysicalTableWriterLease expected, boolean released) {
+                                if (released) {
+                                    throw publicationFailure;
+                                }
+                            }
+                        });
+        PhysicalTableWriterLease exact = writer("generation-1");
+        assertTrue(registry.tryAcquire(exact));
+
+        PhysicalTableWriterLease.Registry.RegistryTransitionException propagated =
+                assertThrows(
+                        PhysicalTableWriterLease.Registry.RegistryTransitionException.class,
+                        () -> registry.releaseActive(exact));
+
+        assertSame(publicationFailure, propagated.transitionFailure());
+        assertSame(exact, registry.currentLease("physical-hash"));
+        assertFalse(registry.tryAcquire(writer("generation-2")));
+        assertEquals(1, registry.snapshotOwnedBy("service").activeCount());
     }
 
     private static PhysicalTableWriterLease writer(String generationId) {

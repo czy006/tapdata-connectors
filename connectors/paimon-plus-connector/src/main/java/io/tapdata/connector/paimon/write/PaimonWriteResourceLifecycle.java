@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
  * drain, but explicitly does not authorize external IO release. See patched Paimon 1.3.2 {@code
  * paimon-core/.../TableCommitMaintenance.java}, lines 34-170.
  */
-final class PaimonWriteResourceLifecycle {
+public final class PaimonWriteResourceLifecycle {
 
     enum StepState {
         NOT_STARTED,
@@ -42,6 +42,7 @@ final class PaimonWriteResourceLifecycle {
                 PaimonWriteCloseModel.CloseState.WAITING_COMPACTION;
         private PaimonWriteCloseModel.CloseState deferredPhase;
         private Throwable terminalFailure;
+        private boolean finalizationClaimed;
 
         private CloseOperation(PaimonWriteCloseModel.QuiescenceProof initiatingProof) {
             this.initiatingProof = Objects.requireNonNull(initiatingProof, "initiatingProof");
@@ -56,8 +57,17 @@ final class PaimonWriteResourceLifecycle {
             return terminalFailure;
         }
 
-        private synchronized CloseOutcome snapshot() {
-            return new CloseOutcome(state, terminalFailure);
+        private synchronized CloseOutcome snapshot(
+                PaimonWriteResourceLifecycle ownerIdentity,
+                Object exactGenerationCapability) {
+            return new CloseOutcome(
+                    ownerIdentity,
+                    this,
+                    exactGenerationCapability,
+                    initiatingReason(),
+                    activeJoinReason,
+                    state,
+                    terminalFailure);
         }
 
         private PaimonWriteCloseModel.InitiatingReason initiatingReason() {
@@ -67,6 +77,10 @@ final class PaimonWriteResourceLifecycle {
         private synchronized void joinForStop() {
             if (initiatingReason() != PaimonWriteCloseModel.InitiatingReason.DDL) {
                 throw new IllegalStateException("Only a DDL operation can be joined by STOP");
+            }
+            if (finalizationClaimed) {
+                throw new IllegalStateException(
+                        "DDL resource outcome was already claimed by its scenario finalizer");
             }
             activeJoinReason = PaimonWriteCloseModel.InitiatingReason.STOP;
             if (state == PaimonWriteCloseModel.CloseState.CLOSE_DEFERRED_TERMINATION) {
@@ -163,6 +177,38 @@ final class PaimonWriteResourceLifecycle {
             state = PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS;
         }
 
+        private synchronized void claimFinalization(
+                CloseOutcome evidence,
+                PaimonWriteCloseModel.InitiatingReason expectedReason,
+                boolean requireClosedSuccess) {
+            if (evidence.operationIdentity != this
+                    || evidence.state != state
+                    || evidence.failure != terminalFailure) {
+                throw new IllegalArgumentException(
+                        "Resource outcome is stale or belongs to another close operation");
+            }
+            if (activeJoinReason != expectedReason
+                    || evidence.effectiveReason != activeJoinReason) {
+                throw new IllegalArgumentException(
+                        "Resource outcome no longer owns the requested finalization reason");
+            }
+            if (requireClosedSuccess) {
+                if (state != PaimonWriteCloseModel.CloseState.CLOSED_SUCCESS
+                        || terminalFailure != null) {
+                    throw new IllegalStateException(
+                            "Finalization requires a current CLOSED_SUCCESS resource outcome");
+                }
+            } else if (!state.isRetained() || terminalFailure == null) {
+                throw new IllegalStateException(
+                        "Retained finalization requires a current terminal retained outcome");
+            }
+            if (finalizationClaimed) {
+                throw new IllegalStateException(
+                        "Resource finalization authority was already claimed");
+            }
+            finalizationClaimed = true;
+        }
+
         private void requireState(PaimonWriteCloseModel.CloseState expected) {
             if (state != expected) {
                 throw new IllegalStateException(
@@ -181,25 +227,64 @@ final class PaimonWriteResourceLifecycle {
         }
     }
 
-    static final class CloseOutcome {
+    public static final class CloseOutcome {
+        private final PaimonWriteResourceLifecycle ownerIdentity;
+        private final CloseOperation operationIdentity;
+        private final Object exactGenerationCapability;
+        private final PaimonWriteCloseModel.InitiatingReason initiatingReason;
+        private final PaimonWriteCloseModel.InitiatingReason effectiveReason;
         private final PaimonWriteCloseModel.CloseState state;
         private final Throwable failure;
 
-        private CloseOutcome(PaimonWriteCloseModel.CloseState state, Throwable failure) {
+        private CloseOutcome(
+                PaimonWriteResourceLifecycle ownerIdentity,
+                CloseOperation operationIdentity,
+                Object exactGenerationCapability,
+                PaimonWriteCloseModel.InitiatingReason initiatingReason,
+                PaimonWriteCloseModel.InitiatingReason effectiveReason,
+                PaimonWriteCloseModel.CloseState state,
+                Throwable failure) {
+            this.ownerIdentity = Objects.requireNonNull(ownerIdentity, "ownerIdentity");
+            this.operationIdentity =
+                    Objects.requireNonNull(operationIdentity, "operationIdentity");
+            this.exactGenerationCapability =
+                    Objects.requireNonNull(
+                            exactGenerationCapability, "exactGenerationCapability");
+            this.initiatingReason =
+                    Objects.requireNonNull(initiatingReason, "initiatingReason");
+            this.effectiveReason =
+                    Objects.requireNonNull(effectiveReason, "effectiveReason");
             this.state = Objects.requireNonNull(state, "state");
             this.failure = failure;
         }
 
-        PaimonWriteCloseModel.CloseState state() {
+        public PaimonWriteCloseModel.CloseState state() {
             return state;
         }
 
-        Throwable failure() {
+        public Throwable failure() {
             return failure;
         }
 
-        boolean terminal() {
+        public boolean terminal() {
             return state.isTerminal();
+        }
+
+        public PaimonWriteCloseModel.InitiatingReason initiatingReason() {
+            return initiatingReason;
+        }
+
+        /** Finalization authority after applying the only legal cross-scenario join: DDL to STOP. */
+        public PaimonWriteCloseModel.InitiatingReason effectiveReason() {
+            return effectiveReason;
+        }
+
+        public boolean belongsTo(PaimonWriteResourceLifecycle expectedOwner) {
+            return ownerIdentity == expectedOwner;
+        }
+
+        public boolean matchesGenerationCapability(Object expectedCapability) {
+            return exactGenerationCapability == expectedCapability;
         }
     }
 
@@ -314,6 +399,25 @@ final class PaimonWriteResourceLifecycle {
         this.spillUnregister =
                 new OnceCloseStep(
                         Objects.requireNonNull(spillUnregister, "spillUnregister"));
+    }
+
+    /** Used only by the one-shot ownership binding created by the service coordinator. */
+    public boolean matchesGenerationCapability(Object expectedCapability) {
+        return exactGenerationCapability == expectedCapability;
+    }
+
+    /** Atomically consumes current success authority before an outer ownership transition. */
+    public void claimClosedSuccess(
+            CloseOutcome evidence,
+            PaimonWriteCloseModel.InitiatingReason expectedReason) {
+        claimFinalization(evidence, expectedReason, true);
+    }
+
+    /** Atomically consumes current retained authority before publishing a retained carrier. */
+    public void claimRetained(
+            CloseOutcome evidence,
+            PaimonWriteCloseModel.InitiatingReason expectedReason) {
+        claimFinalization(evidence, expectedReason, false);
     }
 
     CloseOperation beginClose(
@@ -627,8 +731,29 @@ final class PaimonWriteResourceLifecycle {
         }
     }
 
-    private static CloseOutcome outcome(CloseOperation operation) {
-        return operation.snapshot();
+    private CloseOutcome outcome(CloseOperation operation) {
+        return operation.snapshot(this, exactGenerationCapability);
+    }
+
+    private void claimFinalization(
+            CloseOutcome evidence,
+            PaimonWriteCloseModel.InitiatingReason expectedReason,
+            boolean requireClosedSuccess) {
+        CloseOutcome checked = Objects.requireNonNull(evidence, "evidence");
+        Objects.requireNonNull(expectedReason, "expectedReason");
+        if (checked.ownerIdentity != this
+                || checked.exactGenerationCapability != exactGenerationCapability) {
+            throw new IllegalArgumentException(
+                    "Resource outcome does not belong to this exact writer generation");
+        }
+        synchronized (coordination) {
+            if (closeOperation == null || checked.operationIdentity != closeOperation) {
+                throw new IllegalArgumentException(
+                        "Resource outcome does not belong to the active close operation");
+            }
+            closeOperation.claimFinalization(
+                    checked, expectedReason, requireClosedSuccess);
+        }
     }
 
     private static PaimonWriteCloseModel.CloseState retainedDependencyState(

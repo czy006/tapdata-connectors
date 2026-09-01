@@ -1,0 +1,38 @@
+graph TD
+    A["Enter DDL ingress"] --> B["Acquire exact table lock"]
+    B --> C["Recheck lifecycle and set draining guard"]
+    C --> RB["Fence target-table reads and request child stop"]
+    RB --> RC{"Target-table child borrows closed"}
+    RC -->|No| RX["Retain read fence and operation; action count is zero"]
+    RC -->|Yes| D["Resolve table and physical hash"]
+    D --> E{"Local Context exists"}
+    E -->|Yes| F["Verify existing WRITER lease"]
+    E -->|No| G["Acquire DDL_ONLY lease"]
+    F --> H["Flush and commit with existing false semantics"]
+    H --> J["Create DDL proof and close exact generation"]
+    J --> K{"All resource barriers succeeded"}
+    K -->|No| R["Retain exact Context spill and lease; action and callback counts are zero"]
+    K -->|Yes| AD{"Purpose-aware final action-admission"}
+    G --> I["No Context and no writer-resource close"]
+    I --> AD
+    AD -->|STOP wins| SP{"Lease purpose"}
+    SP -->|WRITER| SW["Expected-remove exact Context and exact-release WRITER lease"]
+    SP -->|DDL_ONLY| SN["Exact-release DDL_ONLY lease; no Context operation"]
+    AD -->|Expired or interrupted| AX["Keep fenced carrier exact Context if present exact lease and read fence; action count is zero"]
+    AD -->|DDL admitted| LP{"Lease purpose"}
+    LP -->|WRITER| C1["Claim effective DDL finalizer authority and issue identity-bound one-shot detach permit"]
+    C1 --> L["Service expected-removes exact Context"]
+    L --> LR{"Expected-remove succeeded"}
+    LR -->|No| LX["Consume permit and retain exact Context WRITER lease and read fence; action count is zero"]
+    LR -->|Yes| LT["Publish and confirm same WRITER lease transfer"]
+    LT --> LTC{"Transfer confirmation succeeded"}
+    LTC -->|No| LX
+    LTC -->|Yes| M["Execute synchronous DDL action"]
+    LP -->|DDL_ONLY| LD["Publish and confirm same DDL_ONLY lease transfer"]
+    LD --> LDC{"Transfer confirmation succeeded"}
+    LDC -->|No| DX["Retain DDL_ONLY lease and read fence; action count is zero"]
+    LDC -->|Yes| M
+    M --> N["Invalidate caches and clear guards in finally"]
+    N --> O{"DDL action and unconditional cleanup succeeded"}
+    O -->|Yes| P["Release lease and read fence; run eligible callbacks"]
+    O -->|No| Q["Publish RetainedDdlActionLease without registry gap; keep read fence; callback count is zero"]

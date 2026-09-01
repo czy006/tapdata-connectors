@@ -1,6 +1,6 @@
 # Tasks：Paimon Spill 与异步资源生命周期根治（Spec V5.1）
 
-> 状态：已授权分阶段实施。每项必须先RED、后GREEN、独立commit并通过审查；Q4只阻断Task 31、DDL-specific验证和最终发布裁决。每项最多修改 5 个文件；若源码审计发现超出范围，必须先拆任务并更新 Plan，不能扩大当前任务。
+> 状态：已授权分阶段实施。每项必须先RED、后GREEN、独立commit并通过审查；Q4只阻断Task 31、DDL-specific验证和最终发布裁决。每个实现切片/commit最多修改 5 个文件；若源码审计发现超出范围，必须先拆成显式编号子任务并更新 Plan，不能静默扩大当前切片。
 
 ## Gate 与基线
 
@@ -210,16 +210,23 @@
 - **文件（≤3）**：`PaimonWriteResourceLifecycle.java`、lifecycle test、failure-injection fixture。
 - **验收**：1)严格事件偏序且exactly-once；2)FAILED_DRAINED/writer/committer失败IO=0；3)WAITING无terminal发布；4)生产字段、构造器、snapshot均不存在physical lease release step。
 
-### Task 25A：建立exact generation ownership与Context carrier
+### Task 25A.1：建立身份型generation evidence与exact registry primitive
 
 - **依赖**：Task 15、16、24。
-- **工作**：在进入Factory前获取一次physical WRITER lease；用不可伪造的generation capability把lease、resource lifecycle和retained handoff绑定到同一active ownership carrier。resource lifecycle只发布到spill unregister；carrier/coordinator负责STOP release、DDL无缝transfer，construction envelope负责Factory SAFE release/RETAINED handoff。Context expected-remove后carrier仍保持active，直到exact release成功或原子转成DDL action/retained owner；transfer-in-progress是显式barrier状态。
-- **文件（≤5）**：generation ownership carrier、coordinator、`PaimonTableWriteContext.java`、ownership test、Context carrier test。
-- **验收**：1)lifecycle不存在lease release字段/callback/snapshot；2)旧token delayed release不能移除新generation；3)DDL transfer前后registry不存在无owner窗口；4)Context只能接收一次成功publication transfer；5)release compare-remove失败时carrier在同一线性化区转retained，不出现Context/marker/carrier全空窗口。
+- **工作**：把proof、resource lifecycle outcome和physical registry expected transition统一绑定到不可复制的对象身份；`CloseOutcome`同时保存initiating reason与DDL→STOP join后的effective finalization reason；registry使用单monitor提供Service-scoped线性化snapshot，禁止value-equivalent token授权release/retain。
+- **文件（≤5）**：`PaimonWriteCloseModel.java`、`PaimonWriteResourceLifecycle.java`、`PhysicalTableWriterLease.java`、lifecycle test、lease test。
+- **验收**：1)resource lifecycle无physical lease release步骤；2)value-equivalent重建token不能通过proof/outcome/registry identity校验；3)DDL→STOP outcome的effective reason为STOP；4)旧token delayed release不能移除新generation；5)Service lease snapshot与单slot transition在线性化点一致。
+
+### Task 25A.2：建立dormant ownership carrier与Coordinator finalizer seam
+
+- **依赖**：Task 25A.1。
+- **工作**：提供将在Task 25B中由Factory调用的WRITER lease reservation API；以one-shot binding把exact lease、resource lifecycle与Context publication绑定到同一active carrier。所有evidence消费采用barrier-visible typed reservation：admission锁内预留、锁外claim lifecycle finalizer authority、锁内凭同一token提交，禁止admission→operation锁嵌套。Coordinator拥有Context registry并封装identity compare-remove；只有exact-remove后生成的不可伪造one-shot receipt才能确认detach。STOP只在effective STOP `CLOSED_SUCCESS`后exact-remove/release；有Context的DDL必须先通过purpose-aware final admission，再claim effective DDL authority、mint identity-bound permit、exact-remove并无缝transfer；无Context DDL_ONLY由Task 31接入同一admission。release/detach compare失败或registry异常先发布retained状态，允许的STOP joiner得到同一结果/异常，FACTORY不允许join。本Task只交付dormant primitive，不修改Factory或Service生产入口。
+- **文件（≤4）**：`PaimonWriteGenerationOwnership.java`、`PaimonServiceResourceCoordinator.java`、`PaimonTableWriteContext.java`、coordinator/Context carrier test。
+- **验收**：1)Context只接收一次publication；2)DDL resource/deadline/interrupt失败在expected-remove前保留exact Context，absent/replaced compare-remove转restart-required retained；3)claim阻塞时admission仍可推进且carrier/barrier可见，claim失败回滚同一reservation；4)transfer/release/registry异常窗口始终有active或retained carrier；5)STOP join exactly-once，compare=false owner/joiner同为false，FACTORY第二owner被拒绝；6)Task 25B/26/28完成前production call graph中不得声称该seam已激活。
 
 ### Task 25B：Factory construction envelope与typed rollback
 
-- **依赖**：Task 17、20、24、25A。
+- **依赖**：Task 17、20、24、25A.1、25A.2。
 - **工作**：每个真实handle创建即登记到construction envelope；使用FACTORY_ROLLBACK proof和固定资源安全偏序，不做普通逆序close。rollback只产生`SAFE_ROLLBACK`或`RETAINED_RESTART_REQUIRED`；只有前者在resource close success后exact-release unpublished lease，后者把同一lease、lifecycle snapshot与强引用移交retained marker。
 - **文件（≤5）**：`PaimonTableWriteContextFactory.java`、construction envelope、creation failure、factory test、rollback fixture。
 - **验收**：1)每个注入点无unregistered handle；2)non-termination或任一close failure不继续IO/delete/release；3)SAFE rollback完整exact-close后lease compare-remove一次；4)成功publication把envelope/lifecycle/lease一次性transfer给Context。
@@ -233,7 +240,7 @@
 
 ### Task 26：建立Context全生命周期WRITER lease与operation admission
 
-- **依赖**：Task 25A、25B、25C。
+- **依赖**：Task 25A.2、25B、25C。
 - **工作**：Factory-created Context接收一次generation ownership carrier；write/commit仅获取operation admission并在表锁后revalidate；close只委托统一resource lifecycle并把outcome交回coordinator，禁止Context自行release physical lease。本Task不宣称所有`PaimonService`入口已激活，Service adoption由Task 28完成。
 - **文件（≤3）**：`PaimonTableWriteContext.java`、context test、context integration test。
 - **验收**：1)write/commit不重复physical acquire/release；2)late DML被二次fence拒绝；3)Context无旁路close。

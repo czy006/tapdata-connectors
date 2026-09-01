@@ -164,7 +164,7 @@ public final class PaimonWriteCloseModel {
         }
 
         public boolean matchesGenerationCapability(Object expectedCapability) {
-            return lease.equals(expectedCapability);
+            return lease == expectedCapability;
         }
 
         public InitiatingReason initiatingReason() {

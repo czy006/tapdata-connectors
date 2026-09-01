@@ -1,5 +1,6 @@
 package io.tapdata.connector.paimon.write;
 
+import io.tapdata.connector.paimon.service.PaimonWriteGenerationOwnership;
 import io.tapdata.connector.paimon.write.bucket.DefaultPaimonBucketWriterRuntimeFactory;
 import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterRuntimeFactory;
 import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterStrategy;
@@ -19,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Owns the connector transaction state for one physical Paimon table.
@@ -43,6 +45,8 @@ public final class PaimonTableWriteContext implements AutoCloseable {
     private final CommitStateStore commitStateStore;
     private final IOManager ioManager;
     private final List<String> spillDirs;
+    private final AtomicReference<PaimonWriteGenerationOwnership> generationOwnership =
+            new AtomicReference<>();
     // Keep the exact identifier/message pair before the first commit I/O and across every
     // ambiguous retry. Paimon's filter is a latest-same-user identifier threshold (<= latest), not
     // an exact message lookup, so recovery must reuse the original user/id/messages. Safety
@@ -184,6 +188,43 @@ public final class PaimonTableWriteContext implements AutoCloseable {
 
     public String commitUser() {
         return commitUser;
+    }
+
+    /**
+     * Receives the exact generation carrier once, before this Context is published to readers.
+     * This is only the Task 25A carrier seam: Task 25B must transfer the Factory construction
+     * envelope, Task 26 must make Context close lifecycle-driven, and Task 28 must adopt the
+     * coordinator in every production Service entry point before this path is production-active.
+     */
+    public void attachGenerationOwnership(
+            PaimonWriteGenerationOwnership.ContextPublication publication) {
+        Objects.requireNonNull(publication, "publication");
+        if (closed) {
+            throw new IllegalStateException(
+                    "Cannot attach generation ownership to a closed Paimon Context");
+        }
+        PaimonWriteGenerationOwnership ownership = publication.ownership();
+        if (!generationOwnership.compareAndSet(null, ownership)) {
+            throw new IllegalStateException(
+                    "Paimon Context already has a generation ownership carrier");
+        }
+        try {
+            publication.claim(this);
+        } catch (RuntimeException | Error publicationFailure) {
+            generationOwnership.compareAndSet(ownership, null);
+            throw publicationFailure;
+        }
+        if (closed) {
+            // Fail closed: publication already consumed the one-shot token, so keep the exact
+            // carrier attached and let the coordinator retain/finalize it instead of creating an
+            // ownership gap by clearing the Context reference.
+            throw new IllegalStateException(
+                    "Paimon Context closed while generation ownership was being published");
+        }
+    }
+
+    public PaimonWriteGenerationOwnership generationOwnership() {
+        return generationOwnership.get();
     }
 
     public BucketMode bucketMode() {
