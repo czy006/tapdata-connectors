@@ -123,7 +123,7 @@ public final class PaimonConsumerLease {
                     synchronized(gate) {
                         // Use operation START, not completion, as the conservative renewal baseline.
                         // Connector policy atop ConsumerManager's overwrite/readback, not an atomic lease:
-                        // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/consumer/ConsumerManager.java#L74
+                        // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/consumer/ConsumerManager.java#L66
                         if(cancelled || failure.get()!=null)throw new CancellationException("Consumer attempt fenced");
                         state.deadline=operationStart+ttl-MARGIN;
                         state.ready=clock.getAsLong()+HEARTBEAT;state.initialized=true;gate.notifyAll();

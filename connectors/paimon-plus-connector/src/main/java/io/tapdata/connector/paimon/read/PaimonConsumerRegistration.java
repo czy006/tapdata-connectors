@@ -54,9 +54,9 @@ public final class PaimonConsumerRegistration {
     public void writeAndVerify() throws InterruptedException {
         resolver.validate(position.startSnapshot);
         resolver.validate(position.nextSnapshot);
-        // ConsumerManager.resetConsumer overwrites and consumer() reads back (74-85). There is no CAS
-        // with expire() (109-124), so verify history as well; never recreate a missing renewal file.
-        // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/consumer/ConsumerManager.java#L74
+        // ConsumerManager.resetConsumer overwrites and consumer() reads back (66-76). There is no CAS
+        // with expire() (95-108), so verify history as well; never recreate a missing renewal file.
+        // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/consumer/ConsumerManager.java#L66
         if (registered && manager.consumer(id).map(Consumer::nextSnapshot).orElse(-1L) != position.startSnapshot) {
             throw new IllegalStateException("Consumer protection disappeared or changed: " + id);
         }

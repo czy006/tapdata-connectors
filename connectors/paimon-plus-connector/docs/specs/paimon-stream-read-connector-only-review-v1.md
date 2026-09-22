@@ -77,3 +77,5 @@
 - 独立复核曾提出 ended 通知和最大 STOP 秒数问题；回查 Engine listener 和算术后撤回：普通同步入口不把 ENDED 当成功，后续同步失败仍传播；Integer.MAX_VALUE 秒可安全表示为纳秒。
 
 验证：`target/stream-read-validation/review-matrix.log`，20 项通过，0 失败/错误/跳过。包含真实 none/input/lookup/full-compaction、append/主键 overwrite、半 plan 回放、租约、schema 和范围检查。lookup 测试先因 writer 缺 IOManager 失败，按原生 TableWrite.withIOManager 契约补齐测试写侧后通过；未改写连接器源端语义。
+
+最终独立只读复核：上述修正后未发现仍存在的明确 P0/P1/P2 问题；这不是无缺陷证明。完整模块回归 789 项，0 失败、0 错误、0 跳过；真实 Engine 验证仍未执行。

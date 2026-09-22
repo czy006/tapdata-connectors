@@ -1,7 +1,7 @@
 # Paimon StreamRead 重构 Spec：仅修改连接器
 
-- 版本：v1.1-draft，2026-09-22；本次为内核源码审查修订。
-- 状态：已完成一轮源码审查并修订；迁移策略仍待用户答复，运行验证仍是实施与发布门槛。尚未实现 Java、运行测试或验证生产恢复。
+- 版本：v1.1，2026-09-22；源码审查后的本地实现版本。
+- 状态：用户已确认完全按 Spec 全新实现。连接器实现和本地测试已落地；完整结果见验证报告。真实 Engine/生产恢复未验证，仍是发布门槛。
 - 唯一修改范围：`connectors/paimon-plus-connector/`。
 - 连接器基线：`hotfix-spill`，`7c40958fdaf3c4f76ef8eb0312550ad16ee81faf`。
 - Paimon 基线：依赖 1.3.2；源码取 `release-1.3` 的 `5c59e6cb01ed0b29563371f56e14fcade4597a2e`，不使用当前其他分支的工作区代码。
@@ -19,11 +19,11 @@
 2. 每表每次最多调用一次原生 plan、有界事件队列、单一交付线程；以完整 plan 的结束标记控制候选 offset。
 3. 新 offset 明确版本与 next-to-consume 语义。默认拒绝旧格式的歧义恢复，禁止自动 `+1`、自动钳制或按 latest 猜测。
 4. 无业务事件的位点更新使用现有 PDK `HeartbeatEvent`，不调用 `accept(emptyList, offset)`。
-5. Consumer 提供 `none` 与 `fixed-start` 两种模式；草案默认 `none`。`fixed-start` 固定保护读取周期的初始位点，在同一周期及其重启中均不前移。
+5. Consumer 提供 `none` 与 `fixed-start` 两种模式；默认 `none`。`fixed-start` 固定保护读取周期的初始位点，在同一周期及其重启中均不前移。
 6. 不注册源端 `FlushOffsetFunction` 来推进 Consumer；不把 `accept()`、目标回调或 stateMap 写后可见等同于恢复位点已持久化。
 7. 不要求增加 Engine API。平台集成验证失败时，报告现有版本的能力边界，不扩大修改范围。
 
-默认关闭 Consumer 是兼容性与运维成本选择，不表示它不重要。固定起点保护在任务长期运行时会持续保留历史；第一版不将它描述为低成本的长期自动保留方案。默认值是本草案建议，待用户评审；选用 `fixed-start` 不改变其安全规则。
+默认关闭 Consumer 是兼容性与运维成本选择，不表示它不重要。固定起点保护在任务长期运行时会持续保留历史；第一版不将它描述为低成本的长期自动保留方案。用户已确认按本 Spec 实施；选用 `fixed-start` 不改变其安全规则。
 
 ## 2. 范围与保证
 
@@ -136,7 +136,7 @@
 
 旧格式 `Map<table, number>` 同时承载过 timestamp 返回的已选中快照和流读返回的 next，不能自动区分；旧代码还可能已提交越过未读数据的值。
 
-第一版建议拒绝所有无版本号旧 Map，不新增按数值自动猜测的开关。此升级策略已向用户单独提问，尚未收到答复；不得将草案建议当作已确认的迁移决定。错误说明旧格式含歧义，并给出两条人工处理路径：
+第一版拒绝所有无版本号旧 Map，不新增按数值自动猜测的开关。用户已确认“不需要保留旧的实现，完全基于 Spec 全新实现”。错误说明旧格式含歧义，并给出两条人工处理路径：
 
 1. 利用 TapData 现有任务操作，从确认仍可读取的较早时间点重新初始化，接受必要重放并核验下游去重/覆盖策略。
 2. 已无法确认缺口或历史过期时，通过现有任务操作重新全量加增量。
@@ -205,12 +205,12 @@ consumer.nextSnapshot == offset.tables[T].startSnapshot
 
 `timestampToStreamOffset` 创建的租约必须持续覆盖后续全量阶段；同一 Service 的 `streamRead` 可复用相同 epoch、表和 start 的租约。若 Engine 使用另一个 Service，后者注册自己的 attempt 文件，前者按自身生命周期结束；不得删除前者文件。
 
-无 Consumer 文件持久化保护生效前不得开始受保护流读。当前无 snapshot 的空表注册 start=1。启动过程中部分成功后失败的 Consumer 保留到 TTL 清理，不返回成功 offset。
+同一 Service 只保护一个 epoch/请求表集合；切换周期或集合需通过现有任务操作重启 Service，不能在仍有全量/流读时替换租约。无 Consumer 文件持久化保护生效前不得开始受保护流读。当前无 snapshot 的空表注册 start=1。启动过程中部分成功后失败的 Consumer 保留到 TTL 清理，不返回成功 offset。
 
 ### 5.4 TTL、续租与停止
 
 - v1 使用固定 60 秒心跳间隔，要求表级 TTL 至少 10 分钟。这是连接器的容错余量策略，不是 Paimon 的最小配置要求；TTL 还需由使用者按预期停机/重启窗口设置，推荐值必须结合实际维护周期评估。
-- TTL 由表的持久化配置及独立写作业维护决定。缺失、非法或过短时，`fixed-start` 失败；`none` 不检查此条件。
+- TTL 还必须在安全纳秒期限范围内（不大于 Long.MAX_VALUE/4 纳秒）；异常大值及转换溢出明确失败。TTL 由表的持久化配置及独立写作业维护决定。缺失、非法或过短时，`fixed-start` 失败；`none` 不检查此条件。
 - 心跳不读取 planned/submittedNext，只重写 start。不能与业务回调共用线程，否则大 plan、背压或回调阻塞可能使 Consumer 过期。
 - 每个 Consumer 同时最多一次续租 I/O，派发队列按受保护表数设上限。续租 I/O 与不执行 I/O 的 deadline watchdog 分离；不能让单个卡住的存储调用同时阻止过期风险检测。
 - 首次注册没有“上次成功”可参考：保护 attempt 创建时记录单调时钟 t0，初始化期限先取 `t0 + stopTimeoutSeconds`；读到合法 TTL 后取该期限与 `t0 + TTL - 2 × 60秒` 中更早者。首次注册与读回在独立 I/O 执行器中运行，调用线程以有限等待观察 deadline/取消；到期即 sticky failure，迟到写入不得恢复 ACTIVE。底层调用不能退出时仍须按 §8 报告停止失败并保留资源所有权，不能声称已取消物理 I/O。
@@ -325,7 +325,7 @@ Coordinator 的状态所有者是 scheduler 线程。另设容量为有效表数
 
 ### 7.3 Schema guard
 
-Paimon Table/ReadBuilder 绑定创建时的 schema，不会因外部 ALTER 自动刷新。[S13] 初始化时保存该分支 schema id B、完整递归字段 id/name/type/nullability、字段顺序、主键及分区键，与 TapTable 的映射核对后再建 reader。仅比较 schema id 会误拒绝只改注释/非读取选项的版本，因此结构指纹不含注释与一般 options。读取语义相关的 producer、merge-engine、overwrite、branch 等选项另外固定，不能运行中悄悄切换。
+Paimon Table/ReadBuilder 绑定创建时的 schema，不会因外部 ALTER 自动刷新。[S13] 初始化时保存该分支 schema id B、完整递归字段 id/name/type/nullability、字段顺序、主键及分区键，与 TapTable 的映射核对后再建 reader。仅比较 schema id 会误拒绝只改注释/非读取选项的版本，因此结构指纹不含注释与一般 options。读取语义相关的 producer、merge-engine、overwrite、branch 等选项，以及由保留策略推导的 changelog 解耦状态另外固定，不能运行中悄悄切换。
 
 每次 plan 前读取持久化最新 schema，结构或读取语义不一致即失败。非空 plan 还通过薄适配层读取 `SnapshotReader.Plan.snapshotId()` 对应 snapshot/changelog 的 schemaId；若大于 B，加载该 schema 再比较，必须在该 plan 第一条 EventItem 入队前完成。计划类型或必要元数据无法核验时明确失败。初始化前的历史 schemaId <= B 交给原生按字段 id 的历史投影，不因旧 data file schema id 不同而一律报错；必须有历史加列/改名实表回归。
 
@@ -362,17 +362,17 @@ PaimonConfig.load 和 spec.json 同步校验；UI 中加入简明中文、英文
 
 不新增 TTL 配置，不新增可前移 Consumer 的模式，不新增 legacy 自动猜测配置，不新增固定线程数/队列大小用户配置。保持 Java 8 编译目标，不升级 Paimon/PDK。
 
-### 9.2 预计实现接缝，不是已存在文件声明
+### 9.2 实现职责
 
 | 本模块路径 | 职责 |
 |---|---|
 | `PaimonConnector.java` | 保留 PDK consumer 类型、时间位点入口与生命周期衔接。 |
 | `service/PaimonService.java` | 委托源端会话、提前注册初始化保护、与现有 stop 顺序对接。 |
-| `read/PaimonStreamReadSession.java`（新） | 每次调用的初始化、交付、取消、错误传播和资源所有权。 |
-| `read/PaimonStreamReadCoordinator.java`（新） | 有限任务、公平调度、每表状态和 ReadItem。 |
-| `read/PaimonReadOffset.java`（新） | v1 envelope、不可变快照、严格解析与来源绑定。 |
-| `read/PaimonReadPositionResolver.java`（新） | timestamp、快照/changelog 可读范围和缺口诊断。 |
-| `read/PaimonConsumerLease.java`（新） | 独立固定 start 保护、注册/续租与失败状态。 |
+| `read/PaimonStreamReadSession.java` | 每次调用的初始化、交付、取消、错误传播和资源所有权。 |
+| `read/PaimonStreamReadCoordinator.java` | 有限任务、公平调度、每表状态和 ReadItem。 |
+| `read/PaimonReadOffset.java` | v1 envelope、不可变快照、严格解析与来源绑定。 |
+| `read/PaimonReadPositionResolver.java` | timestamp、快照/changelog 可读范围和缺口诊断。 |
+| `read/PaimonConsumerLease.java` | 独立固定 start 保护、注册/续租与失败状态。 |
 | `config/PaimonConfig.java`、`resources/spec.json` | 三项源配置及语言文案。 |
 | `src/test/java/io/tapdata/connector/paimon/read/`（新目录） | 单元、原生 Paimon 实表与恢复测试。 |
 
@@ -472,7 +472,7 @@ git diff --name-only
 git diff --cached --name-only
 ```
 
-定向测试名称是预期文件名，当前尚不存在。上面的构建检查使用 `test-compile`，不触发 package：当前模块的 package 阶段会向 `connectors/dist/` 复制产物，不符合本次输出范围。未来如需打包，只能在本模块 pom 内将该复制输出改为本模块目录或增加默认不启用的模块内打包配置，再补充相应命令；不修改父 pom 或其他目录。测试使用临时 catalog 的位置也必须显式指定在本模块 `target/` 内，不对真实业务表执行清理。
+定向测试的实际类名与执行证据见 `docs/validation/stream-read-delivery.md` 和 `tasks/todo.md`。上面的构建检查使用 `test-compile`，不触发 package：当前模块的 package 阶段会向 `connectors/dist/` 复制产物，不符合本次输出范围。未来如需打包，只能在本模块 pom 内将该复制输出改为本模块目录或增加默认不启用的模块内打包配置，再补充相应命令；不修改父 pom 或其他目录。测试使用临时 catalog 的位置也必须显式指定在本模块 `target/` 内，不对真实业务表执行清理。
 
 本轮不引用旧稿的“540 总计/3 失败”为当前基线。实现开始前重新记录基线，同环境验证候选；新增测试全通过，既有失败逐项比较，不能把“没有新失败”写成“全部通过”。记录 commit、依赖解析版本、执行命令、失败方法及 Engine 场景结果。
 
@@ -486,9 +486,9 @@ git diff --cached --name-only
 - 语义适配代码带固定版本源码位置与解释性注释，每个已完成实现单元均有对应本地 commit。
 - 报告明确区分连接器逻辑通过与真实 Engine 场景通过；部署兼容性未验证时不声称端到端恢复已完成。
 
-## 11. 草案评审点与本轮自查
+## 11. 已确认取舍与实施边界
 
-下表区分草案建议与已确定的技术边界；旧位点迁移已提出单独问题，未收到答复前保持待决。Consumer 默认值仍是评审建议，不能标注为用户已确认：
+用户已确认按 Spec 全新实现，以下取舍按该授权落地：
 
 | 取舍 | v1 默认方向 | 影响 |
 |---|---|---|
@@ -529,4 +529,4 @@ Engine 本地源码路径供复核，均仅作为只读参考：
 - [T3 Engine 位点保存](/Users/SL/javaProject/tapdata/iengine/iengine-app/src/main/java/io/tapdata/flow/engine/V2/node/hazelcast/data/pdk/HazelcastTargetPdkBaseNode.java:2030)：flushOffset 在保存之前；同文件 1901 行包含不同目标控制事件路径。
 - [T4 Engine 初始位点](/Users/SL/javaProject/tapdata/iengine/iengine-app/src/main/java/io/tapdata/flow/engine/V2/node/hazelcast/data/pdk/HazelcastSourcePdkBaseNode.java:744)：初始化与 timestampToStreamOffset。
 
-本轮文档检查：修订本 Spec，并新增同目录的源码审查记录；Java、配置、测试、Engine 与原已暂存设计稿均未修改。这里不填写尚未执行的测试通过数。
+实施结果与范围核对见 [本地交付记录](../validation/stream-read-delivery.md)；Engine 源码与原工作区暂存设计稿未修改。

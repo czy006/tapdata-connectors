@@ -16,7 +16,7 @@
 3. 每个调度任务最多调用一次原生 plan；原生调用本身无硬上限。公平调度依赖调用能返回，停止超时报告失败并保留资源，不能伪装物理取消。
 4. 新 offset 明确 next-to-consume；timestamp 在入口捕获共同 T，查 snapshot/changelog；schema guard 在新结构数据入队前失败。
 5. 无业务数据但位点推进时使用 PDK HeartbeatEvent。accept、flushOffset、stateMap 均不作为持久化确认。
-6. Consumer 草案默认 none；可选 fixed-start 永不前移周期 start。续租、初始化 deadline、watchdog 与业务读取分离；保护失败为 sticky failure。
+6. Consumer 默认 none；可选 fixed-start 永不前移周期 start。续租、初始化 deadline、watchdog 与业务读取分离；保护失败为 sticky failure。
 7. 复用 PaimonServiceLifecycle、PaimonStopController、PaimonStopResources、PaimonGuardedReader 和现有 RowKind/codec；不新增平行的 Service 资源账本或改动写入算法。
 
 源码基线固定为 Paimon release-1.3 `5c59e6cb01ed0b29563371f56e14fcade4597a2e`；构建依赖为 1.3.2。PDK 为 2.0.8-SNAPSHOT，需记录实际解析 artifact。JDK 17 执行验证，当前模块 source/target 为 Java 8；历史 Spill 文档的 Java 11 不覆盖当前 pom。
@@ -42,7 +42,7 @@ flowchart LR
   S01 -. Engine入口证据 .-> S10
 ```
 
-执行默认按 S01 至 S16 顺序，检查点置于每 2–3 项后。S11 的注册组件可在 S03 后独立开发，但本计划不启动并行代理；如以后并行，Service/Connector 接线必须串行，测试目录及可变状态隔离。每项预计 2–5 个实现/验证文件，任务清单状态更新另计；超出 5 个实质文件时先拆分，不把多个责任塞进一个提交。
+执行默认按 S01 至 S16 顺序，检查点置于每 2–3 项后。S11 的注册组件可在 S03 后独立开发，实现由主代理串行完成；code-review-and-quality 技能使用独立只读复核代理，不参与修改或运行 Maven；如以后并行实现，Service/Connector 接线必须串行，测试目录及可变状态隔离。每项预计 2–5 个实现/验证文件，任务清单状态更新另计；超出 5 个实质文件时先拆分，不把多个责任塞进一个提交。
 
 S02–S09 的新组件先由模块测试实际调用，原入口保持可构建；S10 是 none 模式切换点，不能提前把新版 timestamp offset 交给旧 streamRead 解析器。S10 之前不部署中间提交；S10–S12 遇 fixed-start 明确报告尚未完成接线，不能静默按 none 运行。S13 后才具备固定保护完整链路。中间提交是可验证增量，不代表独立发布版本；不为此新增永久的生产双实现开关。
 
@@ -50,8 +50,8 @@ S02–S09 的新组件先由模块测试实际调用，原入口保持可构建�
 
 | 项目 | 当前状态 | 对任务的约束 |
 |---|---|---|
-| D01 旧 Map 迁移 | 用户要求不保留旧实现，按 Spec 全新实现；拒绝歧义旧格式，显式重新初始化。 | 可实现明确的 v1 内部协议；S10 的对外拒绝/迁移行为启用前必须确认并同步 Spec。不得默默加自动猜测兼容。 |
-| D02 Consumer 默认策略 | 沿用 Spec：none 默认，fixed-start 显式选用。 | S09 暂按草案设计验证；S10 对外接线前确认默认值。固定保护的永不前移规则不因默认选择而改变。 |
+| D01 旧 Map 迁移 | 用户要求不保留旧实现，按 Spec 全新实现；拒绝歧义旧格式，显式重新初始化。 | 已按确认实现明确的 v1 协议并同步 Spec。不得默默加自动猜测兼容。 |
+| D02 Consumer 默认策略 | 沿用 Spec：none 默认，fixed-start 显式选用。 | S09/S10 已按确认默认值实现和验证。固定保护的永不前移规则不因默认选择而改变。 |
 | E01 真实 Engine 版本与初始化/Heartbeat 契约 | 本地源码只读证据，部署组合未验证。 | S01 已核对正常初始化源码；按本轮本地实施授权继续 S10，真实部署顺序与故障恢复由 S15 独立验收。缺环境时如实记录阻塞，不能用 fake consumer 代替。 |
 | 用户是否授权编码 | 已授权开发与本地单元测试。 | 逐项实现、测试、审查并本地提交；不推送。 |
 
@@ -124,3 +124,9 @@ mvn -pl connectors/paimon-plus-connector \
 ## 7. 完成定义
 
 S01–S16 和检查点都有实际证据，D01/D02 已确认；新测试通过，既有失败有同环境比较及处理结论，未验证的 Engine/存储组合明确列出。每项实现含源码注释且有本地 commit，工作树无遗留未提交实现，所有变更在模块内。本轮交付只完成 Spec/Plan 的版本化，不勾选任何实施任务。
+
+## 7. 本次交付范围更新
+
+用户后续已授权开发与本地单元测试，并确认完全按 Spec 全新实现。S01 的本地基线和源码契约取证、S02–S14 的实现与本地验证属于本次交付；S15 真实 Engine 矩阵需要具体测试环境，保持未验证。S16 可以完成本地回归与提交核对，不能因此将 S15 或端到端发布兼容性标为通过。
+
+实现复核修正 `21aaef39` 同时覆盖相邻适配边界及对应测试（8 个代码/测试文件），作为一次已验证的审查修复提交；这是原 2–5 文件切片规模的例外，没有扩大模块或功能范围。

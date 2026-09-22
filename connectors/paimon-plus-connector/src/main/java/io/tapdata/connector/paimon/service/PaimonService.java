@@ -2442,16 +2442,8 @@ public class PaimonService implements AutoCloseable {
     }
 
     /**
-     * Convert timestamp to stream offset (snapshot IDs) for specified tables
-     *
-     * This method finds the snapshot ID that is earlier than or equal to the given timestamp
-     * for each table. The snapshot ID can be used to resume stream reading from that point.
-     *
-     * @param tables    list of table names to get offset for
-     * @param timestamp timestamp in milliseconds
-     * @param log       logger
-     * @return map of table name to snapshot ID
-     * @throws Exception if conversion fails
+     * Resolve one shared timestamp into a versioned, next-to-consume envelope for every table.
+     * Metadata failures fail the entire initialization; protected mode registers all leases before returning.
      */
     public Object timestampToStreamOffset(List<String> tables, Long timestamp, Log log) throws Exception {
         return timestampToStreamOffset(tables, timestamp, log, () -> {});
@@ -2587,7 +2579,7 @@ public class PaimonService implements AutoCloseable {
                 PaimonReadSchemaGuard guard = new PaimonReadSchemaGuard(physical, tap, resolver);
                 // Paimon release-1.3 @ 5c59e6cb01ed0b29563371f56e14fcade4597a2e:
                 // paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java
-                // #restore/#checkpoint (300-308), #createStartingScanner: restore is next-to-consume.
+                // #checkpoint (305-309) / #restore (317-320), #createStartingScanner: restore is next-to-consume.
                 // Explicit ignore-progress prevents persisted consumer-id from selecting a different start.
                 // https://paimon.apache.org/docs/1.3/program-api/java-api/#stream-read
                 FileStoreTable table = physical.copy(Collections.singletonMap("consumer.ignore-progress", "true"));
