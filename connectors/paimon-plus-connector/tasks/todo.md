@@ -257,7 +257,7 @@
 
 ## S10：切换 none 模式能力入口
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**同时接通新版时间初始化与流读恢复，保持 PDK consumer 类型，替换旧循环并去掉隐式 +1。
 
@@ -265,9 +265,9 @@
 
 **验收：**
 
-- [ ] 正常 capability 从初始化 envelope 到 next=N 恢复读取 N 全链路成立，不允许新旧协议入口混搭。
-- [ ] 缺表/元数据失败整体失败；并发 invocation 拒绝；none 不写 Consumer、不启动续租、不依赖 stateMap。
-- [ ] 保留 codec/RowKind/回调协议；未接通的 fixed-start 明确报错，不偷偷降为 none；本提交不作为完整发布。
+- [x] 正常 capability 从初始化 envelope 到 next=N 恢复读取 N 全链路成立，不允许新旧协议入口混搭。
+- [x] 缺表/元数据失败整体失败；并发 invocation 拒绝；none 不写 Consumer、不启动续租、不依赖 stateMap。
+- [x] 保留 codec/RowKind/回调协议；未接通的 fixed-start 明确报错，不偷偷降为 none；本提交不作为完整发布。
 
 **验证：**F PaimonStreamCapabilityTest,PaimonStreamReadIntegrationTest,PaimonStreamStopTest,PaimonConnectorControlTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -280,7 +280,7 @@
 
 **规模：**M，4 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**entry.log：真实本地 Paimon 入口 2 项、源停止 2 项通过。空表初始化→写入→交付 next=2→恢复仅读下一提交；none 无 Consumer；回调失败传播且 ended 配对。fixed-start 在 S13 接通前明确拒绝。
 
 ## S11：注册固定起点 Consumer
 

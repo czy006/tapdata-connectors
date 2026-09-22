@@ -440,7 +440,7 @@ public class PaimonConnector extends ConnectorBase {
      * @throws Throwable if read fails
      */
     private void streamRead(TapConnectorContext connectorContext, List<String> tables, Object offsetState,
-                           int eventBatchSize, BiConsumer<List<TapEvent>, Object> eventsOffsetConsumer) throws Throwable {
+                           int eventBatchSize, io.tapdata.pdk.apis.consumer.StreamReadConsumer eventsOffsetConsumer) throws Throwable {
         final Log log = connectorContext.getLog();
 
         try {
