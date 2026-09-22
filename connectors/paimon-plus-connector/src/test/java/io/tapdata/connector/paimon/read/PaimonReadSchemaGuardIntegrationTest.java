@@ -31,6 +31,18 @@ class PaimonReadSchemaGuardIntegrationTest {
             assertEquals(1, old.rowType().getFieldCount(), "Bound reader still sees original structure");
         }
     }
+    @Test void retentionChangeThatEnablesDecouplingRequiresRestart() throws Exception {
+        java.nio.file.Path root=Files.createTempDirectory(Files.createDirectories(Paths.get("target/stream-read-validation")),"schema-retention-");
+        try(Catalog catalog=CatalogFactory.createCatalog(CatalogContext.create(new org.apache.paimon.fs.Path(root.toUri())))) {
+            catalog.createDatabase("test",true);Identifier id=Identifier.create("test","orders");
+            catalog.createTable(id,Schema.newBuilder().column("id",DataTypes.INT()).option("bucket","-1").build(),false);
+            FileStoreTable table=(FileStoreTable)catalog.getTable(id);
+            PaimonReadSchemaGuard guard=new PaimonReadSchemaGuard(table,new TapTable("orders").add(new TapField("id","INT")),new PaimonReadPositionResolver(table,"orders",()->true));
+            guard.beforePlan();
+            catalog.alterTable(id,Collections.singletonList(SchemaChange.setOption("changelog.time-retained","2 h")),false);
+            assertThrows(IllegalStateException.class,guard::beforePlan);
+        }
+    }
     @Test void nullableMismatchMustFailAtBinding() {
         FileStoreTable table = org.mockito.Mockito.mock(FileStoreTable.class);
         org.apache.paimon.schema.TableSchema schema = new org.apache.paimon.schema.TableSchema(0,

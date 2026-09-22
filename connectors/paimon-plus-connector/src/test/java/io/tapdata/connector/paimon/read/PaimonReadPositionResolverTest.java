@@ -18,6 +18,12 @@ class PaimonReadPositionResolverTest {
         when(s.id()).thenReturn(id); when(s.timeMillis()).thenReturn(time);
         when(snapshots.snapshotExists(id)).thenReturn(true); when(snapshots.snapshot(id)).thenReturn(s);
     }
+    @Test void storageFailureIsNotMisclassifiedAsExpiredHistory() {
+        RuntimeException denied=new java.io.UncheckedIOException(new java.io.IOException("storage unavailable"));
+        when(snapshots.snapshotExists(1)).thenThrow(denied);
+        assertSame(denied,assertThrows(RuntimeException.class,()->resolver.validate(1)));
+        assertSame(denied,assertThrows(RuntimeException.class,()->resolver.requiredMetadata(1)));
+    }
     @Test void emptyAndLatestSuccessorWaitButHolesFail() throws Exception {
         resolver.validate(1);
         assertThrows(TapPdkOffsetOutOfLogEx.class, () -> resolver.validate(2));

@@ -64,3 +64,16 @@
 - 已做：固定分支源码核对、独立只读复核、文档约束与引用检查、工作区范围检查。
 - 未做：Java 实现、编译、单元/实表测试、真实 Engine 或生产验证。
 - 旧稿工作区与暂存区 blob 均保持 `c087661c9c81ab71bf56d24547aed639b9129cf9`；没有将其并入本轮内容。
+
+## 实现期间复核（2026-09-22）
+
+用户已明确“完全基于 Spec 全新实现”，迁移政策和默认 none 已确认。以下为实现阶段新增证据，前文“未实现/待答复”描述的是最初文档审查时点。
+
+- 修正 null RowKind 转换被静默忽略、TapField 顶层和嵌套 nullable 核对；对应定向测试通过。
+- 修正 Consumer watchdog 与正常 close 的派发竞争：关闭与提交共用短门禁，正常关闭不产生 sticky protection failure；确定性并发测试覆盖检查与派发之间关闭。
+- Consumer TTL 除至少 10 分钟外，要求可安全转换为纳秒期限（不大于 Long.MAX_VALUE/4 纳秒）；防御异常大配置和 Duration 溢出。
+- 核实 CoreOptions.changelogLifecycleDecoupled 由 snapshot/changelog 保留策略推导，schema guard 固定这一读取语义，不使用不存在的独立开关。
+- 元数据存储访问错误保持原始异常；仅元数据确实缺失且重试耗尽才报告 offset-out-of-log，避免误导平台重新初始化。
+- 独立复核曾提出 ended 通知和最大 STOP 秒数问题；回查 Engine listener 和算术后撤回：普通同步入口不把 ENDED 当成功，后续同步失败仍传播；Integer.MAX_VALUE 秒可安全表示为纳秒。
+
+验证：`target/stream-read-validation/review-matrix.log`，20 项通过，0 失败/错误/跳过。包含真实 none/input/lookup/full-compaction、append/主键 overwrite、半 plan 回放、租约、schema 和范围检查。lookup 测试先因 writer 缺 IOManager 失败，按原生 TableWrite.withIOManager 契约补齐测试写侧后通过；未改写连接器源端语义。

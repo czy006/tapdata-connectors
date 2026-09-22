@@ -41,6 +41,10 @@ class PaimonConsumerRegistrationTest {
             assertThrows(IllegalStateException.class,registration::readTtlNanos);
             catalog.alterTable(id,Collections.singletonList(SchemaChange.setOption("consumer.expiration-time","9 min")),false);
             assertThrows(IllegalStateException.class,registration::readTtlNanos);
+            catalog.alterTable(id,Collections.singletonList(SchemaChange.setOption("consumer.expiration-time","36500 d")),false);
+            assertThrows(IllegalStateException.class,registration::readTtlNanos);
+            catalog.alterTable(id,Collections.singletonList(SchemaChange.setOption("consumer.expiration-time","1000000000 d")),false);
+            assertThrows(IllegalStateException.class,registration::readTtlNanos);
             assertTrue(table.consumerManager().listAllIds().isEmpty());
         }
     }

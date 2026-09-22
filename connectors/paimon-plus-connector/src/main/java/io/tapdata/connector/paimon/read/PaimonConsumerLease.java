@@ -93,6 +93,7 @@ public final class PaimonConsumerLease {
         try {
             threadContext.run();check();
             synchronized(gate) {
+                if(cancelled)return;
                 for(State state:states) {
                     if(!state.pending && clock.getAsLong()-state.ready>=0) {
                         state.pending=true;
@@ -101,7 +102,7 @@ public final class PaimonConsumerLease {
                 }
             }
         } catch(CancellationException stopped) { if(!cancelled && active.getAsBoolean())fail(stopped); }
-        catch(Throwable error) { fail(error); }
+        catch(Throwable error) { if(!cancelled && active.getAsBoolean())fail(error); }
     }
     private void renew(State state) {
         try {
@@ -111,7 +112,7 @@ public final class PaimonConsumerLease {
                 long operationStart=clock.getAsLong();
                 try {
                     long ttl=state.target.readTtlNanos();
-                    if(ttl<TimeUnit.MINUTES.toNanos(10))throw new IllegalStateException("Consumer TTL is too short");
+                    if(ttl<TimeUnit.MINUTES.toNanos(10) || ttl>Long.MAX_VALUE/4)throw new IllegalStateException("Consumer TTL is outside safe deadline range");
                     synchronized(gate) {
                         if(!state.initialized) {
                             long risk=state.created+ttl-MARGIN;
@@ -147,8 +148,7 @@ public final class PaimonConsumerLease {
     }
     public Throwable failure() { return failure.get(); }
     public void close(long deadlineNanos) throws InterruptedException, TimeoutException {
-        cancelled=true;
-        watchdog.shutdownNow();io.shutdownNow();
+        synchronized(gate) {cancelled=true;gate.notifyAll();watchdog.shutdownNow();io.shutdownNow();}
         long remaining=Math.max(0,deadlineNanos-System.nanoTime());
         boolean watchdogEnded=watchdog.awaitTermination(remaining,TimeUnit.NANOSECONDS);
         remaining=Math.max(0,deadlineNanos-System.nanoTime());

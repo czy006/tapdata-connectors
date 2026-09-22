@@ -44,6 +44,21 @@ class PaimonConsumerLeaseTest {
             release.countDown();lease.close(deadline());assertThrows(IllegalStateException.class,lease::check);assertEquals(1,writes.get());
         } finally {release.countDown();lease.close(deadline());caller.shutdownNow();assertTrue(caller.awaitTermination(3,TimeUnit.SECONDS));}
     }
+    @Test void closeBetweenWatchdogCheckAndSubmissionIsNotAProtectionFailure() throws Exception {
+        CountDownLatch entered=new CountDownLatch(1),release=new CountDownLatch(1);AtomicInteger failures=new AtomicInteger();
+        PaimonConsumerLease.Target target=new PaimonConsumerLease.Target() {
+            public long readTtlNanos(){return TimeUnit.MINUTES.toNanos(10);}
+            public void writeAndVerify(){fail("No work admitted after close");}
+        };
+        AtomicInteger reads=new AtomicInteger();
+        PaimonConsumerLease lease=new PaimonConsumerLease(Collections.singletonList(target),5000,()->true,e->failures.incrementAndGet(),()->{},()->{
+            if(reads.incrementAndGet()==2) {entered.countDown();try{release.await();}catch(InterruptedException e){Thread.currentThread().interrupt();}}
+            return System.nanoTime();
+        });
+        Thread tick=new Thread(lease::tick);tick.start();
+        try {assertTrue(entered.await(3,TimeUnit.SECONDS));lease.close(deadline());release.countDown();tick.join(3000);assertFalse(tick.isAlive());assertNull(lease.failure());assertEquals(0,failures.get());}
+        finally {release.countDown();tick.join(3000);lease.close(deadline());}
+    }
     @Test void retryExhaustionIsStickyAndSameConsumerHasOneInFlightOperation() throws Exception {
         AtomicInteger writes=new AtomicInteger(),active=new AtomicInteger(),maximum=new AtomicInteger();
         PaimonConsumerLease.Target target=new PaimonConsumerLease.Target() {

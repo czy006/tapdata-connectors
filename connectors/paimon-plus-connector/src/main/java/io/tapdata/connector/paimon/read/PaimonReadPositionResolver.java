@@ -54,9 +54,11 @@ public final class PaimonReadPositionResolver {
 
     public void validate(long next) throws InterruptedException {
         RuntimeException cause = null;
+        RuntimeException metadataFailure = null;
         for (int attempt = 0; attempt < 3; attempt++) {
             checkActive();
             try {
+                metadataFailure = null;
                 if (next <= 0) { throw new IllegalArgumentException("Non-positive snapshot"); }
                 if (metadata(next) != null) { return; }
                 Long latest = snapshots.latestSnapshotIdFromFileSystem();
@@ -65,9 +67,10 @@ public final class PaimonReadPositionResolver {
                 } else if (latest < Long.MAX_VALUE && next == latest + 1) { return; }
                 cause = new IllegalStateException("Requested next=" + next + ", latest=" + latest
                         + ", earliest=" + snapshots.earliestSnapshotId() + ", decoupled=" + decoupled);
-            } catch (RuntimeException failure) { cause = failure; }
+            } catch (RuntimeException failure) { cause = failure; metadataFailure = failure; }
             if (attempt < 2) { pause(); }
         }
+        if (metadataFailure != null) { throw metadataFailure; }
         throw outOfHistory(next, cause);
     }
 
@@ -99,21 +102,24 @@ public final class PaimonReadPositionResolver {
 
     public Snapshot requiredMetadata(long id) throws InterruptedException {
         RuntimeException cause = null;
+        RuntimeException metadataFailure = null;
         for (int attempt = 0; attempt < 3; attempt++) {
             checkActive();
             try {
+                metadataFailure = null;
                 Snapshot snapshot = metadata(id);
                 if (snapshot != null) { return snapshot; }
                 cause = new IllegalStateException("Missing snapshot/changelog metadata " + id);
-            } catch (RuntimeException failure) { cause = failure; }
+            } catch (RuntimeException failure) { cause = failure; metadataFailure = failure; }
             if (attempt < 2) { pause(); }
         }
+        if (metadataFailure != null) { throw metadataFailure; }
         throw outOfHistory(id, cause);
     }
 
     private TapPdkOffsetOutOfLogEx outOfHistory(long next, Throwable cause) {
         // Verified signature: pdk-error-code 2.8-SNAPSHOT TapPdkOffsetOutOfLogEx(String,Object,Throwable).
-        return new TapPdkOffsetOutOfLogEx("paimon", tableName + ":next=" + next, cause);
+        return new TapPdkOffsetOutOfLogEx("paimon", tableName + ":next=" + next + "; decoupled=" + decoupled + "; required history unavailable; reinitialize explicitly", cause);
     }
     private void pause() throws InterruptedException {
         long remaining = retryMillis;

@@ -41,7 +41,11 @@ public final class PaimonConsumerRegistration {
         if (ttl == null || ttl.compareTo(Duration.ofMinutes(10)) < 0) {
             throw new IllegalStateException("fixed-start requires persisted consumer.expiration-time >= 10 minutes");
         }
-        long nanos = ttl.toNanos();
+        long nanos;
+        try { nanos = ttl.toNanos(); }
+        catch (ArithmeticException overflow) { throw new IllegalStateException("Consumer TTL exceeds safe nanosecond deadline range", overflow); }
+        // Keep deadline differences within the same safe quarter-range as the Service stop controller.
+        if (nanos > Long.MAX_VALUE / 4) { throw new IllegalStateException("Consumer TTL exceeds safe nanosecond deadline range"); }
         if (ttlNanos != null && ttlNanos != nanos) { throw new IllegalStateException("Consumer TTL changed; restart required"); }
         ttlNanos = nanos;
         return nanos;

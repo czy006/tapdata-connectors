@@ -71,10 +71,14 @@ public final class PaimonReadSchemaGuard {
         schema.options().forEach((key, value) -> {
             if (key.startsWith("scan.") || key.startsWith("streaming-read") || key.startsWith("sequence.")
                     || key.startsWith("fields.") || key.equals("merge-engine") || key.equals("changelog-producer")
-                    || key.equals("changelog.lifecycle-decoupled") || key.equals("branch")
+                    || key.equals("branch")
                     || key.equals("bucket") || key.equals("bucket-key")) { readOptions.put(key, value); }
         });
-        return Arrays.asList(fields(schema.fields()), schema.primaryKeys(), schema.partitionKeys(), readOptions);
+        // CoreOptions.java#changelogLifecycleDecoupled (2273-2276), release-1.3 @ 5c59e6cb:
+        // decoupling is DERIVED from snapshot/changelog retention, not a standalone option.
+        // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-api/src/main/java/org/apache/paimon/CoreOptions.java#L2273
+        boolean decoupled = new org.apache.paimon.CoreOptions(schema.options()).changelogLifecycleDecoupled();
+        return Arrays.asList(fields(schema.fields()), schema.primaryKeys(), schema.partitionKeys(), readOptions, decoupled);
     }
     private static List<Object> fields(List<DataField> fields) {
         List<Object> result = new ArrayList<>();
