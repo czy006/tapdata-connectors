@@ -5,6 +5,7 @@ import io.tapdata.entity.event.control.HeartbeatEvent;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
@@ -23,6 +24,7 @@ public final class PaimonStreamReadSession {
     private volatile boolean cancelled;
     private volatile long cancelledAt;
     private int inFlight;
+    private volatile PaimonStreamReadCoordinator coordinator;
     private PaimonReadOffset submitted;
     private List<TapEvent> batch = new ArrayList<>();
     private long firstEventAt;
@@ -68,6 +70,52 @@ public final class PaimonStreamReadSession {
     }
     public int inFlight() { synchronized (gate) { return inFlight; } }
     public PaimonReadOffset submittedOffset() { return submitted; }
+
+    <T> boolean offer(BlockingQueue<T> queue, T item) {
+        synchronized (gate) { checkActive(); return queue.offer(item); }
+    }
+
+    public void run(List<PaimonStreamReadCoordinator.Source> sources, long pollMillis,
+            long stopTimeoutMillis, Runnable threadContext) throws Exception {
+        run(sources, pollMillis, stopTimeoutMillis, threadContext,
+                Math.min(sources.size(), Runtime.getRuntime().availableProcessors()));
+    }
+    void run(List<PaimonStreamReadCoordinator.Source> sources, long pollMillis,
+            long stopTimeoutMillis, Runnable threadContext, int workerCount) throws Exception {
+        if (!isActive()) { return; }
+        if (stopTimeoutMillis <= 0) { throw new IllegalArgumentException("Positive stop timeout required"); }
+        coordinator = new PaimonStreamReadCoordinator(sources, this, Math.multiplyExact(batchSize, 10),
+                workerCount, pollMillis, threadContext);
+        boolean interrupted = false;
+        try {
+            coordinator.start();
+            while (isActive()) {
+                PaimonStreamReadCoordinator.Item item = coordinator.poll(20);
+                if (item != null && deliver(item)) { coordinator.delivered(item); }
+                flushIfDue();
+            }
+        } catch (CancellationException cancelled) {
+            if (isActive()) { fail(cancelled); }
+        } catch (InterruptedException interruption) {
+            interrupted = true;
+            if (isActive()) { fail(interruption); }
+        } catch (Throwable error) { fail(error); }
+        finally {
+            cancel();
+            long deadline = cancelledAtNanos() + TimeUnit.MILLISECONDS.toNanos(stopTimeoutMillis);
+            try {
+                coordinator.close(deadline);
+                if (inFlight() != 0) { throw new IllegalStateException("Paimon source has active admissions after worker termination"); }
+            } catch (InterruptedException interruption) { interrupted = true; fail(interruption); }
+            catch (Throwable closeFailure) { fail(closeFailure); }
+            batch = new ArrayList<>();
+            if (interrupted) { Thread.currentThread().interrupt(); }
+        }
+        Throwable error = failure();
+        if (error instanceof Exception) { throw (Exception) error; }
+        if (error instanceof Error) { throw (Error) error; }
+        if (error != null) { throw new IllegalStateException("Paimon source failed", error); }
+    }
 
     /** Called only by the delivery thread. Returns true when a plan boundary was submitted. */
     public boolean deliver(PaimonStreamReadCoordinator.Item item) {

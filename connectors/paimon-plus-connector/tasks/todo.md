@@ -171,7 +171,7 @@
 
 ## S07：多表公平调度与无进展重派发
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**为 Coordinator 接入有界 worker 调度和完成 mailbox，消除永久循环与空表 outstanding 泄漏。
 
@@ -179,9 +179,9 @@
 
 **验收：**
 
-- [ ] worker=1/三表均读取；单表同时一个 outstanding，scheduler 不执行 I/O，不无限提交。
-- [ ] NoProgress/Delivered 串行释放一次；空表随后写入、read delay、旧 token、拒绝提交均有明确状态。
-- [ ] 队列背压可取消；连续空提交与阻塞 plan 记录原生长调用边界，不虚构绝对公平。
+- [x] worker=1/三表均读取；单表同时一个 outstanding，scheduler 不执行 I/O，不无限提交。
+- [x] NoProgress/Delivered 串行释放一次；空表随后写入、read delay、旧 token、拒绝提交均有明确状态。
+- [x] 队列背压可取消；连续空提交与阻塞 plan 记录原生长调用边界，不虚构绝对公平。
 
 **验证：**F PaimonStreamReadCoordinatorTest,PaimonStreamReadIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -193,7 +193,7 @@
 
 **规模：**M，3 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**Coordinator 4 项 + Delivery 6 项 + PlanFailure 6 项通过；coordinator.log。单 worker 三表、无进展重派发、取消拒绝入队、原生阻塞超时保留。
 
 ## S08：接入现有停止与资源所有权
 
