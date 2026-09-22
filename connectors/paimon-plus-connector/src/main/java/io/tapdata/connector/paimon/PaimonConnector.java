@@ -3,6 +3,7 @@ package io.tapdata.connector.paimon;
 import io.tapdata.base.ConnectorBase;
 import io.tapdata.connector.paimon.config.PaimonConfig;
 import io.tapdata.connector.paimon.exception.PaimonFatalWriteException;
+import io.tapdata.connector.paimon.read.PaimonSourceCodecs;
 import io.tapdata.connector.paimon.service.PaimonService;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.TapEvent;
@@ -204,6 +205,7 @@ public class PaimonConnector extends ConnectorBase {
      * @param codecRegistry codec registry
      */
     private void registerCodecs(TapCodecsRegistry codecRegistry) {
+        PaimonSourceCodecs.register(codecRegistry);
         // Register codec for TapRawValue - convert to JSON string
         codecRegistry.registerFromTapValue(TapRawValue.class, "STRING", tapRawValue -> {
             if (tapRawValue != null && tapRawValue.getValue() != null) {

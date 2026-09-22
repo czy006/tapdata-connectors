@@ -68,9 +68,6 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.time.LocalDate;
-import java.time.LocalTime;
-import java.time.ZoneOffset;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -2587,6 +2584,7 @@ public class PaimonService implements AutoCloseable {
                 StreamTableScan scan = builder.newStreamScan();
                 scan.restore(position.nextSnapshot);
                 TableRead read = builder.newRead();
+                PaimonSourceRowDecoder decoder = new PaimonSourceRowDecoder(table.rowType().getFields());
                 sources.add(new PaimonStreamReadCoordinator.Source() {
                     public String name() { return name; }
                     public Long checkpoint() { return scan.checkpoint(); }
@@ -2608,7 +2606,7 @@ public class PaimonService implements AutoCloseable {
                         }
                     }
                     public io.tapdata.entity.event.TapEvent convert(InternalRow row) {
-                        return createEventFromRowKind(row, convertInternalRowToMap(row, table.rowType().getFields(), tap.getNameFieldMap()), name);
+                        return createEventFromRowKind(row, decoder.decodeForEvent(row), name);
                     }
                 });
             }
@@ -2720,8 +2718,7 @@ public class PaimonService implements AutoCloseable {
         log.info("Table {} has {} splits to read", tableName, splits.size());
 
         // Get field names and types for conversion
-        List<DataField> paimonFields = paimonTable.rowType().getFields();
-        Map<String, TapField> tapFields = table.getNameFieldMap();
+        PaimonSourceRowDecoder decoder = new PaimonSourceRowDecoder(paimonTable.rowType().getFields());
 
         // Read data from each split
         long totalRecords = 0;
@@ -2745,7 +2742,7 @@ public class PaimonService implements AutoCloseable {
                         }
 
                         // Convert InternalRow to Map
-                        Map<String, Object> data = convertInternalRowToMap(row, paimonFields, tapFields);
+                        Map<String, Object> data = decoder.decodeForEvent(row);
 
                         // Create TapInsertRecordEvent
                         io.tapdata.entity.event.dml.TapInsertRecordEvent event =
@@ -2779,112 +2776,6 @@ public class PaimonService implements AutoCloseable {
         }
 
         log.info("Batch read completed for table: {}, total records: {}", tableName, totalRecords);
-    }
-
-    /**
-     * Convert Paimon InternalRow to Map
-     *
-     * @param row          Paimon internal row
-     * @param paimonFields Paimon field definitions
-     * @param tapFields    TapData field definitions
-     * @return data map
-     */
-    private Map<String, Object> convertInternalRowToMap(InternalRow row, List<DataField> paimonFields,
-                                                         Map<String, TapField> tapFields) {
-        Map<String, Object> data = new LinkedHashMap<>();
-
-        for (int i = 0; i < paimonFields.size(); i++) {
-            DataField paimonField = paimonFields.get(i);
-            String fieldName = paimonField.name();
-            DataType dataType = paimonField.type();
-
-            // Check if field is null
-            if (row.isNullAt(i)) {
-                data.put(fieldName, null);
-                continue;
-            }
-
-            // Convert value based on data type
-            Object value = convertPaimonValueToJava(row, i, dataType);
-            data.put(fieldName, value);
-        }
-
-        return data;
-    }
-
-    /**
-     * Convert Paimon value to Java object
-     *
-     * @param row      internal row
-     * @param pos      field position
-     * @param dataType Paimon data type
-     * @return Java object
-     */
-    private Object convertPaimonValueToJava(InternalRow row, int pos, DataType dataType) {
-        String typeRoot = dataType.getTypeRoot().name();
-        switch (typeRoot) {
-            case "BOOLEAN":
-                return row.getBoolean(pos);
-            case "TINYINT":
-                return row.getByte(pos);
-            case "SMALLINT":
-                return row.getShort(pos);
-            case "INTEGER":
-                return row.getInt(pos);
-            case "BIGINT":
-                return row.getLong(pos);
-            case "FLOAT":
-                return row.getFloat(pos);
-            case "DOUBLE":
-                return row.getDouble(pos);
-            case "DECIMAL":
-                Decimal decimal;
-                if (dataType instanceof DecimalType) {
-                    decimal = row.getDecimal(pos, ((DecimalType) dataType).getPrecision(), ((DecimalType) dataType).getScale());
-                } else {
-                    Pair<Integer, Integer> fieldPrecisionAndScale = getFieldPrecisionAndScale(dataType.asSQLString());
-                    decimal = row.getDecimal(pos, fieldPrecisionAndScale.getLeft(), fieldPrecisionAndScale.getRight());
-                }
-                return decimal != null ? decimal.toBigDecimal() : null;
-            case "DATE":
-                int days = row.getInt(pos);
-                return new java.sql.Date(days * 86400000L);
-            case "TIMESTAMP_WITHOUT_TIME_ZONE": {
-                Timestamp timestamp;
-                if (dataType instanceof TimestampType) {
-                    timestamp = row.getTimestamp(pos, ((TimestampType) dataType).getPrecision());
-                } else {
-                    Integer fraction = getFieldFraction(dataType.asSQLString());
-                    timestamp = row.getTimestamp(pos, fraction);
-                }
-                if (timestamp != null) {
-                    return timestamp.toLocalDateTime();
-                }
-                return null;
-            }
-            case "TIMESTAMP_WITH_LOCAL_TIME_ZONE": {
-                Timestamp timestamp;
-                if (dataType instanceof TimestampType) {
-                    timestamp = row.getTimestamp(pos, ((TimestampType) dataType).getPrecision());
-                } else {
-                    Integer fraction = getFieldFraction(dataType.asSQLString());
-                    timestamp = row.getTimestamp(pos, fraction);
-                }
-                if (timestamp != null) {
-                    return timestamp.toLocalDateTime().atZone(ZoneOffset.UTC);
-                }
-                return null;
-            }
-            case "TIME_WITHOUT_TIME_ZONE":
-                return LocalTime.ofNanoOfDay(row.getInt(pos) * 1000_000L).atDate(LocalDate.ofYearDay(1970, 1));
-            case "BINARY":
-            case "VARBINARY":
-            case "BYTES":
-                return row.getBinary(pos);
-            default:
-                BinaryString binaryString = row.getString(pos);
-                return binaryString != null ? binaryString.toString() : null;
-        }
     }
 
     /**
@@ -2988,7 +2879,7 @@ public class PaimonService implements AutoCloseable {
         }
         TableScan.Plan plan = stopController.call("plan filtered scan", () -> readBuilder.newScan().plan());
         TableRead tableRead = readBuilder.newRead().executeFilter();
-        List<DataField> paimonFields = paimonTable.rowType().getFields();
+        PaimonSourceRowDecoder decoder = new PaimonSourceRowDecoder(paimonTable.rowType().getFields());
         List<Map<String, Object>> rows = new ArrayList<>();
         long count = 0;
 
@@ -3005,7 +2896,7 @@ public class PaimonService implements AutoCloseable {
                         }
                         count++;
                         if (!query.countQuery()) {
-                            rows.add(convertInternalRowToMap(row, paimonFields, Collections.emptyMap()));
+                            rows.add(decoder.decode(row));
                         }
                     }
                     iterator.releaseBatch();
@@ -3056,8 +2947,7 @@ public class PaimonService implements AutoCloseable {
         }
 
         // Get field names and types for conversion
-        List<DataField> paimonFields = paimonTable.rowType().getFields();
-        Map<String, TapField> tapFields = table.getNameFieldMap();
+        PaimonSourceRowDecoder decoder = new PaimonSourceRowDecoder(paimonTable.rowType().getFields());
 
         // Create read builder
         ReadBuilder readBuilder = paimonTable.newReadBuilder();
@@ -3109,7 +2999,7 @@ public class PaimonService implements AutoCloseable {
                         }
 
                         // Convert InternalRow to Map
-                        Map<String, Object> data = convertInternalRowToMap(row, paimonFields, tapFields);
+                        Map<String, Object> data = decoder.decode(row);
 
                         // Apply filter conditions
                         if (matchesFilter(data, filter)) {

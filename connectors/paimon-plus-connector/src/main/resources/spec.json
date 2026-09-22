@@ -1042,8 +1042,8 @@
     },
     "DATE": {
       "to": "TapDate",
-      "range": ["0001-01-01", "9999-12-31"],
-      "pattern": "yyyy-MM-dd"
+      "range": ["0000-01-01", "9999-12-31"],
+      "pattern": "uuuu-MM-dd"
     },
     "TIME[($fraction)]": {
       "to": "TapTime",
@@ -1060,28 +1060,28 @@
     },
     "TIMESTAMP[($fraction)]": {
       "to": "TapDateTime",
-      "range": ["1970-01-01 00:00:00", "2038-01-19 03:14:07"],
-      "pattern": "yyyy-MM-dd HH:mm:ss",
-      "fraction": [0, 6],
+      "range": ["0000-01-01 00:00:00", "9999-12-31 23:59:59"],
+      "pattern": "uuuu-MM-dd HH:mm:ss",
+      "fraction": [0, 9],
       "defaultFraction": 6
     },
     "TIMESTAMP[($fraction)] WITH LOCAL TIME ZONE": {
       "to": "TapDateTime",
-      "range": ["1970-01-01 00:00:01", "2038-01-19 03:14:07"],
-      "pattern": "yyyy-MM-dd HH:mm:ss",
-      "fraction": [0, 6],
+      "range": ["0000-01-01 00:00:00", "9999-12-31 23:59:59"],
+      "pattern": "uuuu-MM-dd HH:mm:ss",
+      "fraction": [0, 9],
       "defaultFraction": 6,
       "withTimeZone": true
     },
-    "ARRAY": {
+    "ARRAY[<$element>]": {
       "to": "TapArray",
       "byte": "2147483647"
     },
-    "MAP": {
+    "MAP[<$entries>]": {
       "to": "TapMap",
       "byte": "2147483647"
     },
-    "ROW": {
+    "ROW[<$fields>]": {
       "to": "TapMap",
       "byte": "2147483647"
     }
