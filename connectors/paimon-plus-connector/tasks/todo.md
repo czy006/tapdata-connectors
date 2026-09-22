@@ -113,7 +113,7 @@
 
 ## S05：完整读取单表 plan
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**在 Coordinator 中实现一次计划读取及 EventItem/PlanFinished 结果边界，先以单表测试驱动，不接生产入口。
 
@@ -121,9 +121,9 @@
 
 **验收：**
 
-- [ ] 直接 restore(next)，串行 checkpoint/plan/checkpoint；schema/range 检查位于事件入队前。
-- [ ] 全部 split/iterator/reader 成功才生成标记；转换、关闭、取消或队列错误不生成。
-- [ ] 真实多 split/多 batch、零 split 有进展与无进展区分，reader 复用现有受控资源工具。
+- [x] 直接 restore(next)，串行 checkpoint/plan/checkpoint；schema/range 检查位于事件入队前。
+- [x] 全部 split/iterator/reader 成功才生成标记；转换、关闭、取消或队列错误不生成。
+- [x] 真实多 split/多 batch、零 split 有进展与无进展区分，reader 复用现有受控资源工具。
 
 **验证：**F PaimonStreamPlanIntegrationTest,PaimonStreamPlanFailureTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -135,7 +135,7 @@
 
 **规模：**M，3 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**PlanFailure 5 项 + PlanIntegration 1 项通过；plan-read.log。读取/转换/关闭/取消无错误完成标记，实表事件先于 next=2 标记。
 
 ## S06：按 plan 边界交付候选位点
 
