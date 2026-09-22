@@ -103,7 +103,9 @@ public class PaimonConfig extends CommonDbConfig implements Serializable {
     // snapshot.expire.execution-mode 或 Paimon file-operation.thread-num。
     private Integer asyncCommitConcurrency = DEFAULT_ASYNC_COMMIT_CONCURRENCY;
 
-    // Connector source policy; independent from the target commit interval (Spec §9.1).
+    // 源端连接器调度策略（Spec §9.1），不是 Paimon CoreOptions，也不控制目标提交周期。
+    // poll 仅用于无进展 plan 的重试间隔；flush 限制源交付批的等待时间，不表示下游事务已提交。
+    // none 不注册 Consumer；fixed-start 保护原始起点。完整参数说明见 docs/stream-read-architecture.md。
     private Integer streamReadPollIntervalMs = 1000;
     private Integer streamReadFlushIntervalMs = 1000;
     private String streamReadConsumerProtection = "none";

@@ -12,7 +12,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
-/** Immutable connector recovery envelope. Only toMap() crosses the PDK boundary. */
+/**
+ * 连接器自定义的不可变恢复 envelope；不是 Paimon 原生 checkpoint 的序列化格式。
+ * Paimon 只提供每表 next snapshot，本类增加 readEpoch、来源摘要和固定保护起点。
+ * 仅 toMap() 的标准 Map/String/Number 跨 PDK 边界，避免恢复状态依赖连接器私有类加载器。
+ */
 public final class PaimonReadOffset {
     public static final String KIND = "tapdata-paimon-stream";
     private final String readEpoch;
@@ -68,6 +72,7 @@ public final class PaimonReadOffset {
     }
 
     public Map<String, Object> toMap() {
+        // 每次创建独立的嵌套 Map，避免后续表进度修改已提交对象；快照 id 用字符串避免中间 JSON 数值精度损失。
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("kind", KIND);
         envelope.put("version", 1);
@@ -85,6 +90,7 @@ public final class PaimonReadOffset {
     }
 
     public static PaimonReadOffset parse(Object value) {
+        // 连接器政策：旧无版本 Map 无法确定是“已消费 id”还是“下一 id”，故拒绝猜测迁移或自动加一。
         Map<?, ?> envelope = map(value);
         keys(envelope, "kind", "version", "readEpoch", "tables");
         if (!KIND.equals(envelope.get("kind")) || !(envelope.get("version") instanceof Number)) {
@@ -106,6 +112,7 @@ public final class PaimonReadOffset {
     }
 
     public static String physicalTableHash(URI location, String branch) {
+        // 只绑定规范化 location/branch；不是表的创建代际，无法识别同路径 drop/recreate 后编号重合。
         try {
             // Connector policy: bind location/branch without leaking URI credentials into offsets.
             String authority = location.getAuthority();

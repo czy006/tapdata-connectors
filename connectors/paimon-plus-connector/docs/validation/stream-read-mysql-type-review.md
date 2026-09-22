@@ -30,7 +30,7 @@ BIGINT/DECIMAL 的初始疑点已撤回：PDK `ToTapNumberCodec` 本身转 Doubl
 
 ## 明确的数据表示
 
-- 标量保留 Boolean、Byte/Short/Integer/Long、Float/Double、BigDecimal、String、byte[]。DATE 为 epoch-day 对应的日期；TIME 按 Paimon 毫秒精度；Timestamp/LTZ 保留纳秒。
+- 标量保留 Boolean、Byte/Short/Integer/Long、Float/Double、BigDecimal、String、byte[]。DATE 为 epoch-day 对应的日期；TIME 按 InternalRow 的 int 毫秒值解码，当前连接器映射声明精度 0–3；Timestamp/LTZ 保留纳秒。固定 Paimon 1.3 源码的 TimeType 声明允许精度 0–9，不能将连接器毫秒路径视为上游类型上限；TIME(4–9) 的端到端精度尚未验证。
 - ARRAY 为有序数组，ROW 为字段名对象，MAP 仅接受非空字符串键。非字符串键、空键、MULTISET、VARIANT、JSON 内的 NaN/Infinity 明确失败，避免静默改键或错误解码。
 - JSON 内时间用 ISO 文本，嵌套 binary 用标准 Base64。JSON 数字保留十进制精确值；不承诺 MySQL JSON 内部存储的精度和客户端展示方式与 Java BigDecimal 完全一致。
 - 批量和流式事件采用复杂列 JSON 载体；只读查询仍返回独立 Java Map/List。复杂列需要正确发现的 TapMap/TapArray 模型；陈旧/手工改写模型不属于本次已验证合同。

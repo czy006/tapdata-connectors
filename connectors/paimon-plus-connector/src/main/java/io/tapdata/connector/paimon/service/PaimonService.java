@@ -2452,6 +2452,8 @@ public class PaimonService implements AutoCloseable {
     }
 
     private Object timestampToStreamOffsetAdmitted(List<String> tables, Long timestamp, Log log, Runnable threadContext) throws Exception {
+        // 所有表共用一个时间边界，避免逐表取 now 引入不同起点；这是连接器策略，不是跨表快照事务。
+        // 时间相等时的包含规则及原生 TimeTravelUtil 差异，见 PaimonReadPositionResolver#atTimestamp。
         long now = System.currentTimeMillis();
         long boundary = timestamp == null ? now : timestamp;
         Map<String, FileStoreTable> resolved = resolveSourceTables(tables);
@@ -2498,6 +2500,8 @@ public class PaimonService implements AutoCloseable {
 
     private void ensureSourceProtection(PaimonReadOffset offset, Map<String, FileStoreTable> tables,
             Runnable threadContext) throws Exception {
+        // fixed-start 在生成初始 offset 时即可注册，覆盖 TapData 随后的全量阶段；
+        // streamRead 复用同 epoch 的保护，不能等到全量结束才保护所需历史。
         checkSourceProtection();
         if ("none".equals(config.getStreamReadConsumerProtection())) { return; }
         SourceProtection protection;
@@ -2575,10 +2579,12 @@ public class PaimonService implements AutoCloseable {
                 TapTable tap = context.getTableMap().get(name);
                 PaimonReadSchemaGuard guard = new PaimonReadSchemaGuard(physical, tap, resolver);
                 // Paimon release-1.3 @ 5c59e6cb01ed0b29563371f56e14fcade4597a2e:
-                // paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java
-                // #checkpoint (305-309) / #restore (317-320), #createStartingScanner: restore is next-to-consume.
-                // Explicit ignore-progress prevents persisted consumer-id from selecting a different start.
-                // https://paimon.apache.org/docs/1.3/program-api/java-api/#stream-read
+                // DataTableStreamScan#checkpoint/restore 使用同一个 nextSnapshotId，恢复时不能再加一。
+                // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L307
+                // consumer.ignore-progress 固定由 Engine offset 决定起点，避免原生 Consumer 覆盖它。
+                // 内核 createFollowUpScanner 根据 changelog-producer 选择 delta/changelog；
+                // 连接器不自行拼装文件增量，也不保证无 changelog 的表具备完整 CDC before/after。
+                // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L266
                 FileStoreTable table = physical.copy(Collections.singletonMap("consumer.ignore-progress", "true"));
                 ReadBuilder builder = table.newReadBuilder();
                 StreamTableScan scan = builder.newStreamScan();
@@ -2633,12 +2639,17 @@ public class PaimonService implements AutoCloseable {
     }
 
     /**
-     * Create TapEvent from InternalRow based on RowKind
+     * 将原生行变更转换为 TapData 事件：+I/+U 为 insert，-D/-U 为 delete。
+     * 不在连接器内配对 before/after 或构造跨事件事务；目标冲突策略与主键决定重放时的落库行为。
+     * Paimon RowKind 允许 UPDATE_AFTER 单独表示幂等更新，因此不能假设总能收到成对事件。
+     * referenceTime 使用本地转换时间，不是 snapshot 提交时间或源业务时间。
+     * 来源：固定 release-1.3 的 RowKind 枚举语义：
+     * https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-api/src/main/java/org/apache/paimon/types/RowKind.java#L29
      *
      * @param row       internal row
      * @param data      converted data map
      * @param tableName table name
-     * @return TapEvent (Insert, Update, or Delete)
+     * @return TapInsertRecordEvent 或 TapDeleteRecordEvent；未知类型返回 null，由流式调用方报错
      */
     private io.tapdata.entity.event.TapEvent createEventFromRowKind(InternalRow row, Map<String, Object> data, String tableName) {
         RowKind rowKind = row.getRowKind();
@@ -2665,13 +2676,15 @@ public class PaimonService implements AutoCloseable {
                 return deleteEvent;
 
             default:
-                // Unknown row kind, skip
+                // 流式 Coordinator 将 null 视为转换失败，不能悄悄跳过并推进位点。
                 return null;
         }
     }
 
     /**
-     * Batch read records from Paimon table
+     * 全量读取采用有限 TableScan plan，事件复用流式读取的类型转换与源 codec。
+     * 此入口不消费 StreamRead 的 nextSnapshot 位点，也没有 split/行级断点恢复；
+     * 全量与后续流式读取的衔接由 TapData 调用流程及预先取得的 stream offset 负责。
      *
      * @param table             table definition
      * @param offsetState       offset state for resuming read (not used for now)

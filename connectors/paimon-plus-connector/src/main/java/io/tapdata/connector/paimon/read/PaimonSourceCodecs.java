@@ -13,7 +13,11 @@ import io.tapdata.entity.schema.value.TapTimeValue;
 import java.time.LocalDateTime;
 import java.util.TimeZone;
 
-/** Source-only representations within the existing PDK codec extension point. */
+/**
+ * 在既有 PDK 扩展点注册源端 ToTapValue 适配，不修改 Engine 或 MySQL 的 FromTapValue。
+ * 本类处理 TapData 表示边界；Paimon 原生取值依据见 PaimonSourceRowDecoder。
+ * 复杂值的外层恢复与时间载体修正均是连接器策略，不是 Paimon 内核提供的 codec。
+ */
 public final class PaimonSourceCodecs {
     private PaimonSourceCodecs() {}
 
@@ -29,6 +33,9 @@ public final class PaimonSourceCodecs {
             }
             return new TapStringValue((String) value);
         });
+        // 来源：io.tapdata:tapdata-api:2.0.8-SNAPSHOT sources.jar，
+        // io/tapdata/entity/schema/value/DateTime.java#DateTime(LocalDateTime):234。
+        // 对照 connectors/mysql-connector/src/main/java/io/tapdata/connector/mysql/MysqlConnector.java。
         // tapdata-api 2.0.8-SNAPSHOT DateTime.java#DateTime(LocalDateTime):234-240 encodes
         // wall-clock fields as UTC seconds, with a null timeZone. MysqlConnector.java
         // #registerCapabilities:248-265 at connectors@7c40958f then applies the target zone,

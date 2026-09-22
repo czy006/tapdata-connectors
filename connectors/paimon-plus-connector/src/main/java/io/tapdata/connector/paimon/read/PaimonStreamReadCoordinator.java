@@ -9,7 +9,12 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.BooleanSupplier;
 
-/** One native plan per task; native plan() itself has no bounded-duration guarantee. */
+/**
+ * TapData 连接器的多表调度器：每表同时最多一个未交付完的 plan，不依赖 Flink SourceReader/Enumerator。
+ * Paimon 内核负责 plan/split/数据读取；本类负责有界事件队列、跨表调度和资源清理。
+ * 原生 nextPlan 会连续跳过空快照，因此“一次任务调用一次 plan”不等于 plan 有固定耗时上限。
+ * @see <a href="https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L199">Paimon nextPlan 循环与候选位点推进</a>
+ */
 public final class PaimonStreamReadCoordinator {
     public interface Source {
         String name();
@@ -81,6 +86,8 @@ public final class PaimonStreamReadCoordinator {
     void start() { scheduler.start(); }
     Item poll(long millis) throws InterruptedException { return events.poll(millis, TimeUnit.MILLISECONDS); }
     void delivered(Item item) throws InterruptedException {
+        // 有进展的 plan 只能由交付线程确认调度完成；token 防止过期通知释放同表后续任务。
+        // 这里的完成仅允许规划下一次读取，不代表下游已提交事务。
         post(new Completion(states.get(item.table), item.taskToken, false));
     }
     private void post(Completion completion) throws InterruptedException {
@@ -131,6 +138,7 @@ public final class PaimonStreamReadCoordinator {
             boolean progressed = readPlan(state.source, session::isActive, item -> {
                 item.taskToken = token; enqueue(item);
             });
+            // 无进展时没有完成标记可交付，由 worker 释放调度权，并等待 pollInterval 后重试。
             if (!progressed) { post(new Completion(state, token, true)); }
         } catch (CancellationException cancelled) {
             if (session.isActive()) { session.fail(cancelled); }
@@ -141,6 +149,7 @@ public final class PaimonStreamReadCoordinator {
     }
 
     void close(long deadlineNanos) throws InterruptedException, TimeoutException {
+        // 中断只是请求；线程可能阻塞在 FileIO。必须证实终止，才能让 Service 释放共享资源。
         session.cancel();
         scheduler.interrupt();
         workers.shutdownNow();
@@ -180,6 +189,8 @@ public final class PaimonStreamReadCoordinator {
         // Also detect a gap reached after native plan skipped several empty snapshots.
         source.validatePosition(after);
         checkActive(active);
+        // 即使没有数据行，只要跳过空快照使 next 前进，也必须发送边界标记。
+        // 标记排在本 plan 所有事件和 reader 清理之后；Session 才能发布候选 offset。
         if (after > before) { sink.put(Item.finished(source.name(), before, after)); return true; }
         return false; // Scheduler must release this task through PlanNoProgress, not a fake marker.
     }

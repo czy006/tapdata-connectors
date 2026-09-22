@@ -4,7 +4,12 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.reader.RecordReader;
 import java.io.IOException;
 
-/** Adds source cancellation admission to the Service-owned reader without blocking cleanup. */
+/**
+ * 包装 Service 管理的原生 reader，在 readBatch/next 前检查会话与 Consumer 保护状态。
+ * 原生 readBatch 返回 null 表示 reader 结束；RecordIterator.next 返回 null 仅表示当前批结束。
+ * releaseBatch/close 不经过读取门禁：取消后仍必须执行清理，否则批内存和文件句柄会泄漏。
+ * @see <a href="https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-common/src/main/java/org/apache/paimon/reader/RecordReader.java#L45">Paimon reader 与批次生命周期契约</a>
+ */
 public final class PaimonSourceReader implements RecordReader<InternalRow> {
     private final RecordReader<InternalRow> delegate;
     private final PaimonStreamReadSession session;

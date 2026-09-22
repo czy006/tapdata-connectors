@@ -156,13 +156,15 @@ decode 在 reader batch 释放前完成。顶层二进制复制，复杂值转�
 | CHAR / VARCHAR / STRING | String | 字符集与长度由实际 MySQL DDL 约束 |
 | BINARY / VARBINARY | 复制后的 byte[] | 目标 JDBC 二进制绑定；不复用 reader 缓冲 |
 | DATE | java.sql.Date，按 epoch-day 构造 | 表达日历日期；已有跨 JVM 时区合同测试 |
-| TIME | 附在 1970-01-01 上的 LocalDateTime | 源精度为 0–3；按 TapTime 进入时间 codec |
+| TIME | 附在 1970-01-01 上的 LocalDateTime | 当前连接器映射声明精度 0–3，按 InternalRow 的 int 毫秒值解码，再进入 TapTime codec；不代表上游 TimeType 的精度上限 |
 | TIMESTAMP | LocalDateTime | 保留墙钟字段及纳秒；源 codec 使用显式 UTC 编码载体，字段仍是无时区类型 |
 | TIMESTAMP_LTZ | UTC ZonedDateTime | 保留 instant；实际 MySQL TIMESTAMP 的会话时区需往返验证 |
 | ARRAY | List，事件阶段转 JSON 字符串 | 源 codec 按 TapArray 恢复外层类型，MySQL codec 输出 JSON 表示 |
 | MAP / ROW | Map，事件阶段转 JSON 字符串 | 源 codec 按 TapMap 恢复；ROW 使用字段名作为键 |
 
 正常有模型的数值不一定全部包装为 TapNumberValue；不能把读取路径描述成“先统一转 Double”。合同测试同时覆盖默认 CDC 和 schema-enforced 全量转换路径。
+
+TIME 的精度边界需分开看：[固定版本 TimeType 声明](https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-api/src/main/java/org/apache/paimon/types/TimeType.java#L43)允许 0–9，而当前连接器声明和解码路径按毫秒处理，TIME(4–9) 的端到端精度尚未验证。
 
 复杂列为何要经过 JSON：PDK 的递归遍历会先包装嵌套 Map，直接透传容易让 MySQL codec 再次把子对象编码成 JSON 字符串。标准 JSON 载体让其穿过递归遍历，源 `String` codec 再按声明的 TapMap/TapArray 恢复外层类型。普通字符串仍保持字符串。
 
