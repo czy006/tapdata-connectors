@@ -115,9 +115,6 @@ public class PaimonService implements AutoCloseable {
     private static final ThreadGroup CLOSE_WORKER_THREAD_GROUP = createCloseWorkerThreadGroup();
     /** batch read 消费线程从事件队列拉取事件的超时。 */
     private static final int BATCH_READ_EVENT_POLL_TIMEOUT_MILLIS = 100;
-    /** stream read 无新数据时的回退等待。 */
-    /** stream read 完成监控循环的检查间隔。 */
-    /** stream read 执行器关闭时的终止等待超时。 */
     /** 查询未显式指定批大小时的默认值。 */
     private static final int DEFAULT_QUERY_BATCH_SIZE = 1000;
     /** Key 为表名，Value 表示该表写入时是否需要计算 {@link #HASH_KEY} 合成主键。 */
@@ -178,6 +175,26 @@ public class PaimonService implements AutoCloseable {
     private PaimonStopResources.Scope catalogScope;
     private final Object callbackExecutionLock = new Object();
     private final Object bindLock = new Object();
+    private final AtomicReference<Throwable> sourceProtectionFailure = new AtomicReference<>();
+    private volatile SourceProtection sourceProtection;
+    private static final class SourceProtection {
+        final PaimonReadOffset offset;
+        final Set<String> names;
+        final PaimonConsumerLease lease;
+        final PaimonStopResources.Slot slot;
+        final long created = System.nanoTime();
+        SourceProtection(PaimonReadOffset offset, Set<String> names, PaimonConsumerLease lease, PaimonStopResources.Slot slot) {
+            this.offset=offset;this.names=new HashSet<>(names);this.lease=lease;this.slot=slot;
+        }
+        boolean matches(PaimonReadOffset other, Set<String> requested) {
+            if(!offset.readEpoch().equals(other.readEpoch()) || !names.equals(requested))return false;
+            for(String name:names) {
+                PaimonReadOffset.Position first=offset.position(name), next=other.position(name);
+                if(first.startSnapshot!=next.startSnapshot || !first.physicalTableHash.equals(next.physicalTableHash))return false;
+            }
+            return true;
+        }
+    }
     private final AtomicReference<InterruptedException> cleanupInterruption =
             new AtomicReference<>();
     /** Connector 注入的 offset 回调；只允许在 NEW 状态绑定，运行后不可替换。 */
@@ -2437,12 +2454,15 @@ public class PaimonService implements AutoCloseable {
      * @throws Exception if conversion fails
      */
     public Object timestampToStreamOffset(List<String> tables, Long timestamp, Log log) throws Exception {
+        return timestampToStreamOffset(tables, timestamp, log, () -> {});
+    }
+    public Object timestampToStreamOffset(List<String> tables, Long timestamp, Log log, Runnable threadContext) throws Exception {
         try (PaimonServiceLifecycle.Ingress ignored = enterIngress("timestampToStreamOffset")) {
-            return timestampToStreamOffsetAdmitted(tables, timestamp, log);
+            return timestampToStreamOffsetAdmitted(tables, timestamp, log, threadContext);
         }
     }
 
-    private Object timestampToStreamOffsetAdmitted(List<String> tables, Long timestamp, Log log) throws Exception {
+    private Object timestampToStreamOffsetAdmitted(List<String> tables, Long timestamp, Log log, Runnable threadContext) throws Exception {
         long now = System.currentTimeMillis();
         long boundary = timestamp == null ? now : timestamp;
         Map<String, FileStoreTable> resolved = resolveSourceTables(tables);
@@ -2455,8 +2475,9 @@ public class PaimonService implements AutoCloseable {
             positions.put(entry.getKey(), new PaimonReadOffset.Position(
                     PaimonReadPositionResolver.identity(entry.getValue()), next, next));
         }
-        requireUnprotectedMode();
-        return new PaimonReadOffset(UUID.randomUUID().toString(), positions).toMap();
+        PaimonReadOffset offset = new PaimonReadOffset(UUID.randomUUID().toString(), positions);
+        ensureSourceProtection(offset, resolved, threadContext);
+        return offset.toMap();
     }
 
     private Map<String, FileStoreTable> resolveSourceTables(List<String> names) throws Exception {
@@ -2479,9 +2500,64 @@ public class PaimonService implements AutoCloseable {
         return result;
     }
 
-    private void requireUnprotectedMode() {
-        if (!"none".equals(config.getStreamReadConsumerProtection())) {
-            throw new IllegalStateException("fixed-start protection is not connected yet");
+    private void checkSourceProtection() {
+        Throwable failure = sourceProtectionFailure.get();
+        if (failure != null) { throw new IllegalStateException("Paimon source protection failed; restart required", failure); }
+        SourceProtection protection = sourceProtection;
+        if (protection != null) { protection.lease.check(); }
+    }
+
+    private void ensureSourceProtection(PaimonReadOffset offset, Map<String, FileStoreTable> tables,
+            Runnable threadContext) throws Exception {
+        checkSourceProtection();
+        if ("none".equals(config.getStreamReadConsumerProtection())) { return; }
+        SourceProtection protection;
+        synchronized (closeCoordinationLock) {
+            if (stopController.isStarted()) { throw new IllegalStateException("Source protection is stopping"); }
+            protection = sourceProtection;
+            if (protection == null) {
+                String attempt = UUID.randomUUID().toString();
+                List<PaimonConsumerRegistration> registrations = new ArrayList<>();
+                for (Map.Entry<String, FileStoreTable> entry : tables.entrySet()) {
+                    registrations.add(new PaimonConsumerRegistration(entry.getValue(), entry.getKey(), offset,
+                            attempt, () -> sourceProtectionFailure.get() == null));
+                }
+                PaimonConsumerLease lease = PaimonConsumerLease.create(registrations,
+                        TimeUnit.SECONDS.toMillis(config.getStopTimeoutSeconds()), () -> true, failure -> {
+                            sourceProtectionFailure.compareAndSet(null, failure);
+                            PaimonStreamReadSession session = sourceSession.get();
+                            if (session != null) { session.fail(failure); }
+                        }, threadContext);
+                PaimonStopResources.Slot slot = stopResources.reserve("source Consumer protection");
+                protection = new SourceProtection(offset, tables.keySet(), lease, slot);
+                slot.bind(protection); sourceProtection = protection;
+            } else if (!protection.matches(offset, tables.keySet())) {
+                throw new IllegalStateException("Another source read epoch is protected; restart Service to initialize a new epoch");
+            }
+        }
+        try {
+            protection.lease.initialize(() -> !stopController.isStarted());
+            checkSourceProtection();
+        } catch (Exception | Error failure) {
+            sourceProtectionFailure.compareAndSet(null, failure);
+            try { closeSourceProtection(protection.created + TimeUnit.SECONDS.toNanos(config.getStopTimeoutSeconds())); }
+            catch (Throwable closeFailure) { failure.addSuppressed(closeFailure); }
+            throw failure;
+        }
+    }
+
+    private void closeSourceProtection(long deadline) throws Exception {
+        SourceProtection protection = sourceProtection;
+        if (protection == null) { return; }
+        try {
+            protection.lease.close(deadline);
+            synchronized (closeCoordinationLock) {
+                protection.slot.released();
+                if (sourceProtection == protection) { sourceProtection = null; }
+            }
+        } catch (Exception | Error failure) {
+            stopController.retain(failure, this);
+            throw failure;
         }
     }
 
@@ -2491,7 +2567,9 @@ public class PaimonService implements AutoCloseable {
         if (!Boolean.TRUE.equals(running.get())) { return; }
         PaimonReadOffset offset = PaimonReadOffset.parse(offsetState);
         PaimonStreamReadSession session = new PaimonStreamReadSession(offset, eventBatchSize,
-                config.getStreamReadFlushIntervalMs(), () -> Boolean.TRUE.equals(running.get()), consumer);
+                config.getStreamReadFlushIntervalMs(), () -> Boolean.TRUE.equals(running.get()), (events, state) -> {
+                    checkSourceProtection(); consumer.accept(events, state);
+                });
         executeStreamSession(session, () -> {
             Map<String, FileStoreTable> resolved = resolveSourceTables(tables);
             List<PaimonStreamReadCoordinator.Source> sources = new ArrayList<>();
@@ -2521,20 +2599,20 @@ public class PaimonService implements AutoCloseable {
                     public String name() { return name; }
                     public Long checkpoint() { return scan.checkpoint(); }
                     public void validatePosition(long next) throws Exception {
-                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { resolver.validate(next); }
+                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { checkSourceProtection(); resolver.validate(next); }
                     }
                     public void beforePlan() {
-                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { guard.beforePlan(); }
+                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { checkSourceProtection(); guard.beforePlan(); }
                     }
                     public Plan plan() {
-                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { return scan.plan(); }
+                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { checkSourceProtection(); return scan.plan(); }
                     }
                     public void beforeRead(Plan plan) throws Exception {
                         try (PaimonStreamReadSession.Admission ignored = session.admit()) { guard.beforeRead(plan); }
                     }
                     public RecordReader<InternalRow> reader(Split split) throws Exception {
                         try (PaimonStreamReadSession.Admission ignored = session.admit()) {
-                            return new PaimonSourceReader(createFiniteReader(() -> read.createReader(split)), session);
+                            return new PaimonSourceReader(createFiniteReader(() -> read.createReader(split)), session, PaimonService.this::checkSourceProtection);
                         }
                     }
                     public io.tapdata.entity.event.TapEvent convert(InternalRow row) {
@@ -2542,7 +2620,7 @@ public class PaimonService implements AutoCloseable {
                     }
                 });
             }
-            requireUnprotectedMode();
+            ensureSourceProtection(offset, resolved, context::configContext);
             session.checkActive();
             // PDK API 2.0.8-SNAPSHOT io/tapdata/pdk/apis/consumer/StreamReadConsumer.java:29-50.
             // State notifications only; do not opt into asyncMethodAndNoRetry or infer durable ack.
@@ -3165,6 +3243,7 @@ public class PaimonService implements AutoCloseable {
             recordCloseFailure(operation, lifecycle.firstFailure());
             awaitSchedulerTermination(operation);
             awaitLifecycleQuiescence(operation);
+            closeSourceProtection(System.nanoTime() + operation.remainingNanos());
         } catch (Throwable shutdownFailure) {
             recordCloseFailure(operation, shutdownFailure);
             recordStickyFailure(shutdownFailure);
@@ -3422,6 +3501,9 @@ public class PaimonService implements AutoCloseable {
         if (stopController.isFinished() && stopController.failure() != null) { rethrow(stopController.failure()); }
         if (stopController.isStarted()) { throw new IllegalStateException("Paimon service is stopping: " + action); }
         stopController.checkAction(action);
+        if (Arrays.asList("streamRead", "timestampToStreamOffset", "batchRead", "batchCount", "executeQuery", "queryByAdvanceFilter").contains(action)) {
+            checkSourceProtection();
+        }
         return lifecycle.enter(action);
     }
 
@@ -3442,6 +3524,8 @@ public class PaimonService implements AutoCloseable {
             catch (Throwable error) { failure = error; }
             finally {
                 session.cancel();
+                try { closeSourceProtection(session.cancelledAtNanos() + TimeUnit.SECONDS.toNanos(config.getStopTimeoutSeconds())); }
+                catch (Throwable closeFailure) { failure = appendFailure(failure, closeFailure); }
                 if (session.resourcesTerminated()) {
                     registration.released();
                     sourceSession.compareAndSet(session, null);
@@ -3465,9 +3549,11 @@ public class PaimonService implements AutoCloseable {
         }
     }
     private <T> void acceptReadResult(java.util.function.Consumer<T> consumer, T value) throws Exception {
+        checkSourceProtection();
         stopController.run("finite reader callback", () -> consumer.accept(value));
     }
     private <T> void acceptReadResult(java.util.function.BiConsumer<T, Object> consumer, T value) throws Exception {
+        checkSourceProtection();
         stopController.run("finite reader callback", () -> consumer.accept(value, null));
     }
 

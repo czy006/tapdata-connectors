@@ -514,7 +514,7 @@ public class PaimonConnector extends ConnectorBase {
             log.info("Converting timestamp {} to stream offset for {} tables", effectiveTimestamp, tableList.size());
 
             // Get snapshot IDs for specified tables at the given timestamp
-            return paimonService.timestampToStreamOffset(tableList, effectiveTimestamp, log);
+            return paimonService.timestampToStreamOffset(tableList, effectiveTimestamp, log, connectorContext::configContext);
 
         } catch (Exception e) {
             log.error("Error converting timestamp to stream offset: " + e.getMessage(), e);

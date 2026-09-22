@@ -58,12 +58,14 @@ public final class PaimonConsumerLease {
     }
     private static Thread thread(Runnable body,String name) { Thread t=new Thread(body,name);t.setDaemon(true);return t; }
 
-    public void initialize() throws Exception {
+    public void initialize() throws Exception { initialize(() -> true); }
+    public void initialize(BooleanSupplier callerActive) throws Exception {
         check();
         synchronized(gate) {
             if(!started) { started=true;watchdog.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS); }
         }
         while(true) {
+            if(!callerActive.getAsBoolean())throw new CancellationException("Consumer initialization cancelled");
             check();
             synchronized(gate) {
                 if(states.stream().allMatch(s->s.initialized))return;

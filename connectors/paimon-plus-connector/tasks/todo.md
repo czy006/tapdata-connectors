@@ -341,7 +341,7 @@
 
 ## S13：贯通全量至增量保护生命周期
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**在时间初始化阶段注册租约，持续覆盖全量，streamRead 复用匹配会话并传播后台失败。
 
@@ -349,9 +349,9 @@
 
 **验收：**
 
-- [ ] 所有请求表保护完成才返回初始化 offset，full 阶段仍续租；不同 Service 使用独立 attempt。
-- [ ] 全量阶段 sticky failure 在后续源操作/回调与流读入口可见；不持有阻止 Service stop 的永久 ingress。
-- [ ] 独立 writer 清理跨越原保留窗口，固定 start 仍可恢复；租约停止不删文件、不自动重新锚定。
+- [x] 所有请求表保护完成才返回初始化 offset，full 阶段仍续租；不同 Service 使用独立 attempt。
+- [x] 全量阶段 sticky failure 在后续源操作/回调与流读入口可见；不持有阻止 Service stop 的永久 ingress。
+- [x] 独立 writer 清理跨越原保留窗口，固定 start 仍可恢复；租约停止不删文件、不自动重新锚定。
 
 **验证：**F PaimonStreamProtectionIntegrationTest,PaimonFiniteReadLifecycleTest,PaimonStreamStopTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -364,7 +364,7 @@
 
 **规模：**M，4 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**protected-entry.log 42 项通过；增加逐次 reader 健康检查及真实独立 writer 清理验证后 protection-retention.log 17 项通过（入口 5、有限读 12）。全量阶段持有租约、流读复用、停止保留文件；测试将本地 Consumer mtime 调旧后，由独立 writer 执行真实 TTL/历史清理，旧位点明确 out-of-log。
 
 ## S14：验证表模式与恢复语义
 
