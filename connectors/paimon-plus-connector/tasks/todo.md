@@ -1,6 +1,6 @@
 # 任务清单：Paimon StreamRead 连接器内重构
 
-> 2026-09-22；状态：全部实施任务待开始。唯一执行状态来源为本文件。依据 [Plan](plan.md) 和 [Spec](../docs/specs/paimon-stream-read-connector-only-spec-v1.md)。本轮只编写并提交文档。
+> 2026-09-22；状态：已开始本地实施，任务按实际证据更新。唯一执行状态来源为本文件。依据 [Plan](plan.md) 和 [Spec](../docs/specs/paimon-stream-read-connector-only-spec-v1.md)。本轮只编写并提交文档。
 > 下列文件路径均相对 `connectors/paimon-plus-connector/`；新增类名为规划，不是已存在文件。B/F/G 的完整命令见 Plan §4。每项在验证及审查后提交到 `codex/paimon-stream-read`，填写证据/提交，再勾选完成。
 
 ## S01：建立基线并核验平台入口
@@ -27,7 +27,7 @@
 
 **规模：**M，3 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**本地基线通过，见 docs/validation/stream-read-baseline.md；Engine 源码已核对，真实环境部分保持待验证。
 
 ## S02：严格 v1 offset 编解码
 
@@ -465,6 +465,6 @@
 | Spec/Review | 已本地提交 | d6c62884；固定 Paimon 1.3 源码审查。 |
 | Plan/Todo | 本轮编写 | 提交后以本分支 docs 提交及最终交付消息为准。 |
 | Java 实现/测试 | 未开始 | 本轮没有执行 B/F/G 或 Engine 验证。 |
-| D01 旧位点迁移 | 待确认 | 建议拒绝歧义旧格式后显式重新初始化。 |
-| D02 Consumer 默认值 | 待确认 | 草案 none；fixed-start 显式开启。 |
+| D01 旧位点迁移 | 已明确方向 | 用户要求按 Spec 全新实现、不保留旧实现；拒绝歧义旧格式。 |
+| D02 Consumer 默认值 | 按 Spec 实施 | none 默认；fixed-start 显式开启。 |
 | E01 平台适配 | 未验证 | S01/S15 记录实际 Engine/PDK/目标组合。 |
