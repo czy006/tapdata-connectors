@@ -88,7 +88,7 @@
 
 ## S04：绑定读取 schema 并检测变化
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**加入持久化 schema 与计划 schema 的校验，保留原生历史投影，阻止新结构被旧映射静默读取。
 
@@ -96,9 +96,9 @@
 
 **验收：**
 
-- [ ] 初始化核验 TapTable 与递归字段 id/name/type/nullability/顺序、主键、分区键和读取语义。
-- [ ] 运行中不兼容新 plan 在第一条入队前失败；只改注释继续，计划类型或元数据不可核验时不放行。
-- [ ] 历史 schemaId<=初始 B 的加列/改名由真实 Paimon 投影验证，不能一概拒绝旧文件。
+- [x] 初始化核验 TapTable 与递归字段 id/name/type/nullability/顺序、主键、分区键和读取语义。
+- [x] 运行中不兼容新 plan 在第一条入队前失败；只改注释继续，计划类型或元数据不可核验时不放行。
+- [x] 历史 schemaId<=初始 B 的加列/改名由真实 Paimon 投影验证，不能一概拒绝旧文件。
 
 **验证：**F PaimonReadSchemaGuardIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -109,7 +109,7 @@
 
 **规模：**S，2 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**PaimonReadSchemaGuardIntegrationTest：2 项真实 Paimon 测试通过；schema.log。注释兼容、加列失败、历史改名投影及 TapTable 类型不符。
 
 ## S05：完整读取单表 plan
 
