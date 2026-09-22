@@ -1,170 +1,126 @@
-# 实施计划：Paimon Spill 有界停止与受控取消
+# 实施计划：Paimon StreamRead 连接器内重构
 
-> 日期：2026-09-07；状态：用户已授权开发，T01–T18 实现及交付核验完成：62 类、677 项通过，完整证据见 todo。
-> 基线：`962083ff6ae2369a6d85ded223099d09b89bb3f7`；Paimon 1.3.2 / Hadoop 3.3.6；JDK 17 验证，模块编译目标 Java 11。
-> 规范：[V1.2 Spec](../src/doc/specs/SPEC-paimon-spill-sync-graceful-stop.md) §1–15；历史 V1.1 折叠部分仅提供未被替代的基线。任务唯一事实源为 [todo.md](todo.md)。
-> 保存位置由用户确认；根目录 tasks 下另一个 paimon-connector 微批计划不修改。
+- 日期：2026-09-22；状态：计划已编写，尚未开始实现；提交计划不代表待决迁移政策已经确认。
+- 分支：`codex/paimon-stream-read`；基于 `hotfix-spill@7c40958fdaf3c4f76ef8eb0312550ad16ee81faf`，Spec 提交 `d6c62884`。
+- 工作树：`/Users/SL/.codex/worktrees/paimon-stream-read/tapdata-connectors`。
+- 唯一修改范围：`connectors/paimon-plus-connector/`，包括代码、配置、测试、脚本和文档；不修改 Engine、PDK、其他连接器、父 pom。
+- 依据：[Spec v1.1](../docs/specs/paimon-stream-read-connector-only-spec-v1.md)、[源码审查记录](../docs/specs/paimon-stream-read-connector-only-review-v1.md)。任务状态只维护 [todo.md](todo.md)。
+- 历史：本目录原有 Spill 计划及清单均已完成，归档为 [历史 Plan](paimon-spill-completed-plan.md) 和 [历史 Todo](paimon-spill-completed-todo.md)。其中测试计数和“未提交”等措辞属于当时记录，不作本次状态。根目录 tasks 不修改。
 
-## 1. 目标与交付边界
+## 1. 目标与架构决定
 
-STOP 在总预算内等待最终 Compaction，超时主动取消。只有实际任务终止、原生 prepare 已退出及全部相关访问者退出，才能清理 Spill。无法证明时返回失败并保留资源，阻止迟到线程启动新提交/清理；业务提交结果未知仍按原协议对账。
+修复 next 位点额外加一、位点越过未交付事件、半 plan 取消仍推进、空表停轮询、多表永久循环、低流量不刷新及资源关闭竞争。保持 TapData 能力入口、事件类型、错误传播、offset 恢复和生命周期体系。
 
-本次实现范围是 paimon-plus-connector 的写停止、有限读共享资源保护和停止日志。只支持有效 SYNC；不修改 Paimon 内核、Engine、PDK API、依赖版本、CDC 路由、微批阈值或 source offset 格式。不增加跨机器锁、TTL 接管、reaper、Thread.stop、进程强杀。长期 StreamRead 重写不在本计划验收范围。
+1. 保留 Paimon ReadBuilder → StreamTableScan → TableRead；完整读取 plan 后才产生 PlanFinished，单一 Delivery Loop 提交深复制的候选 offset。
+2. Coordinator 串行管理调度状态，worker 与交付线程通过完成 mailbox 通知；无进展返回 IDLE，不能等待一个不会产生的标记。
+3. 每个调度任务最多调用一次原生 plan；原生调用本身无硬上限。公平调度依赖调用能返回，停止超时报告失败并保留资源，不能伪装物理取消。
+4. 新 offset 明确 next-to-consume；timestamp 在入口捕获共同 T，查 snapshot/changelog；schema guard 在新结构数据入队前失败。
+5. 无业务数据但位点推进时使用 PDK HeartbeatEvent。accept、flushOffset、stateMap 均不作为持久化确认。
+6. Consumer 草案默认 none；可选 fixed-start 永不前移周期 start。续租、初始化 deadline、watchdog 与业务读取分离；保护失败为 sticky failure。
+7. 复用 PaimonServiceLifecycle、PaimonStopController、PaimonStopResources、PaimonGuardedReader 和现有 RowKind/codec；不新增平行的 Service 资源账本或改动写入算法。
 
-不同机器的 Engine 仍必须等旧进程实际退出后接管；本地 owner 不是分布式 fencing。FAILED_RETAINED 不意味着停止线程已经死掉，更不意味着可以立刻在 B 机器启动同表 writer。
+源码基线固定为 Paimon release-1.3 `5c59e6cb01ed0b29563371f56e14fcade4597a2e`；构建依赖为 1.3.2。PDK 为 2.0.8-SNAPSHOT，需记录实际解析 artifact。JDK 17 执行验证，当前模块 source/target 为 Java 8；历史 Spill 文档的 Java 11 不覆盖当前 pom。
 
-## 2. 已解决的审查问题与证据
+## 2. 依赖顺序与交付切片
 
-| 问题 | 实现决定 | Spec 证据 / 验收 |
-| --- | --- | --- |
-| prepare 内联关闭可能早于外层 termination 屏障 | GuardedFuture 的受控取消转换成私有 ExecutionException，先展开原生 prepare | R01、PS05/PS08/PS09/PS10；B06/B19 |
-| reader 调用结束不证明资源关闭 | ingress 与读资源账本分开；close 成功才注销 | R02；B17/B20 |
-| 只保留 owner token 会丢掉失败资源 | 同一 Service 资源账本涵盖正常构造与半构造资源；失败时静态强引用 | R03；B10/B14/B22 |
-| INFO / onStop WARN 可以卡住调用者 | 一个有界共享日志分发器；终态先发布，日志非阻塞交付 | R04；B16/B21 |
-| final 提交和取消竞争、长锁阻塞监督 | 一个 StopController，单次 final decision 和动作门禁；无跨组件锁嵌套 | R05；B05/B07/B08/B12 |
-| 内存 pending 被误称为跨进程恢复凭据 | 精确 envelope 仅进程内保留；重启按稳定用户与同用户 snapshot 对账 | R06；B08/B18 |
-| 目录保护 helper 在 deleted=false 时仍释放锁 | 仅正向关闭后释放，失败保留未释放引用并报告证明结果 | R07；B13/B14/B22 |
-
-源码的完整本地路径、方法、行范围、摘录和 SHA-256 在 Spec §9（PS01–PS18）。后续在关键代码注释中写出固定 `apache/paimon@c05f7d1f1b1e5d37e64edab0f2978124d90b64f7` URL、方法及适配理由；不得仅写“参考 Paimon”。
-
-## 3. 架构与实现取舍
-
-```mermaid
-flowchart TD
-    PDK["PaimonConnector.onStop"] --> C["PaimonStopController：监督/预算/唯一终态"]
-    C --> W["唯一 close worker"]
-    W --> D["scheduler + ingress + 业务/callback 屏障"]
-    D --> P["Context 最终 prepare"]
-    P --> G{"提交 / 取消单胜者"}
-    G --> COMMIT["精确 pending 提交与确认"]
-    G --> CANCEL["Executor 私有取消 → 原生 prepare 展开"]
-    COMMIT --> PROOF["实际 termination + 访问者/资源证明"]
-    CANCEL --> PROOF
-    PROOF --> CLOSE["sync → writer → committer → IO → owner → Catalog"]
-    C --> RETAIN["预算耗尽/关闭证明缺失：静态强保留"]
-    RETAIN --> FAIL["FAILED_RETAINED，迟到动作拒绝"]
-    C -.非阻塞事件.-> LOG["共享有界日志分发器"]
-```
-
-- `PaimonStopController` 替换当前 Service 内嵌 CloseOperation，集中预算、final attempt、动作许可、结果发布和进度快照；保持一个 close worker。禁止同时保留两套终态状态机。
-- `PaimonServiceLifecycle` 保留现有 ingress/consumer 计数；不搬入 writer 或 IOManager，不将全 Service 的资源安全寄托于计数等于零。
-- `PaimonCompactionExecutor` 保留已验证 CompactTask 类型边界与异常审计，新增未退场任务登记、受控取消和异常转换。完成历史不长期保留；普通/外部取消仍是硬失败。
-- 新 `PaimonStopResources` 管理 Service 已分配资源和构造占位；活动时由 Service 持有，FAILED_RETAINED 时登记静态强引用。不可只保存字符串，也不可在失败后按时间释放。读资源关闭失败同样纳入。
-- 新 `PaimonStopLog` 使用类加载器内共享的有界单 daemon 分发器；不按表建池，禁止 caller-runs、阻塞 put、停止时 join。后端阻塞时丢弃/合并进度，唯一终态仍保存在停止操作快照中。
-- Context 的提交/确认与清理方法接受明确的停止控制上下文；复用原提交核心，不复制 pending 状态机。private StopCompactionCancelled 只表示受控停止，不冒充普通 NativeCompactionFailure。
-- 这次为增加有界退出而恢复必要的资源保留模型；简化指标是唯一控制器、唯一取消来源、唯一资源账本，没有双模式长留、周期 reaper 或散落 timer。不能把代码行数一定减少作为未经证实的承诺。
-
-### 3.1 锁与在途动作
-
-控制门禁内不调用 Lifecycle、executor、logger、Paimon 或外部回调。先发布取消决定，释放控制门禁后再封闭 executor 并扫描任务；executor 的登记锁涵盖两步之间已接收的任务。submit 可按 executor controlLock → controller gate 检查；gate 内不得反向取得 executor/coordinator/Context/Lifecycle 锁。长 Service/Context/表锁不参与监督者的截止检查或终态发布。
-
-每次提交、重试、状态保存、callback、新资源创建和破坏性清理取得动作许可。超时后禁止新许可；已经取得许可的外部调用可能迟到落地，按未知结果保留。终态及其主因发布后不再更改，迟到异常作为诊断保存。
-
-### 3.2 预算
-
-Service 级配置：`stopTimeoutSeconds=180`、`finalCompactionTimeoutSeconds=120`、`compactionCancelGraceSeconds=30` 为已实现的可配置默认值。正整数且纳秒换算不溢出；表级覆盖拒绝。配置参数化不影响协议，改变数值不改变失败保留规则。
-
-按 Spec §2 计算 Dstop/Dfinal/Dcancel，采用单调时钟和可注入短测试预算。多表、并发 close、重复 close 都不重置总预算。总时间不足预留取消宽限时不开始新 final prepare；没有业务屏障就不能豁免为正常弃提交。
-
-## 4. 依赖与任务顺序
-
-任务拆分为可构建、可独立验证的内部切片，不代表每个中间切片都可上线。T15 是生产 STOP 启用有界等待的接线点，在它之前用显式注入的控制对象验证新组件，生产不得启用半套超时清理协议；不新增面向用户的双模式开关或永久兼容层。
+| 顺序 | 任务 | 可验证产出 |
+|---|---|---|
+| S01–S03 | 基线/平台入口取证、offset、时间与范围 | 先暴露平台适配和恢复边界风险；严格位点协议有实表及编解码证据。 |
+| S04–S06 | schema guard、单表 plan 读取、候选位点交付 | 使用真实 Paimon 数据贯通单表读取到 fake PDK 回调；失败不能越过 plan。 |
+| S07–S09 | 多表调度、停止接缝、配置 | 公平重派发、无进展完成、受控资源退出和配置校验。 |
+| S10–S12 | none 模式入口接线、固定 Consumer 注册、续租 | 先形成 none 模式完整能力入口；Consumer 组件独立验证后再接入。 |
+| S13–S15 | 全量至增量保护、模式实表、Engine 故障验证 | 验证长期保护生命周期、实际事件语义及平台恢复，不改内核。 |
+| S16 | 最终回归与交付复核 | 全部验收矩阵、来源注释和本地提交闭环；区分发布支持与未验证组合。 |
 
 ```mermaid
 flowchart LR
-    T01 --> T02
-    T01 --> T03 --> T04 --> T05
-    T01 --> T06 --> T08
-    T01 --> T07 --> T08
-    T01 --> T10
-    T09 --> T10
-    T05 --> T11
-    T06 --> T11
-    T06 --> T14
-    T11 --> T14
-    T06 --> T12 --> T13
-    T12 --> T14
-    T13 --> T14
-    T04 --> T13
-    T05 --> T13
-    T06 --> T13
-    T02 --> T15
-    T08 --> T15
-    T10 --> T15
-    T11 --> T15
-    T14 --> T15
-    T13 --> T15
-    T15 --> T16
-    T15 --> T17
-    T16 --> T18
-    T17 --> T18
+  S01 --> S02 --> S03 --> S04 --> S05 --> S06
+  S06 --> S07 --> S08 --> S09 --> S10
+  S03 --> S11 --> S12
+  S10 --> S13
+  S12 --> S13 --> S14 --> S15 --> S16
+  S01 -. Engine入口证据 .-> S10
 ```
 
-执行索引（验收勾选只维护 todo.md）：
+执行默认按 S01 至 S16 顺序，检查点置于每 2–3 项后。S11 的注册组件可在 S03 后独立开发，但本计划不启动并行代理；如以后并行，Service/Connector 接线必须串行，测试目录及可变状态隔离。每项预计 2–5 个实现/验证文件，任务清单状态更新另计；超出 5 个实质文件时先拆分，不把多个责任塞进一个提交。
 
-| 顺序 | 任务 | 关键产出 |
-| --- | --- | --- |
-| T01–T03 | 控制器、配置、任务登记 | 建立短控制门禁、不可重置预算和实际退场模型 |
-| T04–T05 | 原生取消适配、最终提交竞争 | 提前展开 prepare，提交/取消只能一个胜者 |
-| T06–T08 | 资源账本、有限读准入/关闭 | 强引用覆盖半构造资源与读资源 |
-| T09–T10 | 日志分发、停止出口接线 | INFO/WARN 阻塞不影响 STOP 返回 |
-| T11–T14 | 业务动作门禁、释放原语、分步清理、构造/DDL | 迟到线程不启动下一外部动作 |
-| T15 | Service 总预算与终态接线 | 生产有界 STOP 协议完整闭环 |
-| T16–T17 | 原生集成、进程退出/GC | 验证真实 Spill、跨 JVM 本地锁和恢复边界 |
-| T18 | 全量验证与文档同步 | 完整门禁与最终证据；未完成项不伪装通过 |
+S02–S09 的新组件先由模块测试实际调用，原入口保持可构建；S10 是 none 模式切换点，不能提前把新版 timestamp offset 交给旧 streamRead 解析器。S10 之前不部署中间提交；S10–S12 遇 fixed-start 明确报告尚未完成接线，不能静默按 none 运行。S13 后才具备固定保护完整链路。中间提交是可验证增量，不代表独立发布版本；不为此新增永久的生产双实现开关。
 
-可并行：T02 与 T03、T07 与执行器探针、T09 与资源账本；T16 与 T17 仅在测试临时目录及静态测试状态隔离后可并行。Service/Context 的接线任务必须顺序执行，避免共享文件与锁合同分叉。
+## 3. 前置决定与验证门槛
 
-## 5. 验证规则
+| 项目 | 当前状态 | 对任务的约束 |
+|---|---|---|
+| D01 旧 Map 迁移 | 已提问，未收到答复；建议拒绝歧义旧格式，显式重新初始化。 | 可实现明确的 v1 内部协议；S10 的对外拒绝/迁移行为启用前必须确认并同步 Spec。不得默默加自动猜测兼容。 |
+| D02 Consumer 默认策略 | 草案建议 none，fixed-start 显式选用。 | S09 暂按草案设计验证；S10 对外接线前确认默认值。固定保护的永不前移规则不因默认选择而改变。 |
+| E01 真实 Engine 版本与初始化/Heartbeat 契约 | 本地源码只读证据，部署组合未验证。 | S01 尽早取证，S10 前确认正常路径会初始化新版 offset；S15 证明顺序与持久化故障恢复。缺环境时如实记录阻塞，不能用 fake consumer 代替。 |
+| 用户是否授权编码 | 当前仅授权 worktree、Spec/Plan 与本地提交。 | 本轮完成文档后停止。后续开始实施需用户明确指示；不因计划已提交自行开展 Java 改造。 |
 
-**本轮证据**：当前源码、真实测试类和 B01–B22 映射见 Spec §14，生产 DDL 的三项回归及新增 PS16–PS18 见 §15。完整构建结果记录在 todo；636 项与 56 项仅为历史基线。
+技术事实通过源码和测试解决；产品取舍不确定时按 interview-me 提出带建议的单一问题。已经授权的常规实现和提交不重复请求许可。检查点用于自查与证据核对，不给每个任务额外增加人为批准步骤。
 
-下列 `F` 为任务定向验证模板，从仓库根目录执行；将 TEST_CLASSES 替换为任务列出的测试类，不把模板字样传入 Maven：
+## 4. 验证命令与证据
+
+所有命令从新 worktree 根目录执行，先将 JAVA_HOME 指向本机实际可用 JDK 17 并记录 `java -version`。以下 B/F/G 是验证模板名称，不是仓库已有脚本；F 的 TEST_CLASSES 必须替换成 todo 中该任务的实际测试类名。
+
+B（编译，不触发 package）：
 
 ```bash
-env JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home \
-  mvn -o -B -pl connectors/paimon-plus-connector -am -DskipTests=false \
-  -Dtest=TEST_CLASSES -Dsurefire.failIfNoSpecifiedTests=false test
+mvn -pl connectors/paimon-plus-connector \
+  -Dmaven.gitcommitid.skip=true \
+  -Dtapdata.pdk.runner.version=2.8-SNAPSHOT \
+  -Dpdk-error-code.version=2.8-SNAPSHOT \
+  -DskipTests test-compile
 ```
 
-`failIfNoSpecifiedTests=false` 只用于不包含所选测试的上游 reactor 模块；必须核查 paimon-plus-connector surefire XML 确有列出的类、tests>0、无意外 skipped。编译成功但没有运行用例不算通过。依赖离线不足时先报告具体缺失，不能将跳过测试当作成功。
-
-最终 `G`：
+F（定向）：
 
 ```bash
-env JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home \
-  mvn -o -B -pl connectors/paimon-plus-connector -am -DskipTests=false clean package
-git diff --check
+mvn -pl connectors/paimon-plus-connector \
+  -Dmaven.gitcommitid.skip=true \
+  -Dtapdata.pdk.runner.version=2.8-SNAPSHOT \
+  -Dpdk-error-code.version=2.8-SNAPSHOT \
+  -Dtest=TEST_CLASSES test
 ```
 
-- 每项先加能捕捉缺口的断言，再实现；高风险并发用 latch/barrier 控制，所有 finally 放行任务并确认终止，避免测试自己泄漏。
-- 已有错误分类、精确 pending、owner/marker、KEY_DYNAMIC 限定目录、全局/表级 stale 根测试继续通过；不能批量删除旧断言来迎合新实现。
-- 每 2–3 项检查点核对接受标准、编译和相关回归；失败就回到对应小任务修复。全量通过后只因新改动或未解决风险重复运行。
-- S3/MinIO 实机验收若缺少环境，标记未完成；本地 FileIO 用例不冒充对象存储故障语义通过。跨机器 fencing 不在验收承诺内。
+G（本模块完整回归）：
 
-## 6. 风险与收敛措施
+```bash
+mvn -pl connectors/paimon-plus-connector \
+  -Dmaven.gitcommitid.skip=true \
+  -Dtapdata.pdk.runner.version=2.8-SNAPSHOT \
+  -Dpdk-error-code.version=2.8-SNAPSHOT test
+```
 
-| 风险 | 严重度 | 明确措施 |
-| --- | --- | --- |
-| 取消伪完成后内联 close | 高 | 私有 ExecutionException 展开，B06/B19 原生验证 |
-| 原因不明的中断被白名单洗掉 | 高 | 精确 Future/attempt/实际取消结果，Error/独立IO/外部cancel仍失败 |
-| commit RPC 已开始但超时 | 高 | 不打断整个 close worker；保留未知结果，禁止后续确认重试/offset |
-| 构造失败局部资源不在 Context map | 高 | 分配前占位、逐项绑定，rollback 也通过门禁 |
-| reader.close 仅告警后释放 Catalog | 高 | 关闭证明与 ingress 分离；关闭失败强引用并保留共享资源 |
-| 日志后端永久阻塞 | 中 | 有界非阻塞交付，countDown 先于日志；无真实输出时保留终态快照 |
-| 修改大 Service 造成重复状态 | 中 | 提取控制器替换 CloseOperation；资源账本和日志各只一个职责 |
-| 失败资源占用内存/磁盘 | 中 | 保留必要资源并可诊断；不自动放行同代 owner，不以不安全清理缓解 |
-| 重启恢复被理解成精确 envelope 重放 | 高 | 文档/测试明确仅 stable user 与 snapshot 对账；不升级 exactly-once 承诺 |
+- 上述 runner/error-code 参数沿用 Spec 的本地验证模板，不代表允许升级 pom 或改变生产依赖。S01 核实实际解析结果，不可用 fallback 参数掩盖依赖差异。
+- 未运行 Maven；本轮不沿用历史 688 项等成绩。S01 重测同环境基线，记录失败方法、环境、版本及报告；后续比较新增失败，基线失败也必须明确列出。
+- 新实表测试采用 `*IntegrationTest`，确认 Surefire XML 中实际类名、tests > 0 和 skipped；不加忽略测试开关来制造通过。并发故障用 latch/barrier、可控时钟，断言事件/位点顺序，避免仅统计行数。
+- catalog、测试临时文件、子进程日志均放模块 target 内；需要改变临时目录默认行为时只改模块测试配置。提交精简且脱敏的证据到模块 docs/validation，构建产物不提交。
+- 不运行 package，当前复制目标会写模块外 connectors/dist。若 Engine 实验必须新 JAR，先在模块 pom 单独增加显式启用、仅输出本模块 target 的打包配置，并单独验证/提交；不得假设外部目录产物符合范围。
+- F 已完成编译时无需为了形式紧接着重复 B。每项执行相关 F，检查点运行相关回归，S01/S16 运行 G；没有新变化或风险不重复全量。
+- Engine 黑盒场景记录真实 source/target 版本、事件序列、持久化 offset 与重启结果；禁止读取未授权真实业务数据，使用现有授权测试环境。环境不可用就标未验证，不修改 Engine 来绕过。
 
-## 7. 实施前与交付条件
+## 5. 每项提交与注释规范
 
-- 用户已明确授权按 Spec/Plan 开发；默认预算已参数化实现。
-- 测试按实际职责合并，原计划类名不是执行证据；最终对应关系以 todo 和 Spec §14 为准。
-- 完成 T18 才能报告“实现修复完成”。若真实对象存储或进程验证未执行，要清楚列出未验证边界。
-- 本轮不提交、不 rebase、不 push；后续提交遵从用户指令并精确暂存，不包含已经 staged 的 StreamRead Spec。
+每个实现单元依次完成实现、定向验证、审查、本地提交，然后更新 todo 的证据和 SHA。不得把计划勾选当作测试证据；失败单元不标完成。任务记录与相应实现同一提交即可，记录自身 SHA 可放下一次记录或最终账本，不为自引用反复 amend。
 
-## 审查修正补充（2026-09-07）
+- 提交只精确选择本模块该任务路径；核对 `git diff --check`、`git diff --cached --check` 和 staged diff，确保没有凭据、构建产物或无关暂存内容。
+- 语义适配处写明来源项目、固定 commit/artifact、完整源码路径、类/方法/行号，以及为何适配。至少涵盖位点、时间、历史、schema、Consumer、Heartbeat 和取消准入。
+- 按职责使用 fix/refactor/test/docs 类型，提交说明记录变更原因、源码基线和验证命令。默认只提交 `codex/paimon-stream-read` 本地分支，不 push、不 merge。
+- 原工作区 `hotfix-spill` 的暂存旧稿及未跟踪文档保持不动；新 worktree 只从 HEAD 和本次明确复制的两份 Spec 文档建立。
 
-已完成：逐行重复 gate 移除、worker 中断恢复、suppressed identity 去重、canonical 清理根、裸 rocksdb 负例与缩进统一；同时完成 INFO 契约、专用超时原因、有限读双重异常修正。实际方案、源码证据和测试映射统一见 [Spec §16](../src/doc/specs/SPEC-paimon-spill-sync-graceful-stop.md#16-审查缺口修复2026-09-07)。
+## 6. 风险与收敛
 
-最新完整验证替代上文旧轮次成绩：2026-09-07 16:34:37 +08:00，clean package，5 个 reactor 项目成功，模块 62 类 / 688 项，0 失败、0 错误、0 跳过；日志 `/tmp/paimon-review-fixes-full.log`。本地未提交/推送；预先暂存的 StreamRead Spec 保持不变。
+| 风险 | 影响 | 缓解与验收 |
+|---|---|---|
+| 新旧 offset 混用或入口分批切换 | 跳读/启动失败 | D01 + S10 原子接线；v1 直接 restore(next)，禁止 +1。 |
+| Engine 吞异常或 Heartbeat 超过未完成数据 | 错误候选被保存 | S01 前置契约验证、S15 真目标故障矩阵；限定支持组合。 |
+| plan() 长调用或 I/O 无法中断 | 多表延迟、停止无法释放 | S07/S08 注入阻塞、报告失败并保留资源；不承诺严格时限。 |
+| 半 plan、队列背压与取消交错 | 候选 offset 越界 | S05/S06/S08 完整标记和准入门，取消无标记。 |
+| timestamp 历史多、提交时钟回拨 | 初始化慢、错误边界 | S03 倒序元数据查询、冻结上界和取消；测耗时，不假定单调时间。 |
+| schema 演进发生在读取中 | 字段遗漏/错配 | S04/S14 结构绑定和新 plan 检查，历史投影独立验证。 |
+| Consumer 清理无 CAS、文件曾被删除 | 历史保护空窗 | S11–S13 独立 writer、注册/续租交错和缺文件测试；不声称事务租约。 |
+| fixed-start 周期无限增长 | 保留成本高 | 记录 start/next/租约年龄，不自动前移或删文件；D02 明确默认。 |
+| 停止改造牵连写链路 | 既有 Spill/提交回归 | S08/S16 复用已有资源/控制器并回归有限读、写提交与停止。 |
+
+## 7. 完成定义
+
+S01–S16 和检查点都有实际证据，D01/D02 已确认；新测试通过，既有失败有同环境比较及处理结论，未验证的 Engine/存储组合明确列出。每项实现含源码注释且有本地 commit，工作树无遗留未提交实现，所有变更在模块内。本轮交付只完成 Spec/Plan 的版本化，不勾选任何实施任务。
