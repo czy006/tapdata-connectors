@@ -174,6 +174,7 @@ public class PaimonService implements AutoCloseable {
     private volatile PaimonStopController closeOperation;
     private final PaimonStopController stopController;
     private final PaimonStopResources stopResources = new PaimonStopResources();
+    private final AtomicReference<io.tapdata.connector.paimon.read.PaimonStreamReadSession> sourceSession = new AtomicReference<>();
     private PaimonStopResources.Scope catalogScope;
     private final Object callbackExecutionLock = new Object();
     private final Object bindLock = new Object();
@@ -3372,6 +3373,8 @@ public class PaimonService implements AutoCloseable {
             PaimonStopController operation = stopController;
             if (operation.isFinished()) { closeOperation = operation; return operation; }
             operation.start();
+            io.tapdata.connector.paimon.read.PaimonStreamReadSession activeSource = sourceSession.get();
+            if (activeSource != null) { activeSource.cancel(); }
             Thread worker = new Thread(CLOSE_WORKER_THREAD_GROUP, () -> performClose(operation),
                     "paimon-service-close-" + serviceWriterOwner.substring(0, 8));
             worker.setDaemon(true);
@@ -3658,6 +3661,36 @@ public class PaimonService implements AutoCloseable {
         if (stopController.isStarted()) { throw new IllegalStateException("Paimon service is stopping: " + action); }
         stopController.checkAction(action);
         return lifecycle.enter(action);
+    }
+
+    /** Source ownership uses the same ledger and stop barrier as finite reads and writers. */
+    void executeStreamSession(io.tapdata.connector.paimon.read.PaimonStreamReadSession session,
+            PaimonStopController.CheckedRunnable body) throws Exception {
+        try (PaimonServiceLifecycle.Ingress ignored = enterIngress("streamRead")) {
+            PaimonStopResources.Slot registration;
+            synchronized (closeCoordinationLock) {
+                if (stopController.isStarted() || !sourceSession.compareAndSet(null, session)) {
+                    throw new IllegalStateException("Paimon source is stopping or another stream invocation is active");
+                }
+                registration = stopResources.reserve("stream source session");
+                registration.bind(session);
+            }
+            Throwable failure = null;
+            try { body.run(); }
+            catch (Throwable error) { failure = error; }
+            finally {
+                session.cancel();
+                if (session.resourcesTerminated()) {
+                    registration.released();
+                    sourceSession.compareAndSet(session, null);
+                } else {
+                    Throwable unclosed = new IllegalStateException("Paimon source termination not proved; shared resources retained");
+                    failure = appendFailure(failure, unclosed);
+                    stopController.retain(failure, this);
+                }
+            }
+            if (failure != null) { rethrow(failure); }
+        }
     }
 
     private RecordReader<InternalRow> createFiniteReader(

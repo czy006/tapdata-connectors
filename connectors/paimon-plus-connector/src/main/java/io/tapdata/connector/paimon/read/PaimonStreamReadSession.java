@@ -25,6 +25,7 @@ public final class PaimonStreamReadSession {
     private volatile long cancelledAt;
     private int inFlight;
     private volatile PaimonStreamReadCoordinator coordinator;
+    private volatile boolean resourcesTerminated = true;
     private PaimonReadOffset submitted;
     private List<TapEvent> batch = new ArrayList<>();
     private long firstEventAt;
@@ -47,6 +48,7 @@ public final class PaimonStreamReadSession {
         }
     }
     public long cancelledAtNanos() { return cancelledAt; }
+    public boolean resourcesTerminated() { return resourcesTerminated && inFlight() == 0; }
     public Throwable failure() { return failure.get(); }
     public void fail(Throwable cause) {
         Throwable first = failure.get();
@@ -86,6 +88,7 @@ public final class PaimonStreamReadSession {
         if (stopTimeoutMillis <= 0) { throw new IllegalArgumentException("Positive stop timeout required"); }
         coordinator = new PaimonStreamReadCoordinator(sources, this, Math.multiplyExact(batchSize, 10),
                 workerCount, pollMillis, threadContext);
+        resourcesTerminated = false;
         boolean interrupted = false;
         try {
             coordinator.start();
@@ -106,6 +109,7 @@ public final class PaimonStreamReadSession {
             try {
                 coordinator.close(deadline);
                 if (inFlight() != 0) { throw new IllegalStateException("Paimon source has active admissions after worker termination"); }
+                resourcesTerminated = true;
             } catch (InterruptedException interruption) { interrupted = true; fail(interruption); }
             catch (Throwable closeFailure) { fail(closeFailure); }
             batch = new ArrayList<>();
