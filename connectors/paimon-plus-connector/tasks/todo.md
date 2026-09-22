@@ -468,3 +468,14 @@
 | D01 旧位点迁移 | 已明确方向 | 用户要求按 Spec 全新实现、不保留旧实现；拒绝歧义旧格式。 |
 | D02 Consumer 默认值 | 按 Spec 实施 | none 默认；fixed-start 显式开启。 |
 | E01 平台适配 | 未验证 | S01/S15 记录实际 Engine/PDK/目标组合。 |
+
+## R01：MySQL 类型与性能复审（2026-09-22）
+
+- [x] 沿 Paimon 1.3 → PDK → MySQL codec/JDBC recorder 核实类型，不将直接 Java 值测试当作下游兼容性结论。
+- [x] 修复原生复杂类型访问器、参数化类型映射、嵌套 JSON 重复编码、无时区时间墙钟漂移；补标量、二进制、空值、复杂结构与 JVM 时区测试。
+- [x] 完整回归 806 项通过；后续新增边界断言采用定向回归，分别保留报告。
+- [x] 保存可重复的解码/真实本地读取 benchmark 与原始数据，记录窄行 CPU 回退及 JSON 往返成本。
+- [ ] MySQL 纳秒时间、scale > 30 Decimal、超范围日期的处理策略尚待用户明确。
+- [ ] S15 增补真实 Engine→MySQL 的 LTZ/session 时区、复杂数组 null、字符集、DDL 和容量验收。
+
+证据：[MySQL 类型与性能审查](../docs/validation/stream-read-mysql-type-review.md)。本轮功能修复与性能证据分别提交到现有分支；不推送。

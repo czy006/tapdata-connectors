@@ -530,3 +530,9 @@ Engine 本地源码路径供复核，均仅作为只读参考：
 - [T4 Engine 初始位点](/Users/SL/javaProject/tapdata/iengine/iengine-app/src/main/java/io/tapdata/flow/engine/V2/node/hazelcast/data/pdk/HazelcastSourcePdkBaseNode.java:744)：初始化与 timestampToStreamOffset。
 
 实施结果与范围核对见 [本地交付记录](../validation/stream-read-delivery.md)；Engine 源码与原工作区暂存设计稿未修改。
+
+## 附录：MySQL 类型审查补充（2026-09-22）
+
+源读取统一使用 schema 绑定的原生行解码器；批量/流式复杂列以标准 JSON 载体穿过既有 PDK 转换机制，最终恢复声明的 TapMap/TapArray，避免嵌套对象被重复编码。只读查询返回独立 Java Map/List。字符串 Map 键、嵌套时间 ISO 文本和 binary Base64 的表示、拒绝条件、MySQL 时间范围/精度限制、测试与性能开销见 [审查报告](../validation/stream-read-mysql-type-review.md)。
+
+源端准确声明 Paimon 的时间范围和 0–9 位时间戳精度，不等于 MySQL 可无损存储。纳秒、Decimal scale > 30、超范围日期的拒绝/降精度/字符串策略尚未确定；真实 LTZ/session 时区与完整 Engine 传输仍属 S15。上述补充不改变位点推进、Consumer、恢复、取消和停止契约。
