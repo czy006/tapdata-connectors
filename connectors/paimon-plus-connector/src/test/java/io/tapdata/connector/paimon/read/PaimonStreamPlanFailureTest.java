@@ -69,6 +69,30 @@ class PaimonStreamPlanFailureTest {
         }));
         assertEquals(1, items.size()); assertFalse(items.get(0).isFinished());
     }
+    @Test void deliveryFailurePreservesCleanupOrderAndBothSuppressedFailures() throws Exception {
+        RecordReader<InternalRow> reader = setup();
+        @SuppressWarnings("unchecked")
+        RecordReader.RecordIterator<InternalRow> batch = mock(RecordReader.RecordIterator.class);
+        when(reader.readBatch()).thenReturn(batch, null);
+        when(batch.next()).thenReturn(GenericRow.of(1), null);
+        IOException deliveryFailure = new IOException("delivery failed");
+        RuntimeException releaseFailure = new IllegalStateException("release failed");
+        IOException closeFailure = new IOException("close failed");
+        doThrow(releaseFailure).when(batch).releaseBatch();
+        doThrow(closeFailure).when(reader).close();
+
+        assertSame(deliveryFailure, assertThrows(IOException.class,
+                () -> PaimonStreamReadCoordinator.readPlan(source, () -> true, item -> {
+                    assertFalse(item.isFinished());
+                    throw deliveryFailure;
+                })));
+
+        assertArrayEquals(new Throwable[]{releaseFailure, closeFailure}, deliveryFailure.getSuppressed());
+        org.mockito.InOrder cleanup = inOrder(batch, reader);
+        cleanup.verify(batch).releaseBatch();
+        cleanup.verify(reader).close();
+        verify(source, never()).validatePosition(6L);
+    }
     @Test void noProgressHasNoMarkerButSkippedSnapshotsHaveOne() throws Exception {
         when(source.name()).thenReturn("orders");
         TableScan.Plan plan = mock(TableScan.Plan.class); when(plan.splits()).thenReturn(Collections.emptyList()); when(source.plan()).thenReturn(plan);

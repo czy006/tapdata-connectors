@@ -174,28 +174,7 @@ public final class PaimonStreamReadCoordinator {
         checkActive(active);
         source.beforeRead(plan);
         for (Split split : plan.splits()) {
-            checkActive(active);
-            try (RecordReader<InternalRow> reader = source.reader(split)) {
-                while (true) {
-                    checkActive(active);
-                    RecordReader.RecordIterator<InternalRow> iterator = reader.readBatch();
-                    if (iterator == null) { break; }
-                    // RecordReader.RecordIterator.releaseBatch contract. TWR preserves the first
-                    // read/convert error when batch release or reader close also throws.
-                    // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-common/src/main/java/org/apache/paimon/reader/RecordReader.java#L59
-                    try (Batch batch = new Batch(iterator)) {
-                        while (true) {
-                            checkActive(active);
-                            InternalRow row = batch.iterator.next();
-                            if (row == null) { break; }
-                            TapEvent event = source.convert(row);
-                            checkActive(active);
-                            if (event == null) { throw new IllegalStateException("Paimon row conversion returned null"); }
-                            sink.put(Item.event(source.name(), event));
-                        }
-                    }
-                }
-            }
+            readSplit(source, split, active, sink);
         }
         checkActive(active);
         // Also detect a gap reached after native plan skipped several empty snapshots.
@@ -203,6 +182,38 @@ public final class PaimonStreamReadCoordinator {
         checkActive(active);
         if (after > before) { sink.put(Item.finished(source.name(), before, after)); return true; }
         return false; // Scheduler must release this task through PlanNoProgress, not a fake marker.
+    }
+
+    private static void readSplit(Source source, Split split, BooleanSupplier active, Sink sink) throws Exception {
+        checkActive(active);
+        try (RecordReader<InternalRow> reader = source.reader(split)) {
+            while (true) {
+                checkActive(active);
+                RecordReader.RecordIterator<InternalRow> iterator = reader.readBatch();
+                if (iterator == null) { return; }
+                // Paimon release-1.3 @ 5c59e6cb01ed0b29563371f56e14fcade4597a2e:
+                // RecordReader#forEachRemaining releases a batch only after its row loop succeeds.
+                // Keep TWR here so read/convert/delivery failure still releases the batch before
+                // closing its reader, preserving the original error and suppressed cleanup errors.
+                // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-common/src/main/java/org/apache/paimon/reader/RecordReader.java#L129
+                try (Batch batch = new Batch(iterator)) {
+                    deliverBatch(source, batch.iterator, active, sink);
+                }
+            }
+        }
+    }
+
+    private static void deliverBatch(Source source, RecordReader.RecordIterator<InternalRow> iterator,
+            BooleanSupplier active, Sink sink) throws Exception {
+        while (true) {
+            checkActive(active);
+            InternalRow row = iterator.next();
+            if (row == null) { return; }
+            TapEvent event = source.convert(row);
+            checkActive(active);
+            if (event == null) { throw new IllegalStateException("Paimon row conversion returned null"); }
+            sink.put(Item.event(source.name(), event));
+        }
     }
 
     static void checkActive(BooleanSupplier active) {
