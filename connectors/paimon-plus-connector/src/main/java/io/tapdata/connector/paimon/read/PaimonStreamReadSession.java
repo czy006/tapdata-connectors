@@ -24,6 +24,8 @@ public final class PaimonStreamReadSession {
     private volatile boolean cancelled;
     private volatile long cancelledAt;
     private int inFlight;
+    // Keep coordinator/source ownership attached to the retained session if run() times out
+    // before worker termination. See PaimonService#executeStreamSession's unreleased ledger slot.
     private volatile PaimonStreamReadCoordinator coordinator;
     private volatile boolean resourcesTerminated = true;
     private PaimonReadOffset submitted;
