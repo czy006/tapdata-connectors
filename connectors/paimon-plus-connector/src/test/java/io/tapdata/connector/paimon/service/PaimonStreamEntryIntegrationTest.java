@@ -91,8 +91,8 @@ class PaimonStreamEntryIntegrationTest {
             assertEquals(1,f.table.consumerManager().consumer(ids.get(0)).get().nextSnapshot());
             f.write(10);
             // Initialization returned and no stream invocation is running; the lease is still owned by Service.
-            java.lang.reflect.Field field=PaimonService.class.getDeclaredField("sourceProtection");field.setAccessible(true);
-            Object protection=field.get(f.service);assertNotNull(protection);
+            java.lang.reflect.Field field=PaimonStreamReadService.class.getDeclaredField("sourceProtection");field.setAccessible(true);
+            Object protection=field.get(PaimonStreamStopTest.streamService(f.service));assertNotNull(protection);
             AtomicBoolean running=new AtomicBoolean(true);AtomicInteger rows=new AtomicInteger();
             StreamReadConsumer consumer=StreamReadConsumer.create((events,state)->{
                 rows.addAndGet((int)events.stream().filter(e->e instanceof TapInsertRecordEvent).count());
@@ -100,11 +100,44 @@ class PaimonStreamEntryIntegrationTest {
                 if(PaimonReadOffset.parse(state).position("orders").nextSnapshot==2)running.set(false);
             });
             f.service.streamRead(Collections.singletonList("orders"),offset,100,consumer,f.context,running::get);
-            assertEquals(1,rows.get());assertNull(field.get(f.service));
+            assertEquals(1,rows.get());assertNull(field.get(PaimonStreamStopTest.streamService(f.service)));
             assertEquals(1,f.table.consumerManager().consumer(ids.get(0)).get().nextSnapshot());
         } finally {f.close();}
         // Closing the Service stops renewal but never deletes the Consumer file.
         assertEquals(ids,f.table.consumerManager().listAllIds());
+    }
+    @Test void serviceCloseCancelsDelegatedStreamWhileCallerStillWantsToRun() throws Exception {
+        try (Fixture f = new Fixture(true)) {
+            Object offset = f.offset();
+            f.write(12);
+            List<String> consumerIds = f.table.consumerManager().listAllIds();
+            AtomicBoolean running = new AtomicBoolean(true);
+            CountDownLatch delivered = new CountDownLatch(1);
+            StreamReadConsumer consumer = StreamReadConsumer.create((events, state) -> {
+                if (events.stream().anyMatch(e -> e instanceof TapInsertRecordEvent)) {
+                    delivered.countDown();
+                }
+            });
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                Future<?> read = executor.submit(() -> {
+                    f.service.streamRead(Collections.singletonList("orders"), offset, 1,
+                            consumer, f.context, running::get);
+                    return null;
+                });
+                assertTrue(delivered.await(10, TimeUnit.SECONDS));
+                f.service.close();
+                read.get(5, TimeUnit.SECONDS);
+                assertTrue(running.get());
+                assertEquals(StreamReadConsumer.STATE_STREAM_READ_ENDED, consumer.getState());
+                assertEquals(consumerIds, f.table.consumerManager().listAllIds());
+                assertThrows(IllegalStateException.class, f::offset);
+            } finally {
+                running.set(false);
+                executor.shutdownNow();
+                assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            }
+        }
     }
     @Test void independentWriterCannotExpireFixedStartUntilStoppedLeaseExpires() throws Exception {
         try(Fixture f=new Fixture(true)) {
@@ -139,11 +172,20 @@ class PaimonStreamEntryIntegrationTest {
     @Test void failedProtectionBlocksSubsequentSourceOperationsDuringFullPhase() throws Exception {
         try(Fixture f=new Fixture(true)) {
             f.offset();
-            java.lang.reflect.Field field=PaimonService.class.getDeclaredField("sourceProtectionFailure");field.setAccessible(true);
+            java.lang.reflect.Field field=PaimonStreamReadService.class.getDeclaredField("sourceProtectionFailure");field.setAccessible(true);
             RuntimeException failure=new RuntimeException("lease lost during full read");
-            ((AtomicReference<Throwable>)field.get(f.service)).set(failure);
+            ((AtomicReference<Throwable>)field.get(PaimonStreamStopTest.streamService(f.service))).set(failure);
             IllegalStateException actual=assertThrows(IllegalStateException.class,()->f.offset());
             assertSame(failure,actual.getCause());
+            // Full reads and queries must still use the same failure gate after protection moves to the read service.
+            TapTable tap = f.context.getTableMap().get("orders");
+            assertSame(failure, assertThrows(IllegalStateException.class,
+                    () -> f.service.batchCount(tap, mock(Log.class))).getCause());
+            assertSame(failure, assertThrows(IllegalStateException.class,
+                    () -> f.service.batchRead(tap, null, 1, (events, state) -> fail("unexpected delivery"),
+                            f.context)).getCause());
+            assertSame(failure, assertThrows(IllegalStateException.class,
+                    () -> f.service.executeQuery("select * from orders", mock(Log.class))).getCause());
         }
     }
     @Test void badInputsAndCallbackFailureDoNotAdvanceOrSkip() throws Exception {

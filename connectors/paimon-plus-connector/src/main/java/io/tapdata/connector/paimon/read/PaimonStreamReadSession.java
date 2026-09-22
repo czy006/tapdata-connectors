@@ -13,10 +13,10 @@ import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 
 /**
- * 一次同步 streamRead 调用的取消门禁和单线程交付器。
- * 原生 checkpoint/restore 都使用下一待消费 snapshot；此处将整 plan 交付完毕作为可提交边界。
- * submitted 仅表示源回调已返回，不能代替 Engine 保存的恢复 offset，也不是下游 durable ack。
- * @see <a href="https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L307">Paimon checkpoint/restore 的 nextSnapshotId 契约</a>
+ * Cancellation admission and single-threaded delivery for one synchronous streamRead invocation.
+ * Native checkpoint/restore use the next snapshot; only a fully delivered plan becomes a publishable boundary here.
+ * submitted records callback return, not the Engine-persisted recovery offset or a durable target acknowledgement.
+ * @see <a href="https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L307">Paimon checkpoint/restore nextSnapshotId contract</a>
  */
 public final class PaimonStreamReadSession {
     private final Object gate = new Object();
@@ -30,7 +30,7 @@ public final class PaimonStreamReadSession {
     private volatile long cancelledAt;
     private int inFlight;
     // Keep coordinator/source ownership attached to the retained session if run() times out
-    // before worker termination. See PaimonService#executeStreamSession's unreleased ledger slot.
+    // before worker termination. See PaimonStreamReadService#executeSession's unreleased ledger slot.
     private volatile PaimonStreamReadCoordinator coordinator;
     private volatile boolean resourcesTerminated = true;
     private PaimonReadOffset submitted;
@@ -133,7 +133,7 @@ public final class PaimonStreamReadSession {
         checkActive();
         PaimonReadOffset.Position previous = submitted.position(item.table);
         if (item.isFinished()) {
-            // 完成标记只推进对应表；跨表共享批内其他表的事件仍携带各自旧边界，失败后允许重放。
+            // Advance only this table; other tables in the shared batch retain their prior boundaries and may replay on failure.
             if (item.before != previous.nextSnapshot || item.after <= item.before) {
                 throw new IllegalStateException("Out-of-order Paimon plan completion: " + item.table);
             }
@@ -142,7 +142,7 @@ public final class PaimonStreamReadSession {
         }
         if (batch.isEmpty()) { firstEventAt = clock.getAsLong(); }
         batch.add(item.event);
-        // 行数/时间触发的批次可能只覆盖半个 plan，仍提交旧位点，避免恢复时跳过未交付部分。
+        // Size/time flushes can cover only part of a plan; retain the old offset to avoid skipping undelivered rows on recovery.
         if (batch.size() >= batchSize) { submit(null); }
         return false;
     }
@@ -161,15 +161,15 @@ public final class PaimonStreamReadSession {
         if (batch.isEmpty() && candidate == null) { return; }
         List<TapEvent> events = batch;
         if (events.isEmpty()) {
-            // 整批刚好写满，或 plan 只有位点进展时，用 Engine 已支持的控制事件携带新 offset。
-            // 空 List 会被 Engine 忽略；心跳承载恢复边界，不新增任何业务行。
+            // If the last batch was exactly full or the plan only advanced progress, use an existing control event for the new offset.
+            // Engine ignores an empty list; the heartbeat carries a recovery boundary without adding a business row.
             events = new ArrayList<>();
             events.add(new HeartbeatEvent().init().referenceTime(System.currentTimeMillis()));
         }
         PaimonReadOffset offset = candidate == null ? submitted : candidate;
         try (Admission ignored = admit()) {
             consumer.accept(events, offset.toMap());
-            // 回调失败或返回后会话已取消，都不安装 candidate；只把完整交付边界留给 Engine 持久化。
+            // Do not install a candidate after callback failure or cancellation; Engine persists only the submitted plan boundary.
             checkActive();
             submitted = offset;
             batch = new ArrayList<>();

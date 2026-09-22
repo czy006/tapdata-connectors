@@ -6,17 +6,17 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.*;
 
 /**
- * 连接器自建的 Consumer 续租与超时门禁，不是 Paimon 提供的原子租约。
- * 原生 ConsumerManager#expire 按文件 mtime 判过期；存储 I/O 可能阻塞，所以 watchdog 独立且不做 I/O。
- * 超时只禁止本 attempt 继续交付，不能证明底层 I/O 已取消；关闭时仍须等待工作线程终止。
- * @see <a href="https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/consumer/ConsumerManager.java#L95">Paimon Consumer 过期实现</a>
+ * Connector-managed Consumer renewal and timeout fencing, not an atomic lease supplied by Paimon.
+ * Native ConsumerManager#expire uses file mtime; storage I/O may block, so the independent watchdog performs no I/O.
+ * A timeout fences delivery but does not prove I/O cancellation; shutdown must still await worker termination.
+ * @see <a href="https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/consumer/ConsumerManager.java#L95">Native Paimon Consumer expiration</a>
  */
 public final class PaimonConsumerLease {
     interface Target {
         long readTtlNanos() throws Exception;
         void writeAndVerify() throws Exception;
     }
-    // 60 秒续租、120 秒余量都是本地策略；与注册阶段要求的至少 10 分钟 TTL 配套使用。
+    // The 60-second renewal interval and 120-second margin are local policy, paired with a minimum 10-minute TTL.
     private static final long HEARTBEAT = TimeUnit.SECONDS.toNanos(60);
     private static final long MARGIN = 2 * HEARTBEAT;
     private final Object gate = new Object();
@@ -94,7 +94,7 @@ public final class PaimonConsumerLease {
             synchronized(gate) {
                 if(cancelled)return;
                 for(State state:states) {
-                    // 每个 Consumer 最多一个续租任务；提交与关闭共用 gate，避免停机后再派发。
+                    // Allow one pending renewal per Consumer; share the gate with close to prevent dispatch after cancellation.
                     if(!state.pending && clock.getAsLong()-state.ready>=0) {
                         state.pending=true;
                         io.execute(()->renew(state));
@@ -147,7 +147,7 @@ public final class PaimonConsumerLease {
         }
     }
     public Throwable failure() { return failure.get(); }
-    // shutdownNow 只发中断；只有 awaitTermination 成功后才能释放依赖的 Catalog/FileIO。
+    // shutdownNow only requests interruption; awaitTermination must succeed before dependent Catalog/FileIO release.
     public void close(long deadlineNanos) throws InterruptedException, TimeoutException {
         synchronized(gate) {cancelled=true;gate.notifyAll();watchdog.shutdownNow();io.shutdownNow();}
         long remaining=Math.max(0,deadlineNanos-System.nanoTime());

@@ -10,8 +10,8 @@ import org.apache.paimon.utils.SnapshotManager;
 import java.util.function.BooleanSupplier;
 
 /**
- * 只解析元数据，不读取业务行：将统一时间边界转为 next-to-consume，并验证恢复历史。
- * 内核决定 snapshot/changelog 的读取语义；有限重试、缺口报错和不自动跳到 latest 是连接器策略。
+ * Resolves a shared time boundary into next-to-consume positions and validates history using metadata only.
+ * Paimon defines snapshot/changelog semantics; bounded retries, gap rejection and no latest fallback are connector policy.
  */
 public final class PaimonReadPositionResolver {
     private final SnapshotManager snapshots;
@@ -55,10 +55,10 @@ public final class PaimonReadPositionResolver {
         return decoupled && changelogs.longLivedChangelogExists(id) ? changelogs.changelog(id) : null;
     }
 
-    // 内核参照：NextSnapshotFetcher#rangeCheck 允许等待尚未生成的下一快照；解耦场景不检查所有缺口。
+    // Native NextSnapshotFetcher#rangeCheck allows waiting for a future snapshot but misses some decoupled history gaps.
     // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/utils/NextSnapshotFetcher.java#L70
-    // 本连接器额外校验实际 id：只允许存在的历史、latest+1 或空表的 1；缺口不能无限等待。
-    // 三次重试属于本地策略。最后一次为存储错误时原样抛出，避免把权限/网络错误误判为历史过期。
+    // Validate the exact id: allow existing history, latest+1, or 1 for an empty table; never wait indefinitely at a gap.
+    // Three attempts are connector policy. Preserve the final storage error instead of misclassifying it as expired history.
     public void validate(long next) throws InterruptedException {
         RuntimeException cause = null;
         RuntimeException metadataFailure = null;
@@ -85,7 +85,7 @@ public final class PaimonReadPositionResolver {
     // TimeTravelUtil.earlierThanTimeMills uses strict <T. Neither implements our highest-id <=T.
     // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java#L287
     // Connector policy: freeze latest, descend metadata, tolerate non-monotonic writer clocks.
-    // 对照原生严格 <T 的二分查找；本方法保留 <=T 的最高 id，因此不直接复用该内核方法。
+    // Unlike the native strict-before binary search, this method selects the highest id at or before T.
     // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/snapshot/TimeTravelUtil.java#L160
     public long atTimestamp(long timestamp, long initializationTime) throws InterruptedException {
         if (timestamp < 0 || timestamp > initializationTime) {
@@ -109,8 +109,8 @@ public final class PaimonReadPositionResolver {
         throw outOfHistory(earliest, new IllegalStateException("Timestamp precedes available Paimon history"));
     }
 
-    // 与 validate 的“允许等待下一快照”不同，时间解析及 plan schema 校验必须拿到具体元数据。
-    // 不返回 null 给调用方继续推进；同时保留原始存储异常，历史缺失才转换为 out-of-log。
+    // Unlike validate, time resolution and plan schema checks require actual metadata, not a future snapshot position.
+    // Never return null to allow progress; preserve storage errors and use out-of-log only for missing history.
     public Snapshot requiredMetadata(long id) throws InterruptedException {
         RuntimeException cause = null;
         RuntimeException metadataFailure = null;

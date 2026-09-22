@@ -16,9 +16,9 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * 固定本次读取的字段结构与受检查的读取选项，阻止绑定旧模型的 reader 交付已识别的新结构。
- * schema id 变化本身不等于不兼容：注释可变；字段/nullable/主键等变化要求重新发现模型并重启。
- * 此 guard 是连接器约束，不提供与并发 DDL 的事务隔离，也不重新实现历史文件投影。
+ * Binds the initial fields and selected read options to prevent an old reader from delivering a detected new schema.
+ * A new schema id alone is compatible: comments may change, but field/nullability/key changes require rediscovery and restart.
+ * This connector guard provides neither transactional DDL isolation nor an alternative historical-file projection.
  */
 public final class PaimonReadSchemaGuard {
     private final FileStoreTable table;
@@ -58,9 +58,9 @@ public final class PaimonReadSchemaGuard {
             throw new IllegalStateException("Cannot verify schema of Paimon stream plan");
         }
         long schemaId = resolver.requiredMetadata(((SnapshotReader.Plan) plan).snapshotId()).schemaId();
-        // 新于绑定版本的 plan 需额外核验，防止 beforePlan 之后发生 ALTER。
-        // 较早文件由内核按 field id 映射，不因历史 schema id 不同就拒绝恢复。
-        // 参照 SchemaEvolutionUtil#createIndexMapping(tableFields, dataFields)，固定 release-1.3：
+        // Check plans newer than the bound schema to cover ALTER occurring after beforePlan.
+        // The native reader maps older files by field id; an older schema id alone must not prevent recovery.
+        // See SchemaEvolutionUtil#createIndexMapping(tableFields, dataFields) at the pinned release-1.3 revision:
         // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/schema/SchemaEvolutionUtil.java#L79
         if (schemaId > initial.id()) { check(table.schemaManager().schema(schemaId)); }
     }
@@ -75,8 +75,8 @@ public final class PaimonReadSchemaGuard {
         return type == null ? "" : type.replaceAll("\\s+", "").toUpperCase(Locale.ROOT);
     }
     private static List<Object> fingerprint(TableSchema schema) {
-        // 连接器选择的兼容性指纹：只覆盖下列结构/选项，不声称检测任意 options 变更。
-        // CoreOptions 推导出的 changelog 解耦状态也必须固定，否则历史可读性的判断会改变。
+        // This connector fingerprint covers only the listed structures/options, not every possible option change.
+        // Also bind the derived changelog decoupling flag, which affects whether historical positions remain readable.
         Map<String, String> readOptions = new TreeMap<>();
         schema.options().forEach((key, value) -> {
             if (key.startsWith("scan.") || key.startsWith("streaming-read") || key.startsWith("sequence.")

@@ -2,7 +2,7 @@
 
 本文说明当前连接器如何持续消费 Paimon 数据、转换类型、交付 TapData 下游，以及如何恢复和停止。下游以 MySQL 为例。
 
-实现基线：`codex/paimon-stream-read@f1f420cc`；Paimon 依赖 **1.3.2**，源码核对固定在 release-1.3 commit `5c59e6cb01ed0b29563371f56e14fcade4597a2e`；PDK API **2.0.8-SNAPSHOT**。本文描述已实现行为；真实 Engine→MySQL 故障恢复和生产容量仍需验收。源码入口与验证证据见文末。
+实现分支：`codex/paimon-stream-read`，2026-09-23 更新为独立的 `PaimonStreamReadService`；Paimon 依赖 **1.3.2**，源码核对固定在 release-1.3 commit `5c59e6cb01ed0b29563371f56e14fcade4597a2e`；PDK API **2.0.8-SNAPSHOT**。本文描述已实现行为；真实 Engine→MySQL 故障恢复和生产容量仍需验收。源码入口与验证证据见文末。
 
 ## 1. 总体架构与责任边界
 
@@ -37,6 +37,25 @@ flowchart LR
 - **MySQL 连接器**负责目标类型转换、SQL/JDBC 写入与写入结果。目标主键、写入策略、DDL 和时区会影响最终结果。
 
 `StreamReadConsumer` 是 TapData 交付回调；Paimon `Consumer` 是历史保留元数据。两者用途不同。
+
+### 1.1 连接器内部的 Service 分工
+
+`PaimonService` 保留对 Connector 的公开入口，委托 `read/PaimonStreamReadService` 完成流读。后者拥有活动会话、Consumer 保护及其失败状态，负责时间位点解析、表校验、scan/reader 绑定和 RowKind 转换。全量、查询、写入及 Catalog 的创建和关闭仍由原 Service 管理。
+
+```mermaid
+flowchart TD
+    A["PaimonConnector"] --> B["PaimonService：入口转发与共享生命周期"]
+    B --> C["PaimonStreamReadService：位点、scan、会话、Consumer"]
+    C --> D["Session / Coordinator / Decoder / Lease"]
+    C --> E["Runtime：入口准入、查表、受管 reader"]
+    E --> B
+    B --> F["共享停止锁 / StopController / 资源台账"]
+    C --> F
+```
+
+新类通过三个宿主接口取得准入许可、查询当前 Catalog、创建受资源台账管理的 reader，不保存独立的 Catalog，也不启动另一套停止控制器。会话登记与宿主停止共用原来的锁；关闭先取消活动会话，再等入口静默、关闭租约，最后由宿主释放共享资源。不能只移动读取方法却留下两套活动会话状态，或在新类自行关闭 Catalog。
+
+Consumer 保护失败仍会阻止全量/查询入口及其结果回调；这些路径通过 `PaimonService` 调用新类的保护检查。该抽取不改变 offset、回调、线程数量、队列容量或续租周期。
 
 ## 2. 从任务启动到持续读取
 
@@ -403,7 +422,8 @@ Service 关闭先取消活动源会话，再等待生命周期静默，之后才
 | 代码 | 主要职责 |
 |---|---|
 | [PaimonConnector](../src/main/java/io/tapdata/connector/paimon/PaimonConnector.java) | capability 注册、PDK 入口、codec 注册 |
-| [PaimonService](../src/main/java/io/tapdata/connector/paimon/service/PaimonService.java) | 表解析、初始化、scan 绑定、RowKind、全量与 Service 生命周期 |
+| [PaimonService](../src/main/java/io/tapdata/connector/paimon/service/PaimonService.java) | 流读入口转发、宿主能力适配、全量/查询/写入与共享生命周期 |
+| [PaimonStreamReadService](../src/main/java/io/tapdata/connector/paimon/read/PaimonStreamReadService.java) | 时间位点初始化、表解析、scan 绑定、RowKind、活动会话与 Consumer 保护 |
 | [PaimonReadPositionResolver](../src/main/java/io/tapdata/connector/paimon/read/PaimonReadPositionResolver.java) | 时间初始化、snapshot/changelog 与历史校验 |
 | [PaimonReadOffset](../src/main/java/io/tapdata/connector/paimon/read/PaimonReadOffset.java) | envelope 编解码、来源绑定、不可变位点更新 |
 | [PaimonStreamReadCoordinator](../src/main/java/io/tapdata/connector/paimon/read/PaimonStreamReadCoordinator.java) | 调度、readPlan/readSplit/deliverBatch、完成通知 |
@@ -422,7 +442,8 @@ Service 关闭先取消活动源会话，再等待生命周期静默，之后才
 | [Engine 契约核对](validation/stream-read-engine-contract.md) | 源回调、Heartbeat、位点持久化责任；源码核对，非运行验收 |
 | [本地实表矩阵](validation/stream-read-table-matrix.md) | producer、overwrite、空表、半 plan 重放、Consumer 和 schema |
 | [MySQL 类型审查](validation/stream-read-mysql-type-review.md) | PDK/目标 codec/JDBC recorder 合同；未连接实际 MySQL 数据库 |
-| [结构精简验证](validation/stream-read-simplification.md) | 最新代码完整回归 809 项通过；本地读取抽查与原始数据 |
+| [结构精简验证](validation/stream-read-simplification.md) | 前一轮完整回归 809 项通过；本地读取抽查与原始数据 |
+| [StreamRead Service 抽取验证](validation/stream-read-service-extraction.md) | 当前抽取后完整回归 810 项通过；宿主停止、故障门禁和资源所有权 |
 | [真实恢复验收矩阵](validation/stream-read-recovery-results.md) | 尚待执行的 Engine/目标崩溃恢复、Heartbeat 顺序和租约场景 |
 
-809 项是上一轮代码实现的验证结果。本次仅补充文档与入口说明，不将其计为新的单元测试运行。已有测试不证明生产 exactly-once、远端 I/O 可限时终止、所有源类型无损落库或 MySQL 吞吐达标。
+810 项是 2026-09-23 抽取 StreamRead Service 后的完整本地回归结果。已有测试不证明生产 exactly-once、远端 I/O 可限时终止、所有源类型无损落库或 MySQL 吞吐达标。

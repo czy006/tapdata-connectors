@@ -1,6 +1,7 @@
 package io.tapdata.connector.paimon.service;
 
-import io.tapdata.connector.paimon.read.*;
+import io.tapdata.connector.paimon.read.PaimonSourceRowDecoder;
+import io.tapdata.connector.paimon.read.PaimonStreamReadService;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
 
 import io.tapdata.connector.paimon.util.PaimonFailures;
@@ -47,7 +48,6 @@ import io.tapdata.pdk.apis.entity.WriteListResult;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.*;
 import org.apache.paimon.data.*;
 import org.apache.paimon.options.Options;
@@ -61,7 +61,6 @@ import org.apache.paimon.table.source.*;
 import org.apache.paimon.table.source.TableScan.Plan;
 import org.apache.paimon.types.*;
 import org.apache.paimon.utils.Pair;
-import org.apache.paimon.utils.SnapshotManager;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -168,30 +167,10 @@ public class PaimonService implements AutoCloseable {
     private volatile PaimonStopController closeOperation;
     private final PaimonStopController stopController;
     private final PaimonStopResources stopResources = new PaimonStopResources();
-    private final AtomicReference<io.tapdata.connector.paimon.read.PaimonStreamReadSession> sourceSession = new AtomicReference<>();
+    private final PaimonStreamReadService streamReadService;
     private PaimonStopResources.Scope catalogScope;
     private final Object callbackExecutionLock = new Object();
     private final Object bindLock = new Object();
-    private final AtomicReference<Throwable> sourceProtectionFailure = new AtomicReference<>();
-    private volatile SourceProtection sourceProtection;
-    private static final class SourceProtection {
-        final PaimonReadOffset offset;
-        final Set<String> names;
-        final PaimonConsumerLease lease;
-        final PaimonStopResources.Slot slot;
-        final long created = System.nanoTime();
-        SourceProtection(PaimonReadOffset offset, Set<String> names, PaimonConsumerLease lease, PaimonStopResources.Slot slot) {
-            this.offset=offset;this.names=new HashSet<>(names);this.lease=lease;this.slot=slot;
-        }
-        boolean matches(PaimonReadOffset other, Set<String> requested) {
-            if(!offset.readEpoch().equals(other.readEpoch()) || !names.equals(requested))return false;
-            for(String name:names) {
-                PaimonReadOffset.Position first=offset.position(name), next=other.position(name);
-                if(first.startSnapshot!=next.startSnapshot || !first.physicalTableHash.equals(next.physicalTableHash))return false;
-            }
-            return true;
-        }
-    }
     private final AtomicReference<InterruptedException> cleanupInterruption =
             new AtomicReference<>();
     /** Connector 注入的 offset 回调；只允许在 NEW 状态绑定，运行后不可替换。 */
@@ -280,6 +259,18 @@ public class PaimonService implements AutoCloseable {
                 config.getStopTimeoutSeconds(), config.getFinalCompactionTimeoutSeconds(),
                 config.getCompactionCancelGraceSeconds(), stopClock);
         this.stopController.attachResourceRoot(this);
+        this.streamReadService = new PaimonStreamReadService(config, new PaimonStreamReadService.Runtime() {
+            @Override public AutoCloseable enterIngress(String action) throws Exception {
+                return PaimonService.this.enterIngress(action);
+            }
+            @Override public Table loadTable(Identifier identifier) throws Exception {
+                return stopController.call("source catalog getTable", () -> catalog.getTable(identifier));
+            }
+            @Override public RecordReader<InternalRow> createReader(
+                    PaimonStopController.CheckedSupplier<RecordReader<InternalRow>> factory) throws Exception {
+                return createFiniteReader(factory);
+            }
+        }, stopController, stopResources, closeCoordinationLock);
         this.clock = Objects.requireNonNull(clock, "clock");
         this.retryWaiter = Objects.requireNonNull(retryWaiter, "retryWaiter");
         this.microBatchCoordinator = new PaimonMicroBatchCoordinator(
@@ -2438,253 +2429,24 @@ public class PaimonService implements AutoCloseable {
         }
     }
 
-    /**
-     * Resolve one shared timestamp into a versioned, next-to-consume envelope for every table.
-     * Metadata failures fail the entire initialization; protected mode registers all leases before returning.
-     */
+    /** Delegates stream state to the read service while preserving the existing Connector entry points. */
     public Object timestampToStreamOffset(List<String> tables, Long timestamp, Log log) throws Exception {
         return timestampToStreamOffset(tables, timestamp, log, () -> {});
     }
+
     public Object timestampToStreamOffset(List<String> tables, Long timestamp, Log log, Runnable threadContext) throws Exception {
-        try (PaimonServiceLifecycle.Ingress ignored = enterIngress("timestampToStreamOffset")) {
-            return timestampToStreamOffsetAdmitted(tables, timestamp, log, threadContext);
-        }
+        return streamReadService.timestampToStreamOffset(tables, timestamp, threadContext);
     }
 
-    private Object timestampToStreamOffsetAdmitted(List<String> tables, Long timestamp, Log log, Runnable threadContext) throws Exception {
-        // 所有表共用一个时间边界，避免逐表取 now 引入不同起点；这是连接器策略，不是跨表快照事务。
-        // 时间相等时的包含规则及原生 TimeTravelUtil 差异，见 PaimonReadPositionResolver#atTimestamp。
-        long now = System.currentTimeMillis();
-        long boundary = timestamp == null ? now : timestamp;
-        Map<String, FileStoreTable> resolved = resolveSourceTables(tables);
-        Map<String, PaimonReadOffset.Position> positions = new LinkedHashMap<>();
-        for (Map.Entry<String, FileStoreTable> entry : resolved.entrySet()) {
-            PaimonReadPositionResolver resolver = new PaimonReadPositionResolver(entry.getValue(), entry.getKey(),
-                    () -> !stopController.isStarted());
-            long next = resolver.atTimestamp(boundary, now);
-            resolver.validate(next);
-            positions.put(entry.getKey(), new PaimonReadOffset.Position(
-                    PaimonReadPositionResolver.identity(entry.getValue()), next, next));
-        }
-        PaimonReadOffset offset = new PaimonReadOffset(UUID.randomUUID().toString(), positions);
-        ensureSourceProtection(offset, resolved, threadContext);
-        return offset.toMap();
-    }
-
-    private Map<String, FileStoreTable> resolveSourceTables(List<String> names) throws Exception {
-        if (names == null || names.isEmpty()) { throw new IllegalArgumentException("Stream read requires tables"); }
-        Map<String, FileStoreTable> result = new LinkedHashMap<>();
-        Set<String> identities = new HashSet<>();
-        for (String name : names) {
-            if (name == null || name.trim().isEmpty() || result.containsKey(name)) {
-                throw new IllegalArgumentException("Empty or duplicate stream table: " + name);
-            }
-            Table table = stopController.call("source catalog getTable",
-                    () -> catalog.getTable(Identifier.create(config.getDatabase(), name)));
-            if (!(table instanceof FileStoreTable)) { throw new IllegalArgumentException("Unsupported source table: " + name); }
-            FileStoreTable file = (FileStoreTable) table;
-            if (!identities.add(PaimonReadPositionResolver.identity(file))) {
-                throw new IllegalArgumentException("Duplicate physical source table: " + name);
-            }
-            result.put(name, file);
-        }
-        return result;
-    }
-
-    private void checkSourceProtection() {
-        Throwable failure = sourceProtectionFailure.get();
-        if (failure != null) { throw new IllegalStateException("Paimon source protection failed; restart required", failure); }
-        SourceProtection protection = sourceProtection;
-        if (protection != null) { protection.lease.check(); }
-    }
-
-    private void ensureSourceProtection(PaimonReadOffset offset, Map<String, FileStoreTable> tables,
-            Runnable threadContext) throws Exception {
-        // fixed-start 在生成初始 offset 时即可注册，覆盖 TapData 随后的全量阶段；
-        // streamRead 复用同 epoch 的保护，不能等到全量结束才保护所需历史。
-        checkSourceProtection();
-        if ("none".equals(config.getStreamReadConsumerProtection())) { return; }
-        SourceProtection protection;
-        synchronized (closeCoordinationLock) {
-            if (stopController.isStarted()) { throw new IllegalStateException("Source protection is stopping"); }
-            protection = sourceProtection;
-            if (protection == null) {
-                String attempt = UUID.randomUUID().toString();
-                List<PaimonConsumerRegistration> registrations = new ArrayList<>();
-                for (Map.Entry<String, FileStoreTable> entry : tables.entrySet()) {
-                    registrations.add(new PaimonConsumerRegistration(entry.getValue(), entry.getKey(), offset,
-                            attempt, () -> sourceProtectionFailure.get() == null));
-                }
-                PaimonConsumerLease lease = PaimonConsumerLease.create(registrations,
-                        TimeUnit.SECONDS.toMillis(config.getStopTimeoutSeconds()), () -> true, failure -> {
-                            sourceProtectionFailure.compareAndSet(null, failure);
-                            PaimonStreamReadSession session = sourceSession.get();
-                            if (session != null) { session.fail(failure); }
-                        }, threadContext);
-                PaimonStopResources.Slot slot = stopResources.reserve("source Consumer protection");
-                protection = new SourceProtection(offset, tables.keySet(), lease, slot);
-                slot.bind(protection); sourceProtection = protection;
-            } else if (!protection.matches(offset, tables.keySet())) {
-                throw new IllegalStateException("Another source read epoch is protected; restart Service to initialize a new epoch");
-            }
-        }
-        try {
-            protection.lease.initialize(() -> !stopController.isStarted());
-            checkSourceProtection();
-        } catch (Exception | Error failure) {
-            sourceProtectionFailure.compareAndSet(null, failure);
-            try { closeSourceProtection(protection.created + TimeUnit.SECONDS.toNanos(config.getStopTimeoutSeconds())); }
-            catch (Throwable closeFailure) { failure.addSuppressed(closeFailure); }
-            throw failure;
-        }
-    }
-
-    private void closeSourceProtection(long deadline) throws Exception {
-        SourceProtection protection = sourceProtection;
-        if (protection == null) { return; }
-        try {
-            protection.lease.close(deadline);
-            synchronized (closeCoordinationLock) {
-                protection.slot.released();
-                if (sourceProtection == protection) { sourceProtection = null; }
-            }
-        } catch (Exception | Error failure) {
-            stopController.retain(failure, this);
-            throw failure;
-        }
-    }
-
-    /** Synchronous PDK invocation; only completed plans can publish a next-snapshot offset. */
     public void streamRead(List<String> tables, Object offsetState, int eventBatchSize,
             StreamReadConsumer consumer, TapConnectorContext context, Supplier<Boolean> running) throws Exception {
-        if (!Boolean.TRUE.equals(running.get())) { return; }
-        PaimonReadOffset offset = PaimonReadOffset.parse(offsetState);
-        PaimonStreamReadSession session = new PaimonStreamReadSession(offset, eventBatchSize,
-                config.getStreamReadFlushIntervalMs(), () -> Boolean.TRUE.equals(running.get()), (events, state) -> {
-                    checkSourceProtection(); consumer.accept(events, state);
-                });
-        executeStreamSession(session, () -> {
-            Map<String, FileStoreTable> resolved = resolveSourceTables(tables);
-            List<PaimonStreamReadCoordinator.Source> sources = new ArrayList<>();
-            for (Map.Entry<String, FileStoreTable> entry : resolved.entrySet()) {
-                session.checkActive();
-                String name = entry.getKey();
-                FileStoreTable physical = entry.getValue();
-                PaimonReadOffset.Position position = offset.position(name);
-                if (!position.physicalTableHash.equals(PaimonReadPositionResolver.identity(physical))) {
-                    throw new IllegalArgumentException("Paimon offset belongs to another physical table: " + name);
-                }
-                PaimonReadPositionResolver resolver = new PaimonReadPositionResolver(physical, name, session::isActive);
-                resolver.validate(position.nextSnapshot);
-                TapTable tap = context.getTableMap().get(name);
-                PaimonReadSchemaGuard guard = new PaimonReadSchemaGuard(physical, tap, resolver);
-                // Paimon release-1.3 @ 5c59e6cb01ed0b29563371f56e14fcade4597a2e:
-                // DataTableStreamScan#checkpoint/restore 使用同一个 nextSnapshotId，恢复时不能再加一。
-                // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L307
-                // consumer.ignore-progress 固定由 Engine offset 决定起点，避免原生 Consumer 覆盖它。
-                // 内核 createFollowUpScanner 根据 changelog-producer 选择 delta/changelog；
-                // 连接器不自行拼装文件增量，也不保证无 changelog 的表具备完整 CDC before/after。
-                // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L266
-                FileStoreTable table = physical.copy(Collections.singletonMap("consumer.ignore-progress", "true"));
-                ReadBuilder builder = table.newReadBuilder();
-                StreamTableScan scan = builder.newStreamScan();
-                scan.restore(position.nextSnapshot);
-                TableRead read = builder.newRead();
-                PaimonSourceRowDecoder decoder = new PaimonSourceRowDecoder(table.rowType().getFields());
-                sources.add(new PaimonStreamReadCoordinator.Source() {
-                    public String name() { return name; }
-                    public Long checkpoint() { return scan.checkpoint(); }
-                    public void validatePosition(long next) throws Exception {
-                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { checkSourceProtection(); resolver.validate(next); }
-                    }
-                    public void beforePlan() {
-                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { checkSourceProtection(); guard.beforePlan(); }
-                    }
-                    public Plan plan() {
-                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { checkSourceProtection(); return scan.plan(); }
-                    }
-                    public void beforeRead(Plan plan) throws Exception {
-                        try (PaimonStreamReadSession.Admission ignored = session.admit()) { guard.beforeRead(plan); }
-                    }
-                    public RecordReader<InternalRow> reader(Split split) throws Exception {
-                        try (PaimonStreamReadSession.Admission ignored = session.admit()) {
-                            return new PaimonSourceReader(createFiniteReader(() -> read.createReader(split)), session, PaimonService.this::checkSourceProtection);
-                        }
-                    }
-                    public io.tapdata.entity.event.TapEvent convert(InternalRow row) {
-                        return createEventFromRowKind(row, decoder.decodeForEvent(row), name);
-                    }
-                });
-            }
-            ensureSourceProtection(offset, resolved, context::configContext);
-            session.checkActive();
-            // PDK API 2.0.8-SNAPSHOT io/tapdata/pdk/apis/consumer/StreamReadConsumer.java:29-50.
-            // State notifications only; do not opt into asyncMethodAndNoRetry or infer durable ack.
-            boolean started = false;
-            Throwable failure = null;
-            try {
-                started = true;
-                consumer.streamReadStarted();
-                session.run(sources, config.getStreamReadPollIntervalMs(),
-                        TimeUnit.SECONDS.toMillis(config.getStopTimeoutSeconds()), context::configContext);
-            } catch (Throwable error) { failure = error; }
-            finally {
-                if (started) {
-                    try { consumer.streamReadEnded(); }
-                    catch (Throwable endFailure) { failure = appendFailure(failure, endFailure); }
-                }
-            }
-            if (failure != null) { rethrow(failure); }
-        });
+        streamReadService.streamRead(tables, offsetState, eventBatchSize, consumer, context, running);
     }
 
     /**
-     * 将原生行变更转换为 TapData 事件：+I/+U 为 insert，-D/-U 为 delete。
-     * 不在连接器内配对 before/after 或构造跨事件事务；目标冲突策略与主键决定重放时的落库行为。
-     * Paimon RowKind 允许 UPDATE_AFTER 单独表示幂等更新，因此不能假设总能收到成对事件。
-     * referenceTime 使用本地转换时间，不是 snapshot 提交时间或源业务时间。
-     * 来源：固定 release-1.3 的 RowKind 枚举语义：
-     * https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-api/src/main/java/org/apache/paimon/types/RowKind.java#L29
-     *
-     * @param row       internal row
-     * @param data      converted data map
-     * @param tableName table name
-     * @return TapInsertRecordEvent 或 TapDeleteRecordEvent；未知类型返回 null，由流式调用方报错
-     */
-    private io.tapdata.entity.event.TapEvent createEventFromRowKind(InternalRow row, Map<String, Object> data, String tableName) {
-        RowKind rowKind = row.getRowKind();
-
-        switch (rowKind) {
-            case INSERT:
-            case UPDATE_AFTER:
-                // For INSERT and UPDATE_AFTER, create insert event
-                io.tapdata.entity.event.dml.TapInsertRecordEvent insertEvent =
-                        new io.tapdata.entity.event.dml.TapInsertRecordEvent().init();
-                insertEvent.setTableId(tableName);
-                insertEvent.setAfter(data);
-                insertEvent.setReferenceTime(System.currentTimeMillis());
-                return insertEvent;
-
-            case DELETE:
-            case UPDATE_BEFORE:
-                // For DELETE and UPDATE_BEFORE, create delete event
-                io.tapdata.entity.event.dml.TapDeleteRecordEvent deleteEvent =
-                        new io.tapdata.entity.event.dml.TapDeleteRecordEvent().init();
-                deleteEvent.setTableId(tableName);
-                deleteEvent.setBefore(data);
-                deleteEvent.setReferenceTime(System.currentTimeMillis());
-                return deleteEvent;
-
-            default:
-                // 流式 Coordinator 将 null 视为转换失败，不能悄悄跳过并推进位点。
-                return null;
-        }
-    }
-
-    /**
-     * 全量读取采用有限 TableScan plan，事件复用流式读取的类型转换与源 codec。
-     * 此入口不消费 StreamRead 的 nextSnapshot 位点，也没有 split/行级断点恢复；
-     * 全量与后续流式读取的衔接由 TapData 调用流程及预先取得的 stream offset 负责。
+     * Full reads use a finite TableScan plan and share stream decoding and source codecs.
+     * This entry point does not consume the stream nextSnapshot offset or resume individual splits/rows.
+     * TapData coordinates the full-to-stream transition using the previously initialized stream offset.
      *
      * @param table             table definition
      * @param offsetState       offset state for resuming read (not used for now)
@@ -3108,8 +2870,7 @@ public class PaimonService implements AutoCloseable {
             PaimonStopController operation = stopController;
             if (operation.isFinished()) { closeOperation = operation; return operation; }
             operation.start();
-            io.tapdata.connector.paimon.read.PaimonStreamReadSession activeSource = sourceSession.get();
-            if (activeSource != null) { activeSource.cancel(); }
+            streamReadService.cancelActiveSession();
             Thread worker = new Thread(CLOSE_WORKER_THREAD_GROUP, () -> performClose(operation),
                     "paimon-service-close-" + serviceWriterOwner.substring(0, 8));
             worker.setDaemon(true);
@@ -3138,7 +2899,7 @@ public class PaimonService implements AutoCloseable {
             recordCloseFailure(operation, lifecycle.firstFailure());
             awaitSchedulerTermination(operation);
             awaitLifecycleQuiescence(operation);
-            closeSourceProtection(System.nanoTime() + operation.remainingNanos());
+            streamReadService.closeSourceProtection(System.nanoTime() + operation.remainingNanos());
         } catch (Throwable shutdownFailure) {
             recordCloseFailure(operation, shutdownFailure);
             recordStickyFailure(shutdownFailure);
@@ -3397,41 +3158,9 @@ public class PaimonService implements AutoCloseable {
         if (stopController.isStarted()) { throw new IllegalStateException("Paimon service is stopping: " + action); }
         stopController.checkAction(action);
         if (Arrays.asList("streamRead", "timestampToStreamOffset", "batchRead", "batchCount", "executeQuery", "queryByAdvanceFilter").contains(action)) {
-            checkSourceProtection();
+            streamReadService.checkSourceProtection();
         }
         return lifecycle.enter(action);
-    }
-
-    /** Source ownership uses the same ledger and stop barrier as finite reads and writers. */
-    void executeStreamSession(io.tapdata.connector.paimon.read.PaimonStreamReadSession session,
-            PaimonStopController.CheckedRunnable body) throws Exception {
-        try (PaimonServiceLifecycle.Ingress ignored = enterIngress("streamRead")) {
-            PaimonStopResources.Slot registration;
-            synchronized (closeCoordinationLock) {
-                if (stopController.isStarted() || !sourceSession.compareAndSet(null, session)) {
-                    throw new IllegalStateException("Paimon source is stopping or another stream invocation is active");
-                }
-                registration = stopResources.reserve("stream source session");
-                registration.bind(session);
-            }
-            Throwable failure = null;
-            try { body.run(); }
-            catch (Throwable error) { failure = error; }
-            finally {
-                session.cancel();
-                try { closeSourceProtection(session.cancelledAtNanos() + TimeUnit.SECONDS.toNanos(config.getStopTimeoutSeconds())); }
-                catch (Throwable closeFailure) { failure = appendFailure(failure, closeFailure); }
-                if (session.resourcesTerminated()) {
-                    registration.released();
-                    sourceSession.compareAndSet(session, null);
-                } else {
-                    Throwable unclosed = new IllegalStateException("Paimon source termination not proved; shared resources retained");
-                    failure = appendFailure(failure, unclosed);
-                    stopController.retain(failure, this);
-                }
-            }
-            if (failure != null) { rethrow(failure); }
-        }
     }
 
     private RecordReader<InternalRow> createFiniteReader(
@@ -3444,11 +3173,11 @@ public class PaimonService implements AutoCloseable {
         }
     }
     private <T> void acceptReadResult(java.util.function.Consumer<T> consumer, T value) throws Exception {
-        checkSourceProtection();
+        streamReadService.checkSourceProtection();
         stopController.run("finite reader callback", () -> consumer.accept(value));
     }
     private <T> void acceptReadResult(java.util.function.BiConsumer<T, Object> consumer, T value) throws Exception {
-        checkSourceProtection();
+        streamReadService.checkSourceProtection();
         stopController.run("finite reader callback", () -> consumer.accept(value, null));
     }
 

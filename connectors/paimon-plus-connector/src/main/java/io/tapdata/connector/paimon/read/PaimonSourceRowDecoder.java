@@ -10,10 +10,10 @@ import java.util.*;
 import java.util.function.Function;
 
 /**
- * 按本次 schema 预构建字段 getter/转换器，逐行读取时不再解析类型。
- * 原生 InternalRow/Array/Map 属于 reader 的内部表示；输出只保留独立集合、不可变值或二进制副本，
- * 避免 TapData 异步消费时引用已被 releaseBatch 回收或复用的内存。
- * 类型读取遵循 Paimon；JSON 表示、Map key 限制和 TapData 时间载体是本连接器的适配约定。
+ * Builds getters and converters once per bound schema instead of resolving types for each row.
+ * InternalRow/Array/Map are reader-owned representations; emit independent collections, immutable values or binary copies
+ * so asynchronous TapData consumption cannot observe memory recycled or reused after releaseBatch.
+ * Native extraction follows Paimon; JSON encoding, map-key restrictions and temporal carriers are connector contracts.
  */
 public final class PaimonSourceRowDecoder {
     private final String[] names;
@@ -37,9 +37,9 @@ public final class PaimonSourceRowDecoder {
             names[i] = field.name();
             DataTypeRoot root = field.type().getTypeRoot();
             complex[i] = root == DataTypeRoot.ARRAY || root == DataTypeRoot.MAP || root == DataTypeRoot.ROW;
-            // 使用内核按类型分派的 getter（包括 LTZ），不通过显示字符串猜类型。
-            // copy(true) 只让 getter 检查 null，保留 delete/before image 中的空值；不修改表 DDL。
-            // InternalRow#createFieldGetter / InternalArray#createElementGetter，固定 release-1.3：
+            // Use native type-dispatched getters, including LTZ, instead of inferring types from display strings.
+            // copy(true) enables null checks for delete/before images without changing the table DDL.
+            // InternalRow#createFieldGetter / InternalArray#createElementGetter, pinned release-1.3:
             // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-common/src/main/java/org/apache/paimon/data/InternalRow.java#L168
             // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-common/src/main/java/org/apache/paimon/data/InternalArray.java#L76
             getters[i] = InternalRow.createFieldGetter(field.type().copy(true), i);
@@ -57,8 +57,8 @@ public final class PaimonSourceRowDecoder {
 
     public Map<String, Object> decodeForEvent(InternalRow row) {
         Map<String, Object> result = decode(row);
-        // 来源：io.tapdata:tapdata-api:2.0.8-SNAPSHOT sources.jar，
-        // io/tapdata/entity/codec/filter/impl/AllLayerMapIterator.java#iterate(Map, EntryFilter):86。
+        // Source: io.tapdata:tapdata-api:2.0.8-SNAPSHOT sources.jar,
+        // io/tapdata/entity/codec/filter/impl/AllLayerMapIterator.java#iterate(Map, EntryFilter):86.
         // PDK 2.0.8-SNAPSHOT AllLayerMapIterator#iterate recursively wraps child Maps before
         // source codecs run; MySQL's target codec then JSON-encodes those children twice.
         // A standard String carrier crosses that traversal once. Our registered String codec
@@ -101,7 +101,7 @@ public final class PaimonSourceRowDecoder {
             case VARBINARY:
                 // GenericRow can expose its backing byte[]; events outlive reader.releaseBatch().
                 // Nested values follow a JSON contract: binary is standard Base64 text.
-                // 内核允许 releaseBatch 后复用批内对象；顶层必须复制 byte[]，嵌套值转换成独立文本。
+                // Batch objects may be reused after releaseBatch; copy top-level bytes and materialize nested bytes as text.
                 // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-common/src/main/java/org/apache/paimon/reader/RecordReader.java#L59
                 return nested ? value -> Base64.getEncoder().encodeToString((byte[]) value)
                         : value -> ((byte[]) value).clone();
@@ -109,21 +109,21 @@ public final class PaimonSourceRowDecoder {
                 return nested ? value -> LocalDate.ofEpochDay((Integer) value).toString()
                         : value -> new java.sql.Date((Integer) value * 86_400_000L);
             case TIME_WITHOUT_TIME_ZONE:
-                // InternalRow getter 的 TIME 路径读取 int，按一天内毫秒数转换。
-                // 本连接器 spec.json 声明 TIME 精度 0..3；不是 Paimon TimeType 的声明上限：
-                // 原生 TimeType 允许 0..9，本路径尚未验证 TIME(4..9) 的端到端精度。
+                // The InternalRow TIME getter reads an int representing milliseconds of the day.
+                // This connector declares TIME precision 0..3 in spec.json; that is not the native TimeType limit.
+                // Native TimeType permits 0..9; end-to-end precision for TIME(4..9) has not been validated here.
                 // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-api/src/main/java/org/apache/paimon/types/TimeType.java#L43
                 return nested ? value -> LocalTime.ofNanoOfDay((Integer) value * 1_000_000L).toString()
                         : value -> LocalTime.ofNanoOfDay((Integer) value * 1_000_000L).atDate(LocalDate.ofEpochDay(0));
             case TIMESTAMP_WITHOUT_TIME_ZONE:
-                // 保留墙钟字段和纳秒，不在此套用 JVM/目标时区；PDK 载体由 PaimonSourceCodecs 处理。
+                // Preserve wall-clock fields and nanos without applying JVM/target zones; PaimonSourceCodecs handles the PDK carrier.
                 // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-common/src/main/java/org/apache/paimon/data/Timestamp.java#L92
                 return nested ? value -> ((Timestamp) value).toLocalDateTime().toString()
                         : value -> ((Timestamp) value).toLocalDateTime();
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                // LTZ 表示 instant，输出携带 UTC；不能套用无时区 TIMESTAMP 的墙钟约定。
-                // 固定版本 InternalRow 的 LTZ getter 仍返回 Timestamp；其 toInstant 已标 Deprecated，
-                // 升级时需连同 LocalZoneTimestamp/getter 契约核对，不能仅替换返回值强转。
+                // LTZ represents an instant and is emitted with UTC; do not apply the unzoned TIMESTAMP wall-clock convention.
+                // The pinned InternalRow LTZ getter still returns Timestamp, whose toInstant is deprecated.
+                // On upgrade, review LocalZoneTimestamp and the getter contract together rather than only changing the cast.
                 // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-common/src/main/java/org/apache/paimon/data/Timestamp.java#L111
                 return nested ? value -> ((Timestamp) value).toInstant().toString()
                         : value -> ((Timestamp) value).toInstant().atZone(ZoneOffset.UTC);

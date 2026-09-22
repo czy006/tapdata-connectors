@@ -9,10 +9,10 @@ import java.util.UUID;
 import java.util.function.BooleanSupplier;
 
 /**
- * 将 Paimon Consumer 用作本读取 epoch 的历史保留边界，固定保护 startSnapshot。
- * 这是连接器的 fixed-start 策略：TapData 源回调没有下游持久化确认，不能据此推进 Consumer。
- * 原生 DataTableStreamScan#notifyCheckpointComplete 会写入传入的 nextSnapshot；本适配器不调用它。
- * @see <a href="https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L334">Paimon 原生 checkpoint 完成通知</a>
+ * Uses a Paimon Consumer to retain history at this read epoch's fixed startSnapshot.
+ * This is connector fixed-start policy: a TapData source callback is not a durable target ack and cannot advance the Consumer.
+ * Native DataTableStreamScan#notifyCheckpointComplete writes its nextSnapshot argument; this adapter does not call it.
+ * @see <a href="https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/source/DataTableStreamScan.java#L334">Native Paimon checkpoint completion notification</a>
  */
 public final class PaimonConsumerRegistration implements PaimonConsumerLease.Target {
     private final FileStoreTable table;
@@ -38,10 +38,10 @@ public final class PaimonConsumerRegistration implements PaimonConsumerLease.Tar
 
     @Override
     public long readTtlNanos() {
-        // TTL 必须来自分支最新持久化 schema，不能用动态 copy 临时“配置”出过期策略。
-        // FileStoreTable#copyWithLatestSchema 的旧 options 可能覆盖最新值，源码有对应 TODO：
+        // Read TTL from the latest persisted branch schema; a dynamic copy must not fabricate an expiration policy.
+        // FileStoreTable#copyWithLatestSchema may overwrite new options with old ones, as its TODO explains:
         // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/FileStoreTable.java#L113
-        // CoreOptions#CONSUMER_EXPIRATION_TIME 无默认值；至少 10 分钟是连接器续租安全预算。
+        // CoreOptions#CONSUMER_EXPIRATION_TIME has no default; the 10-minute minimum is a connector renewal budget.
         // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-api/src/main/java/org/apache/paimon/CoreOptions.java#L1234
         Duration ttl = new CoreOptions(table.schemaManager().latest()
                 .orElseThrow(() -> new IllegalStateException("Consumer table schema missing")).options()).consumerExpireTime();
@@ -68,8 +68,8 @@ public final class PaimonConsumerRegistration implements PaimonConsumerLease.Tar
         if (registered && manager.consumer(id).map(Consumer::nextSnapshot).orElse(-1L) != position.startSnapshot) {
             throw new IllegalStateException("Consumer protection disappeared or changed: " + id);
         }
-        // 两条原生过期路径均以 minNextSnapshot 限制删除边界，故必须始终写 start 而非当前 next。
-        // ExpireSnapshotsImpl / ExpireChangelogImpl 的 Consumer 保留逻辑：
+        // Both native expiration paths cap deletion at minNextSnapshot; fixed-start must write start, not current progress.
+        // Consumer retention in ExpireSnapshotsImpl / ExpireChangelogImpl:
         // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/ExpireSnapshotsImpl.java#L119
         // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-core/src/main/java/org/apache/paimon/table/ExpireChangelogImpl.java#L122
         manager.resetConsumer(id, new Consumer(position.startSnapshot));
