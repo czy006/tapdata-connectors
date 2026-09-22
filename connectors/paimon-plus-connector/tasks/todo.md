@@ -139,7 +139,7 @@
 
 ## S06：按 plan 边界交付候选位点
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**实现 Session 的单一交付循环，以 fake PDK consumer 验证数据序列、候选 offset、刷新与心跳。
 
@@ -147,9 +147,9 @@
 
 **验收：**
 
-- [ ] plan 未完整交付前只携带旧 next；完成标记仅推进对应表，事件/Map 不复用修改。
-- [ ] 精确 batch 边界及零业务事件进展发合法 Heartbeat，不发空列表；低流量按可控时钟刷新。
-- [ ] 回调抛错立即终止；单表真实 Paimon 到 PDK 测试回调贯通，返回不被当 durable ack。
+- [x] plan 未完整交付前只携带旧 next；完成标记仅推进对应表，事件/Map 不复用修改。
+- [x] 精确 batch 边界及零业务事件进展发合法 Heartbeat，不发空列表；低流量按可控时钟刷新。
+- [x] 回调抛错立即终止；单表真实 Paimon 到 PDK 测试回调贯通，返回不被当 durable ack。
 
 **验证：**F PaimonStreamDeliveryTest,PaimonStreamReadIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -161,7 +161,7 @@
 
 **规模：**M，3 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**Delivery 6 项通过；delivery.log。旧/新 offset 批次边界、Heartbeat、低流量刷新、失败/取消及准入票据。真实端到端 Session 接线在 S10 补测。
 
 ### 检查点 C2：S06 之后
 
