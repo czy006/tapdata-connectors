@@ -2,7 +2,13 @@
 
 ## Overview
 
-This connector enables Tapdata to write data to Apache Paimon tables. Paimon is a streaming data lake platform that supports high-speed data ingestion, change data capture, and efficient data query.
+本连接器支持 TapData 读取和写入 Apache Paimon 表。源端通过 Paimon Java API 读取全量数据及持续增量，并交给 TapData Engine 和目标连接器处理。
+
+## 读取架构与使用文档
+
+[Paimon 源端读取架构与使用说明](docs/stream-read-architecture.md) 包含整体架构、启动与读取流程、类型转换、MySQL 下游交付、位点恢复、Consumer 保护、停止流程、参数说明及源码导航，并附 Mermaid 流程图。
+
+当前源码及本地测试已覆盖上述读取能力；真实 Engine→MySQL 故障恢复与生产容量尚需按文档中的验收矩阵验证。
 
 ## Features
 
@@ -16,11 +22,12 @@ This connector enables Tapdata to write data to Apache Paimon tables. Paimon is 
 - ✅ **Create Index**: Handle index creation requests (no-op as Paimon doesn't support traditional indexes)
 - ✅ **Write Records**: Insert, update, and delete records
 
-### Not Implemented (Write-Only Connector)
+### Source Capabilities
 
-- ❌ **Read Operations**: Batch read, stream read
-- ❌ **CDC**: Change data capture from Paimon
-- ❌ **Query Operations**: Query by filter, advance filter
+- **全量读取与计数**：有限快照扫描，输出当前状态。
+- **持续增量读取**：消费原生 snapshot/changelog，按完整 plan 边界提交候选位点。
+- **时间位点与恢复**：版本化 offset、显式 restore、历史可读性校验及可选固定起点 Consumer 保护。
+- **查询能力**：高级过滤查询与当前实现支持的只读查询语法；具体边界以实现为准。
 
 ## Architecture
 
@@ -75,6 +82,8 @@ The connector supports multiple storage backends:
 ```
 
 ## Data Type Mapping
+
+本节描述以 Paimon 为目标的写入映射。源端读取原生 ARRAY/MAP/ROW、时间与二进制的转换规则见[读取架构文档](docs/stream-read-architecture.md#4-类型转换与-mysql-交付)，不要将两种方向的类型策略混用。
 
 ### Basic Types
 
@@ -202,7 +211,7 @@ Use Paimon as a target in your data pipeline:
 
 ## Limitations
 
-1. **Read Operations**: This is a write-only connector. Reading from Paimon is not supported.
+1. **读取与恢复**：支持全量及持续增量；不承诺 exactly-once。全量 batch offset 暂未用于续读，真实下游恢复与类型边界见[读取架构文档](docs/stream-read-architecture.md)。
 2. **Schema Evolution**: Dynamic schema changes during runtime are not supported.
 3. **Indexes**: Paimon doesn't support traditional indexes, only primary keys.
 4. **Transactions**: Each batch is committed as a separate transaction.
@@ -211,8 +220,8 @@ Use Paimon as a target in your data pipeline:
 
 Potential improvements for future versions:
 
-1. **Read Support**: Implement batch read and stream read operations
-2. **CDC Support**: Support reading Paimon changelog for incremental sync
+1. **读取验收**：补齐真实 Engine→MySQL 的故障恢复、Heartbeat 顺序与生产容量验证。
+2. **类型策略**：明确超出 MySQL 精度、范围及 LTZ 时区的落库规则，并验证真实数据库往返。
 3. **Schema Evolution**: Support dynamic schema changes
 4. **Partitioning**: Better support for Paimon's partitioning features
 5. **Compaction**: Expose Paimon's compaction configuration
