@@ -284,7 +284,7 @@
 
 ## S11：注册固定起点 Consumer
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**独立实现基于 readEpoch/attempt/table 的固定 Consumer 注册与读回，验证真正写侧过期边界。
 
@@ -292,9 +292,9 @@
 
 **验收：**
 
-- [ ] 恢复 next 增长但 Consumer 始终=start，attempt 文件不覆盖；不调用 notifyCheckpointComplete 推进。
-- [ ] 持久化 TTL/起点范围严格核验，注册前后检查；snapshot/changelog 与 manifest/data 缺失保留原始错误。
-- [ ] 独立 writer 的清理与注册交错可复现；失败部分注册文件不删除，不声称原子建立保护。
+- [x] 恢复 next 增长但 Consumer 始终=start，attempt 文件不覆盖；不调用 notifyCheckpointComplete 推进。
+- [x] 持久化 TTL/起点范围严格核验，注册前后检查；snapshot/changelog 与 manifest/data 缺失保留原始错误。
+- [x] 独立 writer 的清理与注册交错可复现；失败部分注册文件不删除，不声称原子建立保护。
 
 **验证：**F PaimonConsumerLeaseIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -305,7 +305,7 @@
 
 **规模：**S，2 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**consumer.log：真实 Paimon Consumer 2 项通过；固定 start、attempt 隔离、丢失文件不重建、读取持久化 TTL、TTL 修改/缺失/过短拒绝。租约线程与入口仍待 S12/S13。
 
 ## S12：实现注册超时和独立续租
 
