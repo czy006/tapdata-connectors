@@ -73,7 +73,8 @@ public final class PaimonStreamReadCoordinator {
                             if (row == null) { break; }
                             TapEvent event = source.convert(row);
                             checkActive(active);
-                            if (event != null) { sink.put(Item.event(source.name(), event)); }
+                            if (event == null) { throw new IllegalStateException("Paimon row conversion returned null"); }
+                            sink.put(Item.event(source.name(), event));
                         }
                     }
                 }

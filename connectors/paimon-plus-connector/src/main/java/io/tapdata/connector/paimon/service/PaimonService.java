@@ -645,7 +645,10 @@ public class PaimonService implements AutoCloseable {
         List<DataField> fields = paimonTable.rowType().getFields();
         List<String> primaryKeys = paimonTable.primaryKeys();
         for (DataField field : fields) {
-            TapField tapField = new TapField(field.name(), field.type().asSQLString().replace("NOT NULL", "").trim());
+            // Only top-level nullability belongs in TapField.nullable. Preserve nested NOT NULL
+            // for stream schema binding (Paimon DataType.copy(boolean) / asSQLString).
+            // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-api/src/main/java/org/apache/paimon/types/DataType.java
+            TapField tapField = new TapField(field.name(), field.type().copy(true).asSQLString());
             tapField.setNullable(field.type().isNullable());
             if (primaryKeys.contains(field.name())) {
                 tapField.setPrimaryKey(true);

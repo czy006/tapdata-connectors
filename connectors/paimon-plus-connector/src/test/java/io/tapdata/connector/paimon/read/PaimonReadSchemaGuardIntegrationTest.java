@@ -31,6 +31,25 @@ class PaimonReadSchemaGuardIntegrationTest {
             assertEquals(1, old.rowType().getFieldCount(), "Bound reader still sees original structure");
         }
     }
+    @Test void nullableMismatchMustFailAtBinding() {
+        FileStoreTable table = org.mockito.Mockito.mock(FileStoreTable.class);
+        org.apache.paimon.schema.TableSchema schema = new org.apache.paimon.schema.TableSchema(0,
+                Collections.singletonList(new org.apache.paimon.types.DataField(0, "id", DataTypes.INT().notNull())),
+                0, Collections.emptyList(), Collections.emptyList(), Collections.emptyMap(), null);
+        org.mockito.Mockito.when(table.schema()).thenReturn(schema);
+        assertThrows(IllegalStateException.class, () -> new PaimonReadSchemaGuard(table,
+                new TapTable("orders").add(new TapField("id", "INT").nullable(true)), null));
+        assertDoesNotThrow(() -> new PaimonReadSchemaGuard(table,
+                new TapTable("orders").add(new TapField("id", "INT").nullable(false)), null));
+        org.apache.paimon.types.DataType nested = DataTypes.ARRAY(DataTypes.INT().notNull());
+        org.mockito.Mockito.when(table.schema()).thenReturn(new org.apache.paimon.schema.TableSchema(0,
+                Collections.singletonList(new org.apache.paimon.types.DataField(0, "id", nested)),
+                0, Collections.emptyList(), Collections.emptyList(), Collections.emptyMap(), null));
+        assertThrows(IllegalStateException.class, () -> new PaimonReadSchemaGuard(table,
+                new TapTable("orders").add(new TapField("id", "ARRAY<INT>")), null));
+        assertDoesNotThrow(() -> new PaimonReadSchemaGuard(table,
+                new TapTable("orders").add(new TapField("id", nested.asSQLString())), null));
+    }
     @Test void historyUsesNativeFieldIdProjectionAfterReload() throws Exception {
         java.nio.file.Path root = Files.createTempDirectory(Files.createDirectories(Paths.get("target/stream-read-validation")), "history-schema-");
         try (Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(new org.apache.paimon.fs.Path(root.toUri())))) {

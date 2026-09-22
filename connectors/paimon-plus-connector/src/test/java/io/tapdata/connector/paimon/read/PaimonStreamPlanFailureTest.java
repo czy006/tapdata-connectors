@@ -43,6 +43,11 @@ class PaimonStreamPlanFailureTest {
         assertEquals(5, items.get(1).before); assertEquals(6, items.get(1).after);
         verify(reader, times(2)).close();
     }
+    @Test void nullConversionCannotSkipRecordAndAdvance() throws Exception {
+        setup(); when(source.convert(any())).thenReturn(null);
+        assertThrows(IllegalStateException.class, () -> PaimonStreamReadCoordinator.readPlan(source, () -> true, items::add));
+        assertTrue(items.isEmpty());
+    }
     @Test void readerCloseFailureCannotPublishCompletedPlan() throws Exception {
         RecordReader<InternalRow> reader = setup();
         doThrow(new IOException("close failed")).when(reader).close();

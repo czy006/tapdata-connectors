@@ -31,7 +31,8 @@ public final class PaimonReadSchemaGuard {
         for (DataField field : initial.fields()) {
             TapField tap = tapTable.getNameFieldMap().get(field.name());
             // Matches this connector's discoverSchema() SQL-type representation, including complex types.
-            if (tap == null || !normalize(field.type().asSQLString()).equals(normalize(tap.getDataType()))) {
+            if (tap == null || !Boolean.valueOf(field.type().isNullable()).equals(tap.getNullable())
+                    || !normalize(field.type().copy(true).asSQLString()).equals(normalize(tap.getDataType()))) {
                 throw mismatch();
             }
         }
@@ -63,7 +64,7 @@ public final class PaimonReadSchemaGuard {
         return new IllegalStateException("Paimon stream schema or read semantics changed; reload TapData table metadata and restart");
     }
     private static String normalize(String type) {
-        return type == null ? "" : type.replace("NOT NULL", "").replaceAll("\\s+", "").toUpperCase(Locale.ROOT);
+        return type == null ? "" : type.replaceAll("\\s+", "").toUpperCase(Locale.ROOT);
     }
     private static List<Object> fingerprint(TableSchema schema) {
         Map<String, String> readOptions = new TreeMap<>();
