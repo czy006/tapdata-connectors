@@ -9,7 +9,7 @@ import java.util.UUID;
 import java.util.function.BooleanSupplier;
 
 /** Version-pinned adapter; Consumer always protects the epoch's original start, never delivered progress. */
-public final class PaimonConsumerRegistration {
+public final class PaimonConsumerRegistration implements PaimonConsumerLease.Target {
     private final FileStoreTable table;
     private final PaimonReadOffset.Position position;
     private final PaimonReadPositionResolver resolver;
@@ -31,6 +31,7 @@ public final class PaimonConsumerRegistration {
     }
     public String id() { return id; }
 
+    @Override
     public long readTtlNanos() {
         // Persisted latest branch schema, not FileStoreTable.copyWithLatestSchema(), whose old
         // dynamic options may override new schema options (FileStoreTable.java:113).
@@ -51,6 +52,7 @@ public final class PaimonConsumerRegistration {
         return nanos;
     }
 
+    @Override
     public void writeAndVerify() throws InterruptedException {
         resolver.validate(position.startSnapshot);
         resolver.validate(position.nextSnapshot);

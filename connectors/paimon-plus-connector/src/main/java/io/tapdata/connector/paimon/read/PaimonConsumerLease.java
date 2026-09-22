@@ -36,16 +36,9 @@ public final class PaimonConsumerLease {
     }
     public static PaimonConsumerLease create(List<PaimonConsumerRegistration> registrations, long timeoutMillis,
             BooleanSupplier active, Consumer<Throwable> onFailure, Runnable threadContext) {
-        List<Target> targets = new ArrayList<>();
-        for (PaimonConsumerRegistration registration : registrations) {
-            targets.add(new Target() {
-                public long readTtlNanos() { return registration.readTtlNanos(); }
-                public void writeAndVerify() throws Exception { registration.writeAndVerify(); }
-            });
-        }
-        return new PaimonConsumerLease(targets, timeoutMillis, active, onFailure, threadContext, System::nanoTime);
+        return new PaimonConsumerLease(registrations, timeoutMillis, active, onFailure, threadContext, System::nanoTime);
     }
-    PaimonConsumerLease(List<Target> targets, long timeoutMillis, BooleanSupplier active,
+    PaimonConsumerLease(List<? extends Target> targets, long timeoutMillis, BooleanSupplier active,
             Consumer<Throwable> onFailure, Runnable threadContext, LongSupplier clock) {
         if (targets.isEmpty() || timeoutMillis <= 0) { throw new IllegalArgumentException("Invalid Consumer lease configuration"); }
         this.clock=clock;this.active=active;this.onFailure=onFailure;this.threadContext=threadContext;
