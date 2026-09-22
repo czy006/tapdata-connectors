@@ -103,6 +103,36 @@ public class PaimonConfig extends CommonDbConfig implements Serializable {
     // snapshot.expire.execution-mode 或 Paimon file-operation.thread-num。
     private Integer asyncCommitConcurrency = DEFAULT_ASYNC_COMMIT_CONCURRENCY;
 
+    // Connector source policy; independent from the target commit interval (Spec §9.1).
+    private Integer streamReadPollIntervalMs = 1000;
+    private Integer streamReadFlushIntervalMs = 1000;
+    private String streamReadConsumerProtection = "none";
+    public Integer getStreamReadPollIntervalMs() { return streamReadPollIntervalMs; }
+    public void setStreamReadPollIntervalMs(Integer value) { streamReadPollIntervalMs = value; }
+    public Integer getStreamReadFlushIntervalMs() { return streamReadFlushIntervalMs; }
+    public void setStreamReadFlushIntervalMs(Integer value) { streamReadFlushIntervalMs = value; }
+    public String getStreamReadConsumerProtection() { return streamReadConsumerProtection; }
+    public void setStreamReadConsumerProtection(String value) { streamReadConsumerProtection = value; }
+
+    public void validateStreamRead() {
+        if (streamReadPollIntervalMs == null || streamReadPollIntervalMs < 100 || streamReadPollIntervalMs > 60000
+                || streamReadFlushIntervalMs == null || streamReadFlushIntervalMs < 100 || streamReadFlushIntervalMs > 60000) {
+            throw new IllegalArgumentException("Stream read intervals must be integers between 100 and 60000 ms");
+        }
+        if (!"none".equals(streamReadConsumerProtection) && !"fixed-start".equals(streamReadConsumerProtection)) {
+            throw new IllegalArgumentException("streamReadConsumerProtection must be none or fixed-start");
+        }
+        if (getTableConfig() != null) {
+            for (Map<String, Object> properties : getTableConfig().values()) {
+                if (properties != null && (properties.containsKey("streamReadPollIntervalMs")
+                        || properties.containsKey("streamReadFlushIntervalMs")
+                        || properties.containsKey("streamReadConsumerProtection"))) {
+                    throw new IllegalArgumentException("Stream read options do not support table overrides");
+                }
+            }
+        }
+    }
+
     // Service 停止预算；不是 Paimon 内核参数。超时不能作为删除 Spill 的证据。
     private Integer stopTimeoutSeconds = 180;
     private Integer finalCompactionTimeoutSeconds = 120;
@@ -515,7 +545,7 @@ public class PaimonConfig extends CommonDbConfig implements Serializable {
     @Override
     public PaimonConfig load(Map<String, Object> map) {
         Map<String, Object> normalized = new java.util.HashMap<>(map);
-        for (String key : java.util.Arrays.asList("stopTimeoutSeconds", "finalCompactionTimeoutSeconds", "compactionCancelGraceSeconds")) {
+        for (String key : java.util.Arrays.asList("stopTimeoutSeconds", "finalCompactionTimeoutSeconds", "compactionCancelGraceSeconds", "streamReadPollIntervalMs", "streamReadFlushIntervalMs")) {
             Object raw = normalized.get(key);
             if (raw == null) { continue; }
             try {
@@ -529,6 +559,7 @@ public class PaimonConfig extends CommonDbConfig implements Serializable {
         PaimonConfig loaded = (PaimonConfig) super.load(normalized);
         loaded.validateExpireMode();
         loaded.validateStopBudgets();
+        loaded.validateStreamRead();
         return loaded;
     }
 
@@ -658,6 +689,7 @@ public class PaimonConfig extends CommonDbConfig implements Serializable {
     public void validate() {
         validateExpireMode();
         validateStopBudgets();
+        validateStreamRead();
         if (warehouse == null || warehouse.trim().isEmpty()) {
             throw new IllegalArgumentException("Warehouse path is required");
         }

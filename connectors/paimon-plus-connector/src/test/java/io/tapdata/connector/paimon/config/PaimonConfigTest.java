@@ -21,6 +21,29 @@ import static org.junit.jupiter.api.Assertions.*;
 class PaimonConfigTest {
 
     @Test
+    void sourceOptionsRejectFractionalOutOfRangeAndTableOverrides() {
+        for (String key : java.util.Arrays.asList("streamReadPollIntervalMs", "streamReadFlushIntervalMs")) {
+            for (Object value : java.util.Arrays.asList(99, 60001, 100.5, "bad", "2147483648")) {
+                assertThrows(IllegalArgumentException.class, () -> new PaimonConfig().load(Collections.singletonMap(key, value)));
+            }
+            assertDoesNotThrow(() -> new PaimonConfig().load(Collections.singletonMap(key, 100)));
+            assertDoesNotThrow(() -> new PaimonConfig().load(Collections.singletonMap(key, 60000)));
+            PaimonConfig config = new PaimonConfig();
+            config.setTableConfig(Collections.singletonMap("a", DataMap.create().kv(key, 1000)));
+            assertThrows(IllegalArgumentException.class, config::validateStreamRead);
+        }
+        assertEquals("none", new PaimonConfig().getStreamReadConsumerProtection());
+        assertEquals(Integer.valueOf(1000), new PaimonConfig().getStreamReadPollIntervalMs());
+        assertDoesNotThrow(() -> new PaimonConfig().load(Collections.singletonMap("streamReadConsumerProtection", "fixed-start")));
+        for (String invalid : java.util.Arrays.asList("", "advance", "NONE")) {
+            assertThrows(IllegalArgumentException.class, () -> new PaimonConfig().load(Collections.singletonMap("streamReadConsumerProtection", invalid)));
+        }
+        PaimonConfig config = new PaimonConfig();
+        config.setTableConfig(Collections.singletonMap("a", DataMap.create().kv("streamReadConsumerProtection", "none")));
+        assertThrows(IllegalArgumentException.class, config::validateStreamRead);
+    }
+
+    @Test
     void stopBudgetsMustRejectFractionOverflowNonPositiveAndTableOverrides() {
         for (String key : Arrays.asList("stopTimeoutSeconds", "finalCompactionTimeoutSeconds", "compactionCancelGraceSeconds")) {
             for (Object value : Arrays.asList(0, -1, 1.5, Long.MAX_VALUE, "2147483648", true, "invalid")) {

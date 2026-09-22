@@ -261,6 +261,7 @@ public class PaimonService implements AutoCloseable {
         this.log = log;
         this.config = config;
         config.validateStopBudgets();
+        config.validateStreamRead();
         this.stopController = new PaimonStopController(serviceWriterOwner,
                 config.getStopTimeoutSeconds(), config.getFinalCompactionTimeoutSeconds(),
                 config.getCompactionCancelGraceSeconds(), stopClock);

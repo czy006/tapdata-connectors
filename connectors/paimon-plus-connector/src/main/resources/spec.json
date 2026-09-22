@@ -540,6 +540,56 @@
             }
           ]
         },
+        "streamReadPollIntervalMs": {
+          "type": "number",
+          "title": "${streamReadPollIntervalMs}",
+          "default": 1000,
+          "x-decorator": "FormItem",
+          "x-component": "InputNumber",
+          "x-component-props": {
+            "min": 100,
+            "max": 60000,
+            "precision": 0
+          },
+          "x-decorator-props": {
+            "tooltip": "${streamReadPollIntervalMsTip}"
+          }
+        },
+        "streamReadFlushIntervalMs": {
+          "type": "number",
+          "title": "${streamReadFlushIntervalMs}",
+          "default": 1000,
+          "x-decorator": "FormItem",
+          "x-component": "InputNumber",
+          "x-component-props": {
+            "min": 100,
+            "max": 60000,
+            "precision": 0
+          },
+          "x-decorator-props": {
+            "tooltip": "${streamReadFlushIntervalMsTip}"
+          }
+        },
+        "streamReadConsumerProtection": {
+          "type": "string",
+          "title": "${streamReadConsumerProtection}",
+          "default": "none",
+          "x-decorator": "FormItem",
+          "x-component": "Select",
+          "enum": [
+            {
+              "label": "none",
+              "value": "none"
+            },
+            {
+              "label": "fixed-start",
+              "value": "fixed-start"
+            }
+          ],
+          "x-decorator-props": {
+            "tooltip": "${streamReadConsumerProtectionTip}"
+          }
+        },
         "stopTimeoutSeconds": {
           "type": "number",
           "title": "${stopTimeoutSeconds}",
@@ -701,6 +751,12 @@
   "messages": {
     "default": "en_US",
     "en_US": {
+      "streamReadPollIntervalMs": "Source: idle poll interval (ms)",
+      "streamReadPollIntervalMsTip": "Wait after a source table has no new plan; 100–60000 ms.",
+      "streamReadFlushIntervalMs": "Source: batch flush interval (ms)",
+      "streamReadFlushIntervalMsTip": "Maximum wait for a partially filled source event batch; 100–60000 ms.",
+      "streamReadConsumerProtection": "Source: consumer protection",
+      "streamReadConsumerProtectionTip": "none: no retention protection. fixed-start: retain the initial position and renew its lease; does not acknowledge downstream persistence. Requires a persisted table consumer.expiration-time of at least 10 minutes.",
       "stopTimeoutSeconds": "STOP Total Timeout (seconds)",
       "finalCompactionTimeoutSeconds": "Final Compaction Timeout (seconds)",
       "compactionCancelGraceSeconds": "Compaction Cancellation Grace (seconds)",
@@ -764,6 +820,12 @@
       "enablePrimaryKeyUpdate_description": "When enabled, automatically detects primary key changes and converts update operations to delete+insert. Requires source database to provide before-update data. If unavailable, enabling this feature will cause errors. It is recommended to keep this feature disabled by default and only enable it when primary key values are expected to change. Enabling this feature will reduce update performance."
     },
     "zh_CN": {
+      "streamReadPollIntervalMs": "源端：空闲轮询间隔（毫秒）",
+      "streamReadPollIntervalMsTip": "源表暂无新计划后的等待间隔，100–60000 毫秒。",
+      "streamReadFlushIntervalMs": "源端：批次刷新间隔（毫秒）",
+      "streamReadFlushIntervalMsTip": "源端事件批次未满时的等待期限，100–60000 毫秒。",
+      "streamReadConsumerProtection": "源端：Consumer 保护",
+      "streamReadConsumerProtectionTip": "none：不保护历史；fixed-start：固定保护初始位点并续租，不表示下游持久化确认。要求表已持久化 consumer.expiration-time，且至少为 10 分钟。",
       "stopTimeoutSeconds": "STOP 总超时（秒）",
       "finalCompactionTimeoutSeconds": "最终 Compaction 超时（秒）",
       "compactionCancelGraceSeconds": "Compaction 取消宽限（秒）",
@@ -827,6 +889,12 @@
       "enablePrimaryKeyUpdate_description": "开启后，会自动检查主键变更，将更新操作改为删除+写入，要求源库可以提供更新前数据，如果无法提供，开启此功能会报错退出。建议默认关闭该功能，如果确认主键值会变更再开启，开启后，更新性能会下降。"
     },
     "zh_TW": {
+      "streamReadPollIntervalMs": "來源端：閒置輪詢間隔（毫秒）",
+      "streamReadPollIntervalMsTip": "來源表暫無新計畫後的等待間隔，100–60000 毫秒。",
+      "streamReadFlushIntervalMs": "來源端：批次刷新間隔（毫秒）",
+      "streamReadFlushIntervalMsTip": "來源端事件批次未滿時的等待期限，100–60000 毫秒。",
+      "streamReadConsumerProtection": "來源端：Consumer 保護",
+      "streamReadConsumerProtectionTip": "none：不保護歷史；fixed-start：固定保護初始位點並續租，不代表下游持久化確認。要求表已持久化 consumer.expiration-time，且至少為 10 分鐘。",
       "stopTimeoutSeconds": "STOP 總超時（秒）",
       "finalCompactionTimeoutSeconds": "最終 Compaction 超時（秒）",
       "compactionCancelGraceSeconds": "Compaction 取消寬限（秒）",
