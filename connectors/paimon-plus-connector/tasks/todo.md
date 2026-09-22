@@ -1,11 +1,11 @@
 # 任务清单：Paimon StreamRead 连接器内重构
 
-> 2026-09-22；状态：已开始本地实施，任务按实际证据更新。唯一执行状态来源为本文件。依据 [Plan](plan.md) 和 [Spec](../docs/specs/paimon-stream-read-connector-only-spec-v1.md)。本轮只编写并提交文档。
-> 下列文件路径均相对 `connectors/paimon-plus-connector/`；新增类名为规划，不是已存在文件。B/F/G 的完整命令见 Plan §4。每项在验证及审查后提交到 `codex/paimon-stream-read`，填写证据/提交，再勾选完成。
+> 2026-09-22；状态：已开始本地实施，任务按实际证据更新。唯一执行状态来源为本文件。依据 [Plan](plan.md) 和 [Spec](../docs/specs/paimon-stream-read-connector-only-spec-v1.md)。当前轮已获准实现与本地验证；真实 Engine 验证单独记录。
+> 下列文件路径均相对 `connectors/paimon-plus-connector/`；各任务中的“预计文件”为原规划，实际文件以 Git 提交和验证报告为准。B/F/G 的完整命令见 Plan §4。每项在验证及审查后提交到 `codex/paimon-stream-read`，填写证据/提交，再勾选完成。
 
 ## S01：建立基线并核验平台入口
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**先记录依赖、现有测试和部署契约，尽早验证正常 CDC/全量加增量的初始化入口及 Heartbeat 行为。
 
@@ -13,9 +13,9 @@
 
 **验收：**
 
-- [ ] 记录当前 HEAD、JDK、实际 Paimon/PDK 依赖及同环境完整基线；失败不隐藏。
-- [ ] 取得初始化入口、offset 往返和 Heartbeat 处理的真实环境证据；无环境写明 E01 阻塞与所缺条件。
-- [ ] 记录 D01/D02 的待决状态及实施边界，不将提交计划视为产品确认。
+- [x] 记录当前 HEAD、JDK、实际 Paimon/PDK 依赖及同环境完整基线；失败不隐藏。
+- [x] 取得初始化入口、offset 往返和 Heartbeat 处理的真实环境证据；无环境写明 E01 阻塞与所缺条件。
+- [x] 记录 D01/D02 的已确认状态及实施边界，不将提交计划视为产品确认。
 
 **验证：**G；检查 Surefire 报告；授权测试 Engine 上执行场景取证；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -82,9 +82,9 @@
 
 ### 检查点 C1：S03 之后
 
-- [ ] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
-- [ ] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
-- [ ] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
+- [x] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
+- [x] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
+- [x] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
 
 ## S04：绑定读取 schema 并检测变化
 
@@ -165,9 +165,9 @@
 
 ### 检查点 C2：S06 之后
 
-- [ ] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
-- [ ] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
-- [ ] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
+- [x] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
+- [x] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
+- [x] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
 
 ## S07：多表公平调度与无进展重派发
 
@@ -206,8 +206,8 @@
 **验收：**
 
 - [x] 取消与准入票据原子化；停止先取消 source，再等待 ingress，避免等待自身永久调用。
-- [ ] 满队列、半 plan、已准入回调、阻塞 reader 及关闭失败可复现；失败保留资源且不伪造完成。
-- [ ] 首错保留、关闭错 suppressed、started/ended 配对，既有有限读与写停止无新增失败。
+- [x] 满队列、半 plan、已准入回调、阻塞 reader 及关闭失败可复现；失败保留资源且不伪造完成。
+- [x] 首错保留、关闭错 suppressed、started/ended 配对，既有有限读与写停止无新增失败。
 
 **验证：**F PaimonStreamStopTest,PaimonServiceCloseTest,PaimonBoundedStopTest,PaimonFiniteReadLifecycleTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -232,7 +232,7 @@
 
 **验收：**
 
-- [x] 三项配置按 Spec 范围、枚举及草案默认值校验，非法值明确失败。
+- [x] 三项配置按 Spec 范围、枚举及已确认默认值校验，非法值明确失败。
 - [x] 现有三语言文案完整，位于源端高级配置，不混用写 commit interval。
 - [x] 拒绝源选项表级覆盖，不新增 TTL/legacy 猜测/线程数配置；D02 已由用户“完全基于 Spec 全新实现”确认。
 
@@ -368,7 +368,7 @@
 
 ## S14：验证表模式与恢复语义
 
-- [ ] 完成并本地提交。
+- [x] 完成并本地提交。
 
 **说明：**用 Paimon 1.3.2 实表验证 schema、RowKind、changelog、overwrite 的实际支持矩阵和恢复事件序列。
 
@@ -376,9 +376,9 @@
 
 **验收：**
 
-- [ ] 验证实际支持的 append/主键、none/input/lookup/full-compaction、overwrite 默认/显式组合，拒绝组合有清晰结果。
-- [ ] 历史过期、解耦合法/缺口、schema 改变、半 plan 重放均有逐事件/offset 断言。
-- [ ] RowKind 转换和 referenceTime 保持既有行为；不把状态同步描述成完整事务流，不把未测组合列为通过。
+- [x] 验证实际支持的 append/主键、none/input/lookup/full-compaction、overwrite 默认/显式组合，拒绝组合有清晰结果。
+- [x] 历史过期、解耦合法/缺口、schema 改变、半 plan 重放均有逐事件/offset 断言。
+- [x] RowKind 转换和 referenceTime 保持既有行为；不把状态同步描述成完整事务流，不把未测组合列为通过。
 
 **验证：**F PaimonStreamReadIntegrationTest,PaimonReadSchemaGuardIntegrationTest,PaimonReadPositionIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
@@ -390,7 +390,7 @@
 
 **规模：**M，3 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**PaimonStreamReadIntegrationTest 6 项覆盖多个配置组合；解耦真实历史与缺失恢复、none 不改已存在 Consumer、四种 producer、overwrite、半 plan 重放全部通过。完整模块 full-regression.log：789 项，0 失败/错误/跳过。详见 docs/validation/stream-read-table-matrix.md。
 
 ## S15：验证真实 Engine 故障恢复
 
@@ -416,7 +416,7 @@
 
 **规模：**M，3 个文件。
 
-**证据与本地提交：**待执行。
+**证据与本地提交：**未执行；没有实际测试 Engine/目标任务。源码检查不等于真实故障恢复。验收步骤和缺失证据见 docs/validation/stream-read-recovery-results.md。
 
 ### 检查点 C5：S15 之后
 
@@ -430,7 +430,7 @@
 
 **说明：**核对 Spec 全部验收项、测试结果、来源注释和提交范围，整理最终本地交付证据。
 
-**依赖：**S15；全部检查点通过。
+**依赖：**本地实现与本地检查点；S15 作为发布验证门槛保持独立未完成，见 Plan §7。
 
 **验收：**
 
@@ -463,8 +463,8 @@
 | 项目 | 状态 | 证据 |
 |---|---|---|
 | Spec/Review | 已本地提交 | d6c62884；固定 Paimon 1.3 源码审查。 |
-| Plan/Todo | 本轮编写 | 提交后以本分支 docs 提交及最终交付消息为准。 |
-| Java 实现/测试 | 未开始 | 本轮没有执行 B/F/G 或 Engine 验证。 |
+| Plan/Todo | 已本地提交并持续更新 | 初始计划 b10f0150；后续每单元更新证据。 |
+| Java 实现/测试 | 实现与定向测试已完成；完整回归执行中 | 见 docs/validation/stream-read-delivery.md；Engine 未验证。 |
 | D01 旧位点迁移 | 已明确方向 | 用户要求按 Spec 全新实现、不保留旧实现；拒绝歧义旧格式。 |
 | D02 Consumer 默认值 | 按 Spec 实施 | none 默认；fixed-start 显式开启。 |
 | E01 平台适配 | 未验证 | S01/S15 记录实际 Engine/PDK/目标组合。 |
