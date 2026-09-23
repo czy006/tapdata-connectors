@@ -21,6 +21,26 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class PaimonSpecTest {
 
     @Test
+    void sourceReadOptionsHaveBoundedDefaultsAndThreeLocales() throws Exception {
+        JsonObject spec = loadSpec();
+        JsonObject fields = spec.getAsJsonObject("configOptions").getAsJsonObject("node").getAsJsonObject("properties");
+        for (String key : Arrays.asList("streamReadPollIntervalMs", "streamReadFlushIntervalMs", "streamReadConsumerProtection")) {
+            JsonObject field = fields.getAsJsonObject(key);
+            assertFalse(field.has("x-perTable"));
+            if (!key.endsWith("Protection")) {
+                assertEquals(1000, field.get("default").getAsInt());
+                assertEquals(100, field.getAsJsonObject("x-component-props").get("min").getAsInt());
+                assertEquals(60000, field.getAsJsonObject("x-component-props").get("max").getAsInt());
+            } else { assertEquals("none", field.get("default").getAsString()); }
+            for (String locale : Arrays.asList("en_US", "zh_CN", "zh_TW")) {
+                JsonObject messages = spec.getAsJsonObject("messages").getAsJsonObject(locale);
+                assertTrue(messages.get(key).getAsString().length() > 0);
+                assertTrue(messages.get(key + "Tip").getAsString().length() > 0);
+            }
+        }
+    }
+
+    @Test
     void spillSwitchMustDescribeNativeWriteBufferScopeInEveryLocale() throws Exception {
         JsonObject spec = loadSpec();
         JsonObject field = spec.getAsJsonObject("configOptions").getAsJsonObject("node")

@@ -1,58 +1,481 @@
-# 任务完成记录：Paimon Spill V1.2
+# 任务清单：Paimon StreamRead 连接器内重构
 
-> 日期：2026-09-07。本清单是 [plan.md](plan.md) 的实际落点；[Spec §14–15](../src/doc/specs/SPEC-paimon-spill-sync-graceful-stop.md) 保存源码和测试映射。代码尚未提交。
+> 2026-09-22；状态：本地实现与测试已完成；S15 真实 Engine 验证未完成。唯一执行状态来源为本文件。依据 [Plan](plan.md) 和 [Spec](../docs/specs/paimon-stream-read-connector-only-spec-v1.md)。当前轮已获准实现与本地验证；真实 Engine 验证单独记录。
+> 下列文件路径均相对 `connectors/paimon-plus-connector/`；各任务中的“预计文件”为原规划，实际文件以 Git 提交和验证报告为准。B/F/G 的完整命令见 Plan §4。每项在验证及审查后提交到 `codex/paimon-stream-read`，填写证据/提交，再勾选完成。
 
-以下 T01–T17 已实现并有回归覆盖。T14 在实施时补充策略内部的 assigner/bootstrap reader 强引用和 snapshot 准入，作为独立子步骤顺序完成；未改变 bucket 路由语义。测试类集中到已有领域测试与四个新测试类，没有为每一设计概念另建重复测试文件。
+## S01：建立基线并核验平台入口
 
-| 状态 | 任务 | 完成内容 | 实际源码/测试产物 | 验证（类名前缀 Paimon） |
-| --- | --- | --- | --- | --- |
-| [x] | T01 | 统一停止控制器 | service/PaimonStopController.java | StopControllerTest、ServiceCloseTest |
-| [x] | T02 | 参数化总/最终/宽限预算 | config/PaimonConfig.java；resources/spec.json | ConfigTest、SpecTest、StopControllerTest |
-| [x] | T03 | 未实际退场任务登记 | write/PaimonCompactionExecutor.java | CompactionExecutorTest |
-| [x] | T04 | 私有取消/拒绝展开原生 prepare | write/PaimonCompactionExecutor.java | CompactionExecutorTest、CompactionSpillLifecycleIntegrationTest |
-| [x] | T05 | 最终提交与取消单胜者 | StopController；TableWriteContext | StopControllerTest、BoundedStopTest |
-| [x] | T06 | 强资源账本与半构造占位 | service/PaimonStopResources.java | StopControllerTest、BoundedStopTest |
-| [x] | T07 | 六个有限读入口准入 | service/PaimonService.java | FiniteReadLifecycleTest、ServiceLifecycleTest |
-| [x] | T08 | reader/batch 关闭证明 | service/PaimonGuardedReader.java | FiniteReadLifecycleTest |
-| [x] | T09 | 共享有界日志分发 | service/PaimonStopLog.java | BoundedStopTest |
-| [x] | T10 | Service/Connector 终态日志接线 | PaimonConnector；PaimonService | ServiceCloseTest、BoundedStopTest |
-| [x] | T11 | 业务/重试/KVMap/callback 准入与发布 | Service、CommitStateStore、MicroBatchCoordinator | BoundedStopTest、TableWriteContextTest、MicroBatchCommitTest |
-| [x] | T12 | 明确目录保护释放结果 | util/PaimonSpillDirCleaner.java | SpillDirCleanerTest、DynamicBucketPreflightCleanupTest |
-| [x] | T13 | 按真实终止证明分步清理 | TableWriteContext、CompactionLifecycle、NativeWriteAccess | CompactionLifecycleTest、FinalCompactionTest、BoundedStopTest |
-| [x] | T14 | Factory/preflight/DDL 与内部 bucket 资源 | TableWriteContextFactory、DynamicBucketPreflight、Service；Abstract/KeyDynamic/HashDynamic 策略及 StrategyContext | TableWriteContextFactoryTest、DynamicBucketPreflightCleanupTest、各 bucket 策略测试 |
-| [x] | T15 | 生产有界 STOP 接线 | service/PaimonService.java | BoundedStopTest、ServiceCloseTest、StopControllerTest |
-| [x] | T16 | 真实内核和生产 DDL 集成 | CompactionSpillLifecycleIntegrationTest；FutureInhouseDateFixture | 真实 MergeTree/Append；原始 ASYNC 拒绝、SYNC 写读和 HASH_DYNAMIC Spill 取消 |
-| [x] | T17 | GC、同 JVM/跨 JVM 目录与恢复 | StopControllerTest、SpillDirCleanerProcessIntegrationTest | 静态强达、OS owner lock、实际进程死亡后清理、稳定 commit identity |
+- [x] 完成并本地提交。
 
-- [x] T18：完整 clean package、测试报告核计、独立源码复核、文档前后一致、diff 与暂存范围核查。
+**说明：**先记录依赖、现有测试和部署契约，尽早验证正常 CDC/全量加增量的初始化入口及 Heartbeat 行为。
 
-## 验证账本
+**依赖：**无。
 
-最终完整构建通过：2026-09-07 14:54:44 +08:00，JDK 17、Maven 离线 `clean package`，5 个 reactor 项目成功；paimon-plus-connector surefire XML 共 **62 个测试类、677 项，0 failures、0 errors、0 skipped**。耗时 2 分 10 秒。日志 `/tmp/paimon-v12-full-delivery.log`，报告 `connectors/paimon-plus-connector/target/surefire-reports`。
+**验收：**
 
-定向开发记录（仅作故障定位历史，不与全量重复相加）：
+- [x] 记录当前 HEAD、JDK、实际 Paimon/PDK 依赖及同环境完整基线；失败不隐藏。
+- [x] 取得初始化入口、offset 往返和 Heartbeat 处理的真实环境证据；无环境写明 E01 阻塞与所缺条件。
+- [x] 记录 D01/D02 的已确认状态及实施边界，不将提交计划视为产品确认。
 
-- `/tmp/paimon-v12-races2.log`：18 个 executor 用例 + 12 个有界 STOP 用例，30 项通过。其后追加“已移交 Worker 尚未进入 Callable”用例，纳入最终完整构建。
-- `/tmp/paimon-v12-production-spill2.log`：真实原生/生产 DDL Spill 6 项通过。
-- `/tmp/paimon-v12-production-ddl.log`：生产 DDL 写读与 ASYNC 拒绝所在动态桶类 25 项通过；同次的 Spill fixture 文件数假设失败，按固定内核 FullCompactTrigger 的初次合并语义修正，不能把该次整轮写成成功。
-- `/tmp/paimon-v12-full-final.log`：首次完整 clean package 676 项通过（尚不含最后追加的 dequeued 窗口用例）。最终结果以下次全量为准。
+**验证：**G；检查 Surefire 报告；授权测试 Engine 上执行场景取证；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
 
-B01–B22 的真实类/方法定位见 Spec §14，不再沿用原计划的拟建类名。资源故障采用有界 latch 与 fake nano clock；真实子进程在 finally 退出并等待，不用目录删除代替终止证明。
+**预计文件：**
 
-## 最终审查与边界
+- `docs/validation/stream-read-baseline.md`
+- `docs/validation/stream-read-engine-contract.md`
+- `src/test/scripts/stream-read-engine-probe.sh`
 
-- [x] 独立生产源码复核：此前 Critical/Required 全部关闭，最终未发现确定性 Critical/Required。
-- [x] 关键内核适配代码含固定 Paimon 1.3.2 引用。PS16–PS18 三文件：本地源码、对应 source JAR、官方固定 commit raw 内容逐字节一致。
-- [x] 用户生产 DDL 的 ASYNC 冲突已明确；本轮不自动修改生产表。
-- [x] 精确 pending envelope 只在内存；持久化仍是稳定 commitUser/nextIdentifier 和 Snapshot 对账，不提升跨进程 offset 承诺。
-- [x] FAILED_RETAINED 不设 TTL/reaper，可能占用内存、磁盘和文件锁直至旧进程退出；不构成 B Engine 可接管的证明。
-- [x] 实际 S3/MinIO、生产规模数据、Engine 调度、跨机器 fencing、StreamRead 重写保持未验证/不在本轮实现范围；本地测试不冒充生产验收。
-- [x] 最终文档与完整测试报告、Git diff 检查一致；保留预先 staged 的 StreamRead Spec，未提交或推送。
+**规模：**M，3 个文件。
 
-## 审查修正补充（2026-09-07）
+**证据与本地提交：**本地基线通过，见 docs/validation/stream-read-baseline.md；Engine 源码已核对，真实环境部分保持待验证。
 
-已完成：逐行重复 gate 移除、worker 中断恢复、suppressed identity 去重、canonical 清理根、裸 rocksdb 负例与缩进统一；同时完成 INFO 契约、专用超时原因、有限读双重异常修正。实际方案、源码证据和测试映射统一见 [Spec §16](../src/doc/specs/SPEC-paimon-spill-sync-graceful-stop.md#16-审查缺口修复2026-09-07)。
+## S02：严格 v1 offset 编解码
 
-最新完整验证替代上文旧轮次成绩：2026-09-07 16:34:37 +08:00，clean package，5 个 reactor 项目成功，模块 62 类 / 688 项，0 失败、0 错误、0 跳过；日志 `/tmp/paimon-review-fixes-full.log`。本地未提交/推送；预先暂存的 StreamRead Spec 保持不变。
+- [x] 完成并本地提交。
 
-- [x] 本轮独立增量审查完成；两项初始疑点经基线与可达性反证撤回，最终未发现确定性 Critical/Required 回归。
+**说明：**实现不可变 v1 envelope 与 PDK 编解码往返，建立恢复时无需 +1 的明确协议。
+
+**依赖：**S01。
+
+**验收：**
+
+- [x] 合法 offset 往返保留 readEpoch/start/next/额外表条目，回调深复制不受后续修改影响。
+- [x] 未知字段/版本、歧义旧格式、null/溢出/start>next、缺表和来源不符明确失败；迁移开关不自行扩展。
+- [x] 用实际 PDK 编解码验证普通 Map/string 兼容，不只测 JSON。
+
+**验证：**F PaimonReadOffsetTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonReadOffset.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonReadOffsetTest.java`
+
+**规模：**S，2 个文件。
+
+**证据与本地提交：**PaimonReadOffsetTest：5 项通过；实际 PDK V2 编解码往返、深复制、歧义/溢出拒绝、位置绑定验证；offset.log。
+
+## S03：解析共同时间点及历史范围
+
+- [x] 完成并本地提交。
+
+**说明：**实现统一 T 对应的时间位点解析与 snapshot/changelog 请求点验证，供初始化和恢复复用。
+
+**依赖：**S02。
+
+**验收：**
+
+- [x] 同毫秒取最高符合 id，提交时钟回拨不依赖二分假设；null 在入口捕获的同一 T 可贯穿全部表。
+- [x] 空表=1、latest+1 等待；联合历史过期/中间缺口/超大位点/未来与负时间按 Spec 失败，不钳制。
+- [x] 并发可见性重试不跳号，冻结上界、有限元数据缓存及取消可测试，实表记录事件与起点。
+
+**验证：**F PaimonReadPositionResolverTest,PaimonReadPositionIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonReadPositionResolver.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonReadPositionResolverTest.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonReadPositionIntegrationTest.java`
+
+**规模：**M，3 个文件。
+
+**证据与本地提交：**Resolver 5 项 + Paimon 1.3.2 实表 1 项通过；position.log。真实 restore(2) 只读取第 2 次提交，checkpoint=3。
+
+### 检查点 C1：S03 之后
+
+- [x] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
+- [x] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
+- [x] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
+
+## S04：绑定读取 schema 并检测变化
+
+- [x] 完成并本地提交。
+
+**说明：**加入持久化 schema 与计划 schema 的校验，保留原生历史投影，阻止新结构被旧映射静默读取。
+
+**依赖：**S03。
+
+**验收：**
+
+- [x] 初始化核验 TapTable 与递归字段 id/name/type/nullability/顺序、主键、分区键和读取语义。
+- [x] 运行中不兼容新 plan 在第一条入队前失败；只改注释继续，计划类型或元数据不可核验时不放行。
+- [x] 历史 schemaId<=初始 B 的加列/改名由真实 Paimon 投影验证，不能一概拒绝旧文件。
+
+**验证：**F PaimonReadSchemaGuardIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonReadSchemaGuard.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonReadSchemaGuardIntegrationTest.java`
+
+**规模：**S，2 个文件。
+
+**证据与本地提交：**PaimonReadSchemaGuardIntegrationTest：2 项真实 Paimon 测试通过；schema.log。注释兼容、加列失败、历史改名投影及 TapTable 类型不符。
+
+## S05：完整读取单表 plan
+
+- [x] 完成并本地提交。
+
+**说明：**在 Coordinator 中实现一次计划读取及 EventItem/PlanFinished 结果边界，先以单表测试驱动，不接生产入口。
+
+**依赖：**S04。
+
+**验收：**
+
+- [x] 直接 restore(next)，串行 checkpoint/plan/checkpoint；schema/range 检查位于事件入队前。
+- [x] 全部 split/iterator/reader 成功才生成标记；转换、关闭、取消或队列错误不生成。
+- [x] 真实多 split/多 batch、零 split 有进展与无进展区分，reader 复用现有受控资源工具。
+
+**验证：**F PaimonStreamPlanIntegrationTest,PaimonStreamPlanFailureTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonStreamReadCoordinator.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamPlanIntegrationTest.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamPlanFailureTest.java`
+
+**规模：**M，3 个文件。
+
+**证据与本地提交：**PlanFailure 5 项 + PlanIntegration 1 项通过；plan-read.log。读取/转换/关闭/取消无错误完成标记，实表事件先于 next=2 标记。
+
+## S06：按 plan 边界交付候选位点
+
+- [x] 完成并本地提交。
+
+**说明：**实现 Session 的单一交付循环，以 fake PDK consumer 验证数据序列、候选 offset、刷新与心跳。
+
+**依赖：**S05。
+
+**验收：**
+
+- [x] plan 未完整交付前只携带旧 next；完成标记仅推进对应表，事件/Map 不复用修改。
+- [x] 精确 batch 边界及零业务事件进展发合法 Heartbeat，不发空列表；低流量按可控时钟刷新。
+- [x] 回调抛错立即终止；单表真实 Paimon 到 PDK 测试回调贯通，返回不被当 durable ack。
+
+**验证：**F PaimonStreamDeliveryTest,PaimonStreamReadIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonStreamReadSession.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamDeliveryTest.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamReadIntegrationTest.java`
+
+**规模：**M，3 个文件。
+
+**证据与本地提交：**Delivery 6 项通过；delivery.log。旧/新 offset 批次边界、Heartbeat、低流量刷新、失败/取消及准入票据。真实端到端 Session 接线在 S10 补测。
+
+### 检查点 C2：S06 之后
+
+- [x] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
+- [x] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
+- [x] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
+
+## S07：多表公平调度与无进展重派发
+
+- [x] 完成并本地提交。
+
+**说明：**为 Coordinator 接入有界 worker 调度和完成 mailbox，消除永久循环与空表 outstanding 泄漏。
+
+**依赖：**S06。
+
+**验收：**
+
+- [x] worker=1/三表均读取；单表同时一个 outstanding，scheduler 不执行 I/O，不无限提交。
+- [x] NoProgress/Delivered 串行释放一次；空表随后写入、read delay、旧 token、拒绝提交均有明确状态。
+- [x] 队列背压可取消；连续空提交与阻塞 plan 记录原生长调用边界，不虚构绝对公平。
+
+**验证：**F PaimonStreamReadCoordinatorTest,PaimonStreamReadIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonStreamReadCoordinator.java`
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonStreamReadSession.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamReadCoordinatorTest.java`
+
+**规模：**M，3 个文件。
+
+**证据与本地提交：**Coordinator 4 项 + Delivery 6 项 + PlanFailure 6 项通过；coordinator.log。单 worker 三表、无进展重派发、取消拒绝入队、原生阻塞超时保留。
+
+## S08：接入现有停止与资源所有权
+
+- [x] 完成并本地提交。
+
+**说明：**在本模块 Service 增加源会话登记和取消接缝，复用已有控制器/资源账本，先用受控注入验证。
+
+**依赖：**S07。
+
+**验收：**
+
+- [x] 取消与准入票据原子化；停止先取消 source，再等待 ingress，避免等待自身永久调用。
+- [x] 满队列、半 plan、已准入回调、阻塞 reader 及关闭失败可复现；失败保留资源且不伪造完成。
+- [x] 首错保留、关闭错 suppressed、started/ended 配对，既有有限读与写停止无新增失败。
+
+**验证：**F PaimonStreamStopTest,PaimonServiceCloseTest,PaimonBoundedStopTest,PaimonFiniteReadLifecycleTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/service/PaimonService.java`
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonStreamReadSession.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamStopTest.java`
+- `src/test/java/io/tapdata/connector/paimon/service/PaimonServiceCloseTest.java`
+
+**规模：**M，4 个文件。
+
+**证据与本地提交：**stop.log：61 项通过（新增源停止 2 项，原 Service/有限读/有界停止 59 项）。已验证先取消再等待 ingress、并发会话拒绝、超时保留 Catalog；正式入口生命周期配对与更多真实 reader 场景在 S10/S14 验证。
+
+## S09：新增源端配置校验
+
+- [x] 完成并本地提交。
+
+**说明：**添加轮询/刷新间隔及 Consumer 模式配置，保证 UI 与配置解析一致并拒绝表级误覆盖。
+
+**依赖：**S08。
+
+**验收：**
+
+- [x] 三项配置按 Spec 范围、枚举及已确认默认值校验，非法值明确失败。
+- [x] 现有三语言文案完整，位于源端高级配置，不混用写 commit interval。
+- [x] 拒绝源选项表级覆盖，不新增 TTL/legacy 猜测/线程数配置；D02 已由用户“完全基于 Spec 全新实现”确认。
+
+**验证：**F PaimonConfigTest,PaimonSpecTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/config/PaimonConfig.java`
+- `src/main/resources/spec.json`
+- `src/test/java/io/tapdata/connector/paimon/config/PaimonConfigTest.java`
+- `src/test/java/io/tapdata/connector/paimon/PaimonSpecTest.java`
+
+**规模：**M，4 个文件。
+
+**证据与本地提交：**config.log：Config 40 项和 Spec 11 项通过；配置范围、整数、枚举、表级覆盖及三语言默认值已验证。
+
+### 检查点 C3：S09 之后
+
+- [x] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
+- [x] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
+- [x] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
+
+## S10：切换 none 模式能力入口
+
+- [x] 完成并本地提交。
+
+**说明：**同时接通新版时间初始化与流读恢复，保持 PDK consumer 类型，替换旧循环并去掉隐式 +1。
+
+**依赖：**S09；D01/D02 确认；E01 启动路径证据。
+
+**验收：**
+
+- [x] 正常 capability 从初始化 envelope 到 next=N 恢复读取 N 全链路成立，不允许新旧协议入口混搭。
+- [x] 缺表/元数据失败整体失败；并发 invocation 拒绝；none 不写 Consumer、不启动续租、不依赖 stateMap。
+- [x] 保留 codec/RowKind/回调协议；未接通的 fixed-start 明确报错，不偷偷降为 none；本提交不作为完整发布。
+
+**验证：**F PaimonStreamCapabilityTest,PaimonStreamReadIntegrationTest,PaimonStreamStopTest,PaimonConnectorControlTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/PaimonConnector.java`
+- `src/main/java/io/tapdata/connector/paimon/service/PaimonService.java`
+- `src/test/java/io/tapdata/connector/paimon/PaimonStreamCapabilityTest.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamReadIntegrationTest.java`
+
+**规模：**M，4 个文件。
+
+**证据与本地提交：**entry.log：真实本地 Paimon 入口 2 项、源停止 2 项通过。空表初始化→写入→交付 next=2→恢复仅读下一提交；none 无 Consumer；回调失败传播且 ended 配对。fixed-start 在 S13 接通前明确拒绝。
+
+## S11：注册固定起点 Consumer
+
+- [x] 完成并本地提交。
+
+**说明：**独立实现基于 readEpoch/attempt/table 的固定 Consumer 注册与读回，验证真正写侧过期边界。
+
+**依赖：**S03；按顺序在 S10 后执行。
+
+**验收：**
+
+- [x] 恢复 next 增长但 Consumer 始终=start，attempt 文件不覆盖；不调用 notifyCheckpointComplete 推进。
+- [x] 持久化 TTL/起点范围严格核验，注册前后检查；snapshot/changelog 与 manifest/data 缺失保留原始错误。
+- [x] 独立 writer 的清理与注册交错可复现；失败部分注册文件不删除，不声称原子建立保护。
+
+**验证：**F PaimonConsumerLeaseIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonConsumerLease.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonConsumerLeaseIntegrationTest.java`
+
+**规模：**S，2 个文件。
+
+**证据与本地提交：**consumer.log：真实 Paimon Consumer 2 项通过；固定 start、attempt 隔离、丢失文件不重建、读取持久化 TTL、TTL 修改/缺失/过短拒绝。租约线程与入口仍待 S12/S13。
+
+## S12：实现注册超时和独立续租
+
+- [x] 完成并本地提交。
+
+**说明：**为租约添加初始化 deadline、无 I/O watchdog、有界续租执行和 sticky failure。
+
+**依赖：**S11。
+
+**验收：**
+
+- [x] 首次写/读回卡住也有 deadline；续租使用成功操作开始时间保守计算风险期限，迟到成功不复活。
+- [x] 同 Consumer 无并发重入、队列有界；业务背压不挡心跳、存储阻塞不挡 watchdog、重试不越期限。
+- [x] TTL 变化、读回不符、旧 mtime 删除与停租均有测试；正常/失败 stop 不删 Consumer。
+
+**验证：**F PaimonConsumerLeaseTest,PaimonConsumerLeaseIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonConsumerLease.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonConsumerLeaseTest.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonConsumerLeaseIntegrationTest.java`
+
+**规模：**M，3 个文件。
+
+**证据与本地提交：**lease.log：Lease 3 项和 Registration 2 项通过；独立续租、操作开始时间期限、阻塞首次注册的 watchdog、迟到成功不恢复、关闭超时与 3 次重试上限。
+
+### 检查点 C4：S12 之后
+
+- [x] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
+- [x] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
+- [x] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
+
+## S13：贯通全量至增量保护生命周期
+
+- [x] 完成并本地提交。
+
+**说明：**在时间初始化阶段注册租约，持续覆盖全量，streamRead 复用匹配会话并传播后台失败。
+
+**依赖：**S10、S12。
+
+**验收：**
+
+- [x] 所有请求表保护完成才返回初始化 offset，full 阶段仍续租；不同 Service 使用独立 attempt。
+- [x] 全量阶段 sticky failure 在后续源操作/回调与流读入口可见；不持有阻止 Service stop 的永久 ingress。
+- [x] 独立 writer 清理跨越原保留窗口，固定 start 仍可恢复；租约停止不删文件、不自动重新锚定。
+
+**验证：**F PaimonStreamProtectionIntegrationTest,PaimonFiniteReadLifecycleTest,PaimonStreamStopTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/main/java/io/tapdata/connector/paimon/service/PaimonService.java`
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonStreamReadSession.java`
+- `src/main/java/io/tapdata/connector/paimon/read/PaimonConsumerLease.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamProtectionIntegrationTest.java`
+
+**规模：**M，4 个文件。
+
+**证据与本地提交：**protected-entry.log 42 项通过；增加逐次 reader 健康检查及真实独立 writer 清理验证后 protection-retention.log 17 项通过（入口 5、有限读 12）。全量阶段持有租约、流读复用、停止保留文件；测试将本地 Consumer mtime 调旧后，由独立 writer 执行真实 TTL/历史清理，旧位点明确 out-of-log。
+
+## S14：验证表模式与恢复语义
+
+- [x] 完成并本地提交。
+
+**说明：**用 Paimon 1.3.2 实表验证 schema、RowKind、changelog、overwrite 的实际支持矩阵和恢复事件序列。
+
+**依赖：**S13。
+
+**验收：**
+
+- [x] 验证实际支持的 append/主键、none/input/lookup/full-compaction、overwrite 默认/显式组合，拒绝组合有清晰结果。
+- [x] 历史过期、解耦合法/缺口、schema 改变、半 plan 重放均有逐事件/offset 断言。
+- [x] RowKind 转换和 referenceTime 保持既有行为；不把状态同步描述成完整事务流，不把未测组合列为通过。
+
+**验证：**F PaimonStreamReadIntegrationTest,PaimonReadSchemaGuardIntegrationTest,PaimonReadPositionIntegrationTest；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonStreamReadIntegrationTest.java`
+- `src/test/java/io/tapdata/connector/paimon/read/PaimonReadSchemaGuardIntegrationTest.java`
+- `docs/validation/stream-read-table-matrix.md`
+
+**规模：**M，3 个文件。
+
+**证据与本地提交：**PaimonStreamReadIntegrationTest 6 项覆盖多个配置组合；解耦真实历史与缺失恢复、none 不改已存在 Consumer、四种 producer、overwrite、半 plan 重放全部通过。完整模块 full-regression.log：789 项，0 失败/错误/跳过。详见 docs/validation/stream-read-table-matrix.md。
+
+## S15：验证真实 Engine 故障恢复
+
+- [ ] 完成并本地提交。
+
+**说明：**在不修改内核的前提下，执行源/目标真实链路的进程退出、心跳与旧 attempt 退出场景。
+
+**依赖：**S14；授权测试环境可用。
+
+**验收：**
+
+- [ ] 覆盖 plan 中途、回调后目标未完成、目标完成但 offset 未保存、保存后重启，允许重复但不能有连接器引入的缺口。
+- [ ] 普通/异步目标/多目标的 Heartbeat 不越过 DML，正常与全量+增量恢复入口成立，旧 attempt 无迟到有效交付。
+- [x] 结果区分本地测试与平台事实；不适配组合明确限制，缺环境保持未完成，打包如需改变先按 Plan §4 单独提交。
+
+**验证：**按脚本说明执行真实 Engine 矩阵；回读持久化 offset 与目标事件，记录版本与日志；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `src/test/scripts/stream-read-engine-probe.sh`
+- `docs/validation/stream-read-engine-contract.md`
+- `docs/validation/stream-read-recovery-results.md`
+
+**规模：**M，3 个文件。
+
+**证据与本地提交：**未执行；没有实际测试 Engine/目标任务。源码检查不等于真实故障恢复。验收步骤和缺失证据见 docs/validation/stream-read-recovery-results.md。
+
+### 检查点 C5：S15 之后
+
+- [ ] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
+- [x] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
+- [x] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
+
+## S16：最终回归与提交账本复核
+
+- [x] 完成并本地提交。
+
+**说明：**核对 Spec 全部验收项、测试结果、来源注释和提交范围，整理最终本地交付证据。
+
+**依赖：**本地实现与本地检查点；S15 作为发布验证门槛保持独立未完成，见 Plan §7。
+
+**验收：**
+
+- [x] 本模块完整回归通过，或对既有失败提供同环境证据与明确处理结论；新增测试不得失败或意外跳过。
+- [x] 逐项闭环 Spec 与审查 R1–R8/两项接缝，源码引用完整，D01/D02 和平台支持范围已记录。
+- [x] 实现单元均有本地 commit，变更只在模块，工作树干净；未验证边界明确，不 push/merge。
+
+**验证：**G；git diff --check；git log 与 baseline..HEAD 文件范围核对；首次/必要构建使用 B；人工复核事件/位点证据及来源注释。
+
+**预计文件：**
+
+- `docs/validation/stream-read-delivery.md`
+- `docs/specs/paimon-stream-read-connector-only-spec-v1.md`
+- `docs/specs/paimon-stream-read-connector-only-review-v1.md`
+- `tasks/plan.md`
+- `tasks/todo.md`
+
+**规模：**M，5 个文件。
+
+**证据与本地提交：**full-regression.log 与 82 份 Surefire XML 一致：789 项，0 失败/错误/跳过；独立最终源码复核无未处理明确缺陷；范围和提交账本见 docs/validation/stream-read-delivery.md。
+
+### 检查点 C6：S16 之后
+
+- [x] 本阶段任务的定向测试及相关回归通过，核验真实报告、无新增失败。
+- [x] 依赖、状态所有权与 Spec 保证一致，未引入模块外修改或未授权策略。
+- [x] 所有已完成单元已审查并本地提交，记录尚未关闭的决策/平台验证门槛；不自动开始受阻任务。
+
+## 提交与验证账本
+
+| 项目 | 状态 | 证据 |
+|---|---|---|
+| Spec/Review | 已本地提交 | d6c62884；固定 Paimon 1.3 源码审查。 |
+| Plan/Todo | 已本地提交并持续更新 | 初始计划 b10f0150；后续每单元更新证据。 |
+| Java 实现/测试 | 本地完成，789 项全通过 | 见 docs/validation/stream-read-delivery.md；Engine 未验证。 |
+| D01 旧位点迁移 | 已明确方向 | 用户要求按 Spec 全新实现、不保留旧实现；拒绝歧义旧格式。 |
+| D02 Consumer 默认值 | 按 Spec 实施 | none 默认；fixed-start 显式开启。 |
+| E01 平台适配 | 未验证 | S01/S15 记录实际 Engine/PDK/目标组合。 |
+
+## R01：MySQL 类型与性能复审（2026-09-22）
+
+- [x] 沿 Paimon 1.3 → PDK → MySQL codec/JDBC recorder 核实类型，不将直接 Java 值测试当作下游兼容性结论。
+- [x] 修复原生复杂类型访问器、参数化类型映射、嵌套 JSON 重复编码、无时区时间墙钟漂移；补标量、二进制、空值、复杂结构与 JVM 时区测试。
+- [x] 完整回归 806 项通过；后续新增边界断言采用定向回归，分别保留报告。
+- [x] 保存可重复的解码/真实本地读取 benchmark 与原始数据，记录窄行 CPU 回退及 JSON 往返成本。
+- [ ] MySQL 纳秒时间、scale > 30 Decimal、超范围日期的处理策略尚待用户明确。
+- [ ] S15 增补真实 Engine→MySQL 的 LTZ/session 时区、复杂数组 null、字符集、DDL 和容量验收。
+
+证据：[MySQL 类型与性能审查](../docs/validation/stream-read-mysql-type-review.md)。本轮功能修复与性能证据分别提交到现有分支；不推送。

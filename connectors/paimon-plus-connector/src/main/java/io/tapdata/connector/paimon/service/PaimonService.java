@@ -1,5 +1,9 @@
 package io.tapdata.connector.paimon.service;
 
+import io.tapdata.connector.paimon.read.PaimonSourceRowDecoder;
+import io.tapdata.connector.paimon.read.PaimonStreamReadService;
+import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
+
 import io.tapdata.connector.paimon.util.PaimonFailures;
 import io.tapdata.connector.paimon.config.PaimonExpireMode;
 import io.tapdata.connector.paimon.write.PaimonNativeCommitterClose;
@@ -44,7 +48,6 @@ import io.tapdata.pdk.apis.entity.WriteListResult;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.*;
 import org.apache.paimon.data.*;
 import org.apache.paimon.options.Options;
@@ -58,16 +61,12 @@ import org.apache.paimon.table.source.*;
 import org.apache.paimon.table.source.TableScan.Plan;
 import org.apache.paimon.types.*;
 import org.apache.paimon.utils.Pair;
-import org.apache.paimon.utils.SnapshotManager;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.time.LocalDate;
-import java.time.LocalTime;
-import java.time.ZoneOffset;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -112,12 +111,6 @@ public class PaimonService implements AutoCloseable {
     private static final ThreadGroup CLOSE_WORKER_THREAD_GROUP = createCloseWorkerThreadGroup();
     /** batch read 消费线程从事件队列拉取事件的超时。 */
     private static final int BATCH_READ_EVENT_POLL_TIMEOUT_MILLIS = 100;
-    /** stream read 无新数据时的回退等待。 */
-    private static final int STREAM_READ_IDLE_WAIT_MILLIS = 1000;
-    /** stream read 完成监控循环的检查间隔。 */
-    private static final int STREAM_READ_MONITOR_INTERVAL_MILLIS = 1000;
-    /** stream read 执行器关闭时的终止等待超时。 */
-    private static final int STREAM_READ_EXECUTOR_TERMINATION_TIMEOUT_SECONDS = 30;
     /** 查询未显式指定批大小时的默认值。 */
     private static final int DEFAULT_QUERY_BATCH_SIZE = 1000;
     /** Key 为表名，Value 表示该表写入时是否需要计算 {@link #HASH_KEY} 合成主键。 */
@@ -174,6 +167,7 @@ public class PaimonService implements AutoCloseable {
     private volatile PaimonStopController closeOperation;
     private final PaimonStopController stopController;
     private final PaimonStopResources stopResources = new PaimonStopResources();
+    private final PaimonStreamReadService streamReadService;
     private PaimonStopResources.Scope catalogScope;
     private final Object callbackExecutionLock = new Object();
     private final Object bindLock = new Object();
@@ -260,10 +254,23 @@ public class PaimonService implements AutoCloseable {
         this.log = log;
         this.config = config;
         config.validateStopBudgets();
+        config.validateStreamRead();
         this.stopController = new PaimonStopController(serviceWriterOwner,
                 config.getStopTimeoutSeconds(), config.getFinalCompactionTimeoutSeconds(),
                 config.getCompactionCancelGraceSeconds(), stopClock);
         this.stopController.attachResourceRoot(this);
+        this.streamReadService = new PaimonStreamReadService(config, new PaimonStreamReadService.Runtime() {
+            @Override public AutoCloseable enterIngress(String action) throws Exception {
+                return PaimonService.this.enterIngress(action);
+            }
+            @Override public Table loadTable(Identifier identifier) throws Exception {
+                return stopController.call("source catalog getTable", () -> catalog.getTable(identifier));
+            }
+            @Override public RecordReader<InternalRow> createReader(
+                    PaimonStopController.CheckedSupplier<RecordReader<InternalRow>> factory) throws Exception {
+                return createFiniteReader(factory);
+            }
+        }, stopController, stopResources, closeCoordinationLock);
         this.clock = Objects.requireNonNull(clock, "clock");
         this.retryWaiter = Objects.requireNonNull(retryWaiter, "retryWaiter");
         this.microBatchCoordinator = new PaimonMicroBatchCoordinator(
@@ -645,7 +652,10 @@ public class PaimonService implements AutoCloseable {
         List<DataField> fields = paimonTable.rowType().getFields();
         List<String> primaryKeys = paimonTable.primaryKeys();
         for (DataField field : fields) {
-            TapField tapField = new TapField(field.name(), field.type().asSQLString().replace("NOT NULL", "").trim());
+            // Only top-level nullability belongs in TapField.nullable. Preserve nested NOT NULL
+            // for stream schema binding (Paimon DataType.copy(boolean) / asSQLString).
+            // https://github.com/apache/paimon/blob/5c59e6cb01ed0b29563371f56e14fcade4597a2e/paimon-api/src/main/java/org/apache/paimon/types/DataType.java
+            TapField tapField = new TapField(field.name(), field.type().copy(true).asSQLString());
             tapField.setNullable(field.type().isNullable());
             if (primaryKeys.contains(field.name())) {
                 tapField.setPrimaryKey(true);
@@ -2419,425 +2429,24 @@ public class PaimonService implements AutoCloseable {
         }
     }
 
-    /**
-     * Convert timestamp to stream offset (snapshot IDs) for specified tables
-     *
-     * This method finds the snapshot ID that is earlier than or equal to the given timestamp
-     * for each table. The snapshot ID can be used to resume stream reading from that point.
-     *
-     * @param tables    list of table names to get offset for
-     * @param timestamp timestamp in milliseconds
-     * @param log       logger
-     * @return map of table name to snapshot ID
-     * @throws Exception if conversion fails
-     */
+    /** Delegates stream state to the read service while preserving the existing Connector entry points. */
     public Object timestampToStreamOffset(List<String> tables, Long timestamp, Log log) throws Exception {
-        try (PaimonServiceLifecycle.Ingress ignored = enterIngress("timestampToStreamOffset")) {
-            return timestampToStreamOffsetAdmitted(tables, timestamp, log);
-        }
+        return timestampToStreamOffset(tables, timestamp, log, () -> {});
     }
 
-    private Object timestampToStreamOffsetAdmitted(List<String> tables, Long timestamp, Log log) throws Exception {
-        log.info("Converting timestamp {} to stream offset for {} tables", timestamp, tables.size());
-
-        Map<String, Object> offsetMap = new HashMap<>();
-        String database = config.getDatabase();
-
-        // For each table, find the snapshot ID at or before the given timestamp
-        for (String tableName : tables) {
-            try {
-                Identifier identifier = Identifier.create(database, tableName);
-                Table paimonTable = stopController.call("catalog getTable", () -> catalog.getTable(identifier));
-
-                SnapshotManager snapshotManager = ((FileStoreTable) paimonTable).store().snapshotManager();
-
-                // Find snapshot at or before the given timestamp
-                Snapshot snapshot = stopController.call("lookup snapshot timestamp", () -> snapshotManager.earlierOrEqualTimeMills(timestamp));
-
-                if (snapshot != null) {
-                    long snapshotId = snapshot.id();
-                    offsetMap.put(tableName, snapshotId);
-                    log.info("Table {} - found snapshot {} at timestamp {}", tableName, snapshotId, snapshot.timeMillis());
-                } else {
-                    // No snapshot found at or before the timestamp, use null (will start from beginning)
-                    offsetMap.put(tableName, null);
-                    log.warn("Table {} - no snapshot found at or before timestamp {}, will start from beginning", tableName, timestamp);
-                }
-            } catch (Catalog.TableNotExistException e) {
-                log.warn("Table {} does not exist, skipping", tableName);
-            } catch (PaimonStopController.FrozenException frozen) { throw frozen;
-            } catch (Exception e) {
-                log.error("Error finding snapshot for table {}: {}", tableName, e.getMessage(), e);
-                // Put null to start from beginning for this table
-                offsetMap.put(tableName, null);
-            }
-        }
-
-        log.info("Timestamp to offset conversion result: {}", offsetMap);
-        return offsetMap;
+    public Object timestampToStreamOffset(List<String> tables, Long timestamp, Log log, Runnable threadContext) throws Exception {
+        return streamReadService.timestampToStreamOffset(tables, timestamp, threadContext);
     }
 
-    /**
-     * Stream read records from Paimon table (CDC mode)
-     *
-     * @param tables            list of tables to read from
-     * @param offsetState       offset state for resuming read
-     * @param eventBatchSize    batch size for events
-     * @param eventsOffsetConsumer consumer for events and offset
-     * @param connectorContext  connector context
-     * @throws Exception if read fails
-     */
     public void streamRead(List<String> tables, Object offsetState, int eventBatchSize,
-                           java.util.function.BiConsumer<List<io.tapdata.entity.event.TapEvent>, Object> eventsOffsetConsumer,
-                           TapConnectorContext connectorContext, Supplier<Boolean> running) throws Exception {
-        Log log = connectorContext.getLog();
-        log.info("Starting stream read from tables: {}", tables);
-
-        String database = config.getDatabase();
-
-        // Parse offset state - each table has its own snapshot ID
-        Map<String, Long> tableSnapshots = new HashMap<>();
-        if (offsetState instanceof Map) {
-            Map<String, Object> offsetMap = (Map<String, Object>) offsetState;
-            for (Map.Entry<String, Object> entry : offsetMap.entrySet()) {
-                if (entry.getValue() != null) {
-                    tableSnapshots.put(entry.getKey(), Long.parseLong(entry.getValue().toString()) + 1);
-                }
-            }
-            log.info("Resuming stream read from snapshots: {}", tableSnapshots);
-        } else if (offsetState == null) {
-            // First time stream read - start from AFTER latest snapshot to avoid reading historical data
-            log.info("No offset state found, initializing stream read from after latest snapshots");
-
-            // For each table, get the latest snapshot ID
-            for (String tableName : tables) {
-                try {
-                    Identifier identifier = Identifier.create(database, tableName);
-                    Table paimonTable = stopController.call("catalog getTable", () -> catalog.getTable(identifier));
-
-                SnapshotManager snapshotManager = ((FileStoreTable) paimonTable).store().snapshotManager();
-
-                // Get the latest snapshot
-                Snapshot latestSnapshot = snapshotManager.latestSnapshot();
-
-                if (latestSnapshot != null) {
-                    long snapshotId = latestSnapshot.id();
-                    // IMPORTANT: restore(snapshotId) will INCLUDE that snapshot's data
-                    // To start from AFTER the latest snapshot, we need to use snapshotId + 1
-                    // This way, only NEW data after current snapshot will be read
-                    long nextSnapshotId = snapshotId + 1;
-                    tableSnapshots.put(tableName, nextSnapshotId);
-                    log.info("Table {} - initialized to start AFTER latest snapshot {} (will start from snapshot {})",
-                            tableName, snapshotId, nextSnapshotId);
-                } else {
-                    // No snapshot exists yet, stream read will start from the first snapshot when it's created
-                    log.info("Table {} - no snapshots exist yet, will start from first snapshot", tableName);
-                    // Don't put anything in tableSnapshots, let it start naturally
-                }
-                } catch (Catalog.TableNotExistException e) {
-                    log.warn("Table {} does not exist, skipping", tableName);
-                } catch (Exception e) {
-                    log.error("Error getting latest snapshot for table {}: {}", tableName, e.getMessage(), e);
-                }
-            }
-
-            log.info("Initialized stream read to start after latest snapshots: {}", tableSnapshots);
-        }
-
-        // Initialize stream scans for all tables
-        Map<String, StreamTableScan> streamScans = new HashMap<>();
-        Map<String, TableRead> tableReads = new HashMap<>();
-        Map<String, List<DataField>> paimonFieldsMap = new HashMap<>();
-        Map<String, Map<String, TapField>> tapFieldsMap = new HashMap<>();
-
-        for (String tableName : tables) {
-            Identifier identifier = Identifier.create(database, tableName);
-
-            // Get Paimon table
-            Table paimonTable;
-            try {
-                paimonTable = stopController.call("catalog getTable", () -> catalog.getTable(identifier));
-            } catch (Catalog.TableNotExistException e) {
-                log.warn("Table {} does not exist, skipping stream read", tableName);
-                continue;
-            }
-
-            // Get TapTable definition
-            TapTable tapTable = connectorContext.getTableMap().get(tableName);
-            if (tapTable == null) {
-                log.warn("TapTable definition not found for table: {}, skipping", tableName);
-                continue;
-            }
-
-            // Create read builder
-            ReadBuilder readBuilder = paimonTable.newReadBuilder();
-
-            // Create stream scan
-            StreamTableScan streamScan = readBuilder.newStreamScan();
-
-            // Restore from offset if available
-            Long startSnapshotId = tableSnapshots.get(tableName);
-            if (startSnapshotId != null) {
-                streamScan.restore(startSnapshotId);
-                log.info("Restored table {} from snapshot: {}", tableName, startSnapshotId);
-            }
-
-            // Get field names and types for conversion
-            List<DataField> paimonFields = paimonTable.rowType().getFields();
-            Map<String, TapField> tapFields = tapTable.getNameFieldMap();
-
-            // Create table read
-            TableRead tableRead = readBuilder.newRead();
-
-            // Store in maps
-            streamScans.put(tableName, streamScan);
-            tableReads.put(tableName, tableRead);
-            paimonFieldsMap.put(tableName, paimonFields);
-            tapFieldsMap.put(tableName, tapFields);
-
-            log.info("Initialized stream scan for table: {}", tableName);
-        }
-
-        if (streamScans.isEmpty()) {
-            log.warn("No valid tables to stream read");
-            return;
-        }
-
-        log.info("Starting continuous stream read for {} tables with multi-threading", streamScans.size());
-
-        // Create thread pool for table scanning - one thread per table
-        int threadCount = Math.min(streamScans.size(), Runtime.getRuntime().availableProcessors());
-        ExecutorService executorService = new ThreadPoolExecutor(
-                threadCount,
-                threadCount,
-                60L,
-                TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(),
-                r -> {
-                    Thread t = new Thread(r);
-                    t.setName("Paimon-StreamRead-" + t.getId());
-                    t.setDaemon(true);
-                    return t;
-                }
-        );
-
-        AtomicReference<Throwable> threadException = new AtomicReference<>();
-        BlockingQueue<io.tapdata.entity.event.TapEvent> eventQueue = new LinkedBlockingQueue<>(eventBatchSize * 10);
-        Map<String, Long> currentOffsets = new ConcurrentHashMap<>();
-
-        // Initialize offsets
-        for (String tableName : streamScans.keySet()) {
-            Long snapshot = tableSnapshots.get(tableName);
-            if (snapshot != null) {
-                currentOffsets.put(tableName, snapshot);
-            }
-        }
-
-        // Start consumer thread to collect events and send to downstream
-        Thread consumerThread = new Thread(() -> {
-            List<io.tapdata.entity.event.TapEvent> batch = new ArrayList<>();
-            try {
-                while (running.get() || !eventQueue.isEmpty()) {
-                    io.tapdata.entity.event.TapEvent event = eventQueue.poll(BATCH_READ_EVENT_POLL_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
-                    if (event != null) {
-                        batch.add(event);
-
-                        // Send batch when size reached
-                        if (batch.size() >= eventBatchSize) {
-                            Map<String, Object> offsets = new HashMap<>(currentOffsets);
-                            eventsOffsetConsumer.accept(batch, offsets);
-                            batch = new ArrayList<>();
-                        }
-                    }
-
-                    // When stopping, send remaining batch even if not full
-                    // This ensures no data loss when running becomes false
-                    if (!running.get() && !batch.isEmpty()) {
-                        Map<String, Object> offsets = new HashMap<>(currentOffsets);
-                        eventsOffsetConsumer.accept(batch, offsets);
-                        batch = new ArrayList<>();
-                    }
-                }
-
-                // Send any remaining events (final safety check)
-                if (!batch.isEmpty()) {
-                    Map<String, Object> offsets = new HashMap<>(currentOffsets);
-                    eventsOffsetConsumer.accept(batch, offsets);
-                }
-            } catch (Exception e) {
-                log.error("Error in consumer thread: {}", e.getMessage(), e);
-                threadException.set(e);
-            }
-        });
-        consumerThread.setName("Paimon-StreamRead-Consumer");
-        consumerThread.setDaemon(true);
-        consumerThread.start();
-
-        // Submit scanning tasks for each table
-        for (String tableName : streamScans.keySet()) {
-            StreamTableScan streamScan = streamScans.get(tableName);
-            TableRead tableRead = tableReads.get(tableName);
-            List<DataField> paimonFields = paimonFieldsMap.get(tableName);
-            Map<String, TapField> tapFields = tapFieldsMap.get(tableName);
-
-            executorService.submit(() -> {
-                log.info("Started stream read thread for table: {}", tableName);
-                try {
-                    while (running.get()) {
-                        // Check for exceptions in other threads
-                        if (threadException.get() != null) {
-                            break;
-                        }
-
-                        // Plan next batch of splits
-                        Plan plan = streamScan.plan();
-                        List<Split> splits = plan.splits();
-
-                        if (splits.isEmpty()) {
-                            // No new data, update checkpoint and wait
-                            Long currentSnapshot = streamScan.checkpoint();
-                            currentOffsets.put(tableName, currentSnapshot);
-                            Thread.sleep(STREAM_READ_IDLE_WAIT_MILLIS);
-                            continue;
-                        }
-
-                        log.debug("Table {} has {} new splits to read", tableName, splits.size());
-
-                        // Read data from each split
-                        long totalRecords = 0;
-                        for (Split split : splits) {
-                            if (!running.get()) {
-                                break;
-                            }
-
-                            // Create record reader for this split
-                            RecordReader<InternalRow> reader = tableRead.createReader(split);
-
-                            try {
-                                // Read records from this split
-                                RecordReader.RecordIterator<InternalRow> iterator = reader.readBatch();
-
-                                while (iterator != null && running.get()) {
-                                    InternalRow row;
-                                    while ((row = iterator.next()) != null) {
-                                        // Convert InternalRow to Map
-                                        Map<String, Object> data = convertInternalRowToMap(row, paimonFields, tapFields);
-
-                                        // Determine event type based on RowKind
-                                        io.tapdata.entity.event.TapEvent event = createEventFromRowKind(row, data, tableName);
-
-                                        if (event != null) {
-                                            // Add to queue, block if queue is full
-                                            eventQueue.put(event);
-                                            totalRecords++;
-                                        }
-                                    }
-
-                                    // Release current batch
-                                    iterator.releaseBatch();
-
-                                    // Read next batch
-                                    iterator = reader.readBatch();
-                                }
-
-                            } finally {
-                                // Close reader
-                                try {
-                                    reader.close();
-                                } catch (Exception e) {
-                                    log.warn("Error closing reader for table {}: {}", tableName, e.getMessage());
-                                }
-                            }
-                        }
-
-                        // Save checkpoint for this table
-                        Long currentSnapshot = streamScan.checkpoint();
-                        currentOffsets.put(tableName, currentSnapshot);
-
-                        log.debug("Stream read batch completed for table: {}, records: {}", tableName, totalRecords);
-                    }
-                } catch (InterruptedException e) {
-                    log.warn("Stream read thread interrupted for table: {}", tableName);
-                    Thread.currentThread().interrupt();
-                } catch (Exception e) {
-                    log.error("Error in stream read thread for table {}: {}", tableName, e.getMessage(), e);
-                    threadException.set(e);
-                    return;
-                }
-                log.info("Stream read thread stopped for table: {}", tableName);
-            });
-        }
-
-        // Wait for threads to complete or exception to occur
-        try {
-            while (running.get()) {
-                if (threadException.get() != null) {
-                    throw new RuntimeException("Stream read failed", threadException.get());
-                }
-                Thread.sleep(STREAM_READ_MONITOR_INTERVAL_MILLIS);
-            }
-        } finally {
-            executorService.shutdown();
-            try {
-                if (!executorService.awaitTermination(STREAM_READ_EXECUTOR_TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                    executorService.shutdownNow();
-                }
-            } catch (InterruptedException e) {
-                executorService.shutdownNow();
-                Thread.currentThread().interrupt();
-            }
-
-            // Wait for consumer thread
-            try {
-                consumerThread.join(5000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-
-        log.info("Stream read completed for all tables");
+            StreamReadConsumer consumer, TapConnectorContext context, Supplier<Boolean> running) throws Exception {
+        streamReadService.streamRead(tables, offsetState, eventBatchSize, consumer, context, running);
     }
 
     /**
-     * Create TapEvent from InternalRow based on RowKind
-     *
-     * @param row       internal row
-     * @param data      converted data map
-     * @param tableName table name
-     * @return TapEvent (Insert, Update, or Delete)
-     */
-    private io.tapdata.entity.event.TapEvent createEventFromRowKind(InternalRow row, Map<String, Object> data, String tableName) {
-        RowKind rowKind = row.getRowKind();
-
-        switch (rowKind) {
-            case INSERT:
-            case UPDATE_AFTER:
-                // For INSERT and UPDATE_AFTER, create insert event
-                io.tapdata.entity.event.dml.TapInsertRecordEvent insertEvent =
-                        new io.tapdata.entity.event.dml.TapInsertRecordEvent().init();
-                insertEvent.setTableId(tableName);
-                insertEvent.setAfter(data);
-                insertEvent.setReferenceTime(System.currentTimeMillis());
-                return insertEvent;
-
-            case DELETE:
-            case UPDATE_BEFORE:
-                // For DELETE and UPDATE_BEFORE, create delete event
-                io.tapdata.entity.event.dml.TapDeleteRecordEvent deleteEvent =
-                        new io.tapdata.entity.event.dml.TapDeleteRecordEvent().init();
-                deleteEvent.setTableId(tableName);
-                deleteEvent.setBefore(data);
-                deleteEvent.setReferenceTime(System.currentTimeMillis());
-                return deleteEvent;
-
-            default:
-                // Unknown row kind, skip
-                return null;
-        }
-    }
-
-    /**
-     * Batch read records from Paimon table
+     * Full reads use a finite TableScan plan and share stream decoding and source codecs.
+     * This entry point does not consume the stream nextSnapshot offset or resume individual splits/rows.
+     * TapData coordinates the full-to-stream transition using the previously initialized stream offset.
      *
      * @param table             table definition
      * @param offsetState       offset state for resuming read (not used for now)
@@ -2884,8 +2493,7 @@ public class PaimonService implements AutoCloseable {
         log.info("Table {} has {} splits to read", tableName, splits.size());
 
         // Get field names and types for conversion
-        List<DataField> paimonFields = paimonTable.rowType().getFields();
-        Map<String, TapField> tapFields = table.getNameFieldMap();
+        PaimonSourceRowDecoder decoder = new PaimonSourceRowDecoder(paimonTable.rowType().getFields());
 
         // Read data from each split
         long totalRecords = 0;
@@ -2909,7 +2517,7 @@ public class PaimonService implements AutoCloseable {
                         }
 
                         // Convert InternalRow to Map
-                        Map<String, Object> data = convertInternalRowToMap(row, paimonFields, tapFields);
+                        Map<String, Object> data = decoder.decodeForEvent(row);
 
                         // Create TapInsertRecordEvent
                         io.tapdata.entity.event.dml.TapInsertRecordEvent event =
@@ -2943,112 +2551,6 @@ public class PaimonService implements AutoCloseable {
         }
 
         log.info("Batch read completed for table: {}, total records: {}", tableName, totalRecords);
-    }
-
-    /**
-     * Convert Paimon InternalRow to Map
-     *
-     * @param row          Paimon internal row
-     * @param paimonFields Paimon field definitions
-     * @param tapFields    TapData field definitions
-     * @return data map
-     */
-    private Map<String, Object> convertInternalRowToMap(InternalRow row, List<DataField> paimonFields,
-                                                         Map<String, TapField> tapFields) {
-        Map<String, Object> data = new LinkedHashMap<>();
-
-        for (int i = 0; i < paimonFields.size(); i++) {
-            DataField paimonField = paimonFields.get(i);
-            String fieldName = paimonField.name();
-            DataType dataType = paimonField.type();
-
-            // Check if field is null
-            if (row.isNullAt(i)) {
-                data.put(fieldName, null);
-                continue;
-            }
-
-            // Convert value based on data type
-            Object value = convertPaimonValueToJava(row, i, dataType);
-            data.put(fieldName, value);
-        }
-
-        return data;
-    }
-
-    /**
-     * Convert Paimon value to Java object
-     *
-     * @param row      internal row
-     * @param pos      field position
-     * @param dataType Paimon data type
-     * @return Java object
-     */
-    private Object convertPaimonValueToJava(InternalRow row, int pos, DataType dataType) {
-        String typeRoot = dataType.getTypeRoot().name();
-        switch (typeRoot) {
-            case "BOOLEAN":
-                return row.getBoolean(pos);
-            case "TINYINT":
-                return row.getByte(pos);
-            case "SMALLINT":
-                return row.getShort(pos);
-            case "INTEGER":
-                return row.getInt(pos);
-            case "BIGINT":
-                return row.getLong(pos);
-            case "FLOAT":
-                return row.getFloat(pos);
-            case "DOUBLE":
-                return row.getDouble(pos);
-            case "DECIMAL":
-                Decimal decimal;
-                if (dataType instanceof DecimalType) {
-                    decimal = row.getDecimal(pos, ((DecimalType) dataType).getPrecision(), ((DecimalType) dataType).getScale());
-                } else {
-                    Pair<Integer, Integer> fieldPrecisionAndScale = getFieldPrecisionAndScale(dataType.asSQLString());
-                    decimal = row.getDecimal(pos, fieldPrecisionAndScale.getLeft(), fieldPrecisionAndScale.getRight());
-                }
-                return decimal != null ? decimal.toBigDecimal() : null;
-            case "DATE":
-                int days = row.getInt(pos);
-                return new java.sql.Date(days * 86400000L);
-            case "TIMESTAMP_WITHOUT_TIME_ZONE": {
-                Timestamp timestamp;
-                if (dataType instanceof TimestampType) {
-                    timestamp = row.getTimestamp(pos, ((TimestampType) dataType).getPrecision());
-                } else {
-                    Integer fraction = getFieldFraction(dataType.asSQLString());
-                    timestamp = row.getTimestamp(pos, fraction);
-                }
-                if (timestamp != null) {
-                    return timestamp.toLocalDateTime();
-                }
-                return null;
-            }
-            case "TIMESTAMP_WITH_LOCAL_TIME_ZONE": {
-                Timestamp timestamp;
-                if (dataType instanceof TimestampType) {
-                    timestamp = row.getTimestamp(pos, ((TimestampType) dataType).getPrecision());
-                } else {
-                    Integer fraction = getFieldFraction(dataType.asSQLString());
-                    timestamp = row.getTimestamp(pos, fraction);
-                }
-                if (timestamp != null) {
-                    return timestamp.toLocalDateTime().atZone(ZoneOffset.UTC);
-                }
-                return null;
-            }
-            case "TIME_WITHOUT_TIME_ZONE":
-                return LocalTime.ofNanoOfDay(row.getInt(pos) * 1000_000L).atDate(LocalDate.ofYearDay(1970, 1));
-            case "BINARY":
-            case "VARBINARY":
-            case "BYTES":
-                return row.getBinary(pos);
-            default:
-                BinaryString binaryString = row.getString(pos);
-                return binaryString != null ? binaryString.toString() : null;
-        }
     }
 
     /**
@@ -3152,7 +2654,7 @@ public class PaimonService implements AutoCloseable {
         }
         TableScan.Plan plan = stopController.call("plan filtered scan", () -> readBuilder.newScan().plan());
         TableRead tableRead = readBuilder.newRead().executeFilter();
-        List<DataField> paimonFields = paimonTable.rowType().getFields();
+        PaimonSourceRowDecoder decoder = new PaimonSourceRowDecoder(paimonTable.rowType().getFields());
         List<Map<String, Object>> rows = new ArrayList<>();
         long count = 0;
 
@@ -3169,7 +2671,7 @@ public class PaimonService implements AutoCloseable {
                         }
                         count++;
                         if (!query.countQuery()) {
-                            rows.add(convertInternalRowToMap(row, paimonFields, Collections.emptyMap()));
+                            rows.add(decoder.decode(row));
                         }
                     }
                     iterator.releaseBatch();
@@ -3220,8 +2722,7 @@ public class PaimonService implements AutoCloseable {
         }
 
         // Get field names and types for conversion
-        List<DataField> paimonFields = paimonTable.rowType().getFields();
-        Map<String, TapField> tapFields = table.getNameFieldMap();
+        PaimonSourceRowDecoder decoder = new PaimonSourceRowDecoder(paimonTable.rowType().getFields());
 
         // Create read builder
         ReadBuilder readBuilder = paimonTable.newReadBuilder();
@@ -3273,7 +2774,7 @@ public class PaimonService implements AutoCloseable {
                         }
 
                         // Convert InternalRow to Map
-                        Map<String, Object> data = convertInternalRowToMap(row, paimonFields, tapFields);
+                        Map<String, Object> data = decoder.decode(row);
 
                         // Apply filter conditions
                         if (matchesFilter(data, filter)) {
@@ -3369,6 +2870,7 @@ public class PaimonService implements AutoCloseable {
             PaimonStopController operation = stopController;
             if (operation.isFinished()) { closeOperation = operation; return operation; }
             operation.start();
+            streamReadService.cancelActiveSession();
             Thread worker = new Thread(CLOSE_WORKER_THREAD_GROUP, () -> performClose(operation),
                     "paimon-service-close-" + serviceWriterOwner.substring(0, 8));
             worker.setDaemon(true);
@@ -3397,6 +2899,7 @@ public class PaimonService implements AutoCloseable {
             recordCloseFailure(operation, lifecycle.firstFailure());
             awaitSchedulerTermination(operation);
             awaitLifecycleQuiescence(operation);
+            streamReadService.closeSourceProtection(System.nanoTime() + operation.remainingNanos());
         } catch (Throwable shutdownFailure) {
             recordCloseFailure(operation, shutdownFailure);
             recordStickyFailure(shutdownFailure);
@@ -3654,6 +3157,9 @@ public class PaimonService implements AutoCloseable {
         if (stopController.isFinished() && stopController.failure() != null) { rethrow(stopController.failure()); }
         if (stopController.isStarted()) { throw new IllegalStateException("Paimon service is stopping: " + action); }
         stopController.checkAction(action);
+        if (Arrays.asList("streamRead", "timestampToStreamOffset", "batchRead", "batchCount", "executeQuery", "queryByAdvanceFilter").contains(action)) {
+            streamReadService.checkSourceProtection();
+        }
         return lifecycle.enter(action);
     }
 
@@ -3667,9 +3173,11 @@ public class PaimonService implements AutoCloseable {
         }
     }
     private <T> void acceptReadResult(java.util.function.Consumer<T> consumer, T value) throws Exception {
+        streamReadService.checkSourceProtection();
         stopController.run("finite reader callback", () -> consumer.accept(value));
     }
     private <T> void acceptReadResult(java.util.function.BiConsumer<T, Object> consumer, T value) throws Exception {
+        streamReadService.checkSourceProtection();
         stopController.run("finite reader callback", () -> consumer.accept(value, null));
     }
 

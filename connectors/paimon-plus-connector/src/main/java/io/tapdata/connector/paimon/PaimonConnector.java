@@ -3,6 +3,7 @@ package io.tapdata.connector.paimon;
 import io.tapdata.base.ConnectorBase;
 import io.tapdata.connector.paimon.config.PaimonConfig;
 import io.tapdata.connector.paimon.exception.PaimonFatalWriteException;
+import io.tapdata.connector.paimon.read.PaimonSourceCodecs;
 import io.tapdata.connector.paimon.service.PaimonService;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.TapEvent;
@@ -204,6 +205,7 @@ public class PaimonConnector extends ConnectorBase {
      * @param codecRegistry codec registry
      */
     private void registerCodecs(TapCodecsRegistry codecRegistry) {
+        PaimonSourceCodecs.register(codecRegistry);
         // Register codec for TapRawValue - convert to JSON string
         codecRegistry.registerFromTapValue(TapRawValue.class, "STRING", tapRawValue -> {
             if (tapRawValue != null && tapRawValue.getValue() != null) {
@@ -440,7 +442,7 @@ public class PaimonConnector extends ConnectorBase {
      * @throws Throwable if read fails
      */
     private void streamRead(TapConnectorContext connectorContext, List<String> tables, Object offsetState,
-                           int eventBatchSize, BiConsumer<List<TapEvent>, Object> eventsOffsetConsumer) throws Throwable {
+                           int eventBatchSize, io.tapdata.pdk.apis.consumer.StreamReadConsumer eventsOffsetConsumer) throws Throwable {
         final Log log = connectorContext.getLog();
 
         try {
@@ -514,7 +516,7 @@ public class PaimonConnector extends ConnectorBase {
             log.info("Converting timestamp {} to stream offset for {} tables", effectiveTimestamp, tableList.size());
 
             // Get snapshot IDs for specified tables at the given timestamp
-            return paimonService.timestampToStreamOffset(tableList, effectiveTimestamp, log);
+            return paimonService.timestampToStreamOffset(tableList, effectiveTimestamp, log, connectorContext::configContext);
 
         } catch (Exception e) {
             log.error("Error converting timestamp to stream offset: " + e.getMessage(), e);
