@@ -316,6 +316,24 @@ class PaimonDmlImageValidatorTest {
     }
 
     @Test
+    void recoveryInsertDistinguishesExplicitNullFromAnOmittedDefaultedField() {
+        PaimonWriteSemanticContract contract = contract(
+                BucketMode.HASH_FIXED, MergeEngine.DEDUPLICATE, false,
+                Arrays.asList("id", "defaulted", "ordinary"), set("id"), set("defaulted"),
+                set("id"), Collections.emptySet(), null, -1);
+        TapInsertRecordEvent absent = new TapInsertRecordEvent().after(map("id", 1, "ordinary", null));
+        TapInsertRecordEvent value = new TapInsertRecordEvent().after(map("id", 2, "defaulted", "mapped"));
+        TapInsertRecordEvent explicit = new TapInsertRecordEvent().after(map("id", 3, "defaulted", null));
+        assertDoesNotThrow(() -> PaimonDmlImageValidator.validateRecoveryInsertDefaults(
+                "default.t", contract, Arrays.asList(absent, value)));
+        PaimonFatalWriteException error = assertThrows(PaimonFatalWriteException.class, () ->
+                PaimonDmlImageValidator.validateRecoveryInsertDefaults(
+                        "default.t", contract, Arrays.asList(absent, value, explicit)));
+        assertTrue(error.getMessage().contains("PAIMON_LOCAL_RECOVERY_DEFAULTED_NULL"));
+        assertTrue(error.getMessage().contains("field=defaulted"));
+    }
+
+    @Test
     void sparseUpdateMustRemainAllowedOutsidePrimaryKeyDeduplicateContract() {
         PaimonWriteSemanticContract partialUpdate =
                 contract(

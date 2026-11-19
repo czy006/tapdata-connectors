@@ -302,6 +302,28 @@ class PaimonDataTypeConverterTest {
                 DataTypes.VARIANT());
     }
 
+    @Test
+    void rejectsLossOfPrecisionOnlyWhenMaterializingARecoveryKey() throws Exception {
+        PaimonRecoveryTime time = new PaimonRecoveryTime(java.time.LocalTime.of(0, 0, 1, 123_456_000));
+        assertEquals("1123", PaimonDataTypeConverter.toInternalValue("clock", time, DataTypes.STRING()).toString());
+        assertEquals("1123", new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(time));
+        assertEquals("1123", com.alibaba.fastjson.JSON.toJSONString(time));
+        assertThrows(PaimonFatalWriteException.class,
+                () -> PaimonDataTypeConverter.toInternalRecoveryKey("id", 16_777_217, DataTypes.FLOAT()));
+        assertEquals(16_777_216F, PaimonDataTypeConverter.toInternalRecoveryKey("id", 16_777_216, DataTypes.FLOAT()));
+        assertThrows(PaimonFatalWriteException.class,
+                () -> PaimonDataTypeConverter.toInternalRecoveryKey("id", 9_007_199_254_740_993L, DataTypes.DOUBLE()));
+        assertThrows(PaimonFatalWriteException.class,
+                () -> PaimonDataTypeConverter.toInternalRecoveryKey("id", 45_296_123, DataTypes.TIME(3)));
+        Timestamp nanos = Timestamp.fromEpochMillis(-123, 1234);
+        for (DataType target : new DataType[]{DataTypes.TIMESTAMP(3), DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6)}) {
+            assertThrows(PaimonFatalWriteException.class,
+                    () -> PaimonDataTypeConverter.toInternalRecoveryKey("id", nanos, target));
+            assertEquals(nanos, PaimonDataTypeConverter.toInternalValue("payload", nanos, target));
+        }
+        assertEquals(nanos, PaimonDataTypeConverter.toInternalRecoveryKey("id", nanos, DataTypes.TIMESTAMP(9)));
+    }
+
     private static DataType type(String dataType) {
         return PaimonDataTypeConverter.toPaimonDataType(new TapField("field", dataType));
     }

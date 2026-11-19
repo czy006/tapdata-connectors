@@ -5,6 +5,7 @@ import io.tapdata.connector.paimon.config.PaimonConfig;
 import io.tapdata.connector.paimon.recovery.PreparedMessageStore;
 import io.tapdata.connector.paimon.exception.PaimonFatalWriteException;
 import io.tapdata.connector.paimon.service.PaimonService;
+import io.tapdata.connector.paimon.schema.PaimonRecoveryTime;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.TapEvent;
 import io.tapdata.entity.event.control.ControlEvent;
@@ -40,6 +41,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.concurrent.atomic.AtomicReference;
@@ -68,13 +70,15 @@ public class PaimonConnector extends ConnectorBase {
     private static final class RecoverySession {
         final TapConnectorContext context;
         final PaimonService service;
+        final boolean localRecoveryEnabled;
         final AtomicReference<Throwable> failure = new AtomicReference<>();
         volatile boolean ready;
         volatile boolean stopping;
 
-        RecoverySession(TapConnectorContext context, PaimonService service) {
+        RecoverySession(TapConnectorContext context, PaimonService service, boolean localRecoveryEnabled) {
             this.context = context;
             this.service = service;
+            this.localRecoveryEnabled = localRecoveryEnabled;
         }
     }
 
@@ -127,7 +131,7 @@ public class PaimonConnector extends ConnectorBase {
         // A formerly bound target can lose both the safety option and the sink callback.
         // An ordinary source has its own node KV and only reads this key.
         RecoverySession session = task && (callback != null || stateMap != null)
-                ? new RecoverySession((TapConnectorContext) context, service) : null;
+                ? new RecoverySession((TapConnectorContext) context, service, recovery) : null;
         synchronized (this) {
             if (paimonService != null) {
                 throw new IllegalStateException("Paimon connector already started");
@@ -152,6 +156,11 @@ public class PaimonConnector extends ConnectorBase {
             if (session != null) {
                 if (recovery) {
                     service.startLocalRecovery(session.context);
+                    // TapData 65add935fdee: readNormalAndLogCollectorTaskStreamOffset may take the
+                    // current position after an older saveToSnapshot overwrites a newer progress record.
+                    // The PDK cannot verify which position the source actually resumed from.
+                    // https://github.com/tapdata/tapdata/blob/65add935fdee/iengine/iengine-app/src/main/java/io/tapdata/flow/engine/V2/node/hazelcast/data/pdk/HazelcastSourcePdkBaseNode.java#L792-L800
+                    service.requireFreshSourceSession();
                 }
                 synchronized (this) {
                     if (paimonService != service || session.stopping) {
@@ -379,7 +388,14 @@ public class PaimonConnector extends ConnectorBase {
             if (t == null || null == t.getValue() ||  t.getValue().isContainsIllegal()) {
                 return null;
             }
-            return PaimonConnector.toMillisOfDay(t);
+            // The active node registry is shared by the engine's full-load and CDC filters.
+            // Preserve precision until the writer can distinguish a business column from a key.
+            LocalTime time = toLocalTime(t);
+            RecoverySession session = recoverySession;
+            if (session != null && session.localRecoveryEnabled) {
+                return new PaimonRecoveryTime(time);
+            }
+            return Math.toIntExact(time.toNanoOfDay() / 1_000_000L);
         });
         codecRegistry.registerFromTapValue(TapYearValue.class, "CHAR(4)", PaimonConnector::toYear);
     }
@@ -445,10 +461,7 @@ public class PaimonConnector extends ConnectorBase {
         }
     }
 
-    private static Integer toMillisOfDay(TapTimeValue tapTimeValue) {
-        if (tapTimeValue == null || tapTimeValue.getValue() == null) {
-            return null;
-        }
+    private static LocalTime toLocalTime(TapTimeValue tapTimeValue) {
         Long seconds = tapTimeValue.getValue().getSeconds();
         Integer nanos = tapTimeValue.getValue().getNano();
         if (seconds == null || nanos == null) {
@@ -465,20 +478,7 @@ public class PaimonConnector extends ConnectorBase {
                     tapTimeValue.getValue(),
                     "value must be within one day");
         }
-        // Paimon 1.3.2 InternalRow represents TIME as integer milliseconds of the day.
-        // Source: https://github.com/apache/paimon/blob/release-1.3.2/paimon-common/src/main/java/org/apache/paimon/data/InternalRow.java
-        // Preserve the legacy connector's truncation of sub-millisecond fractions.
-        try {
-            return Math.toIntExact(
-                    Math.addExact(
-                            Math.multiplyExact(seconds, 1_000L), nanos / 1_000_000L));
-        } catch (ArithmeticException e) {
-            throw temporalConversionFailure(
-                    "TapTime",
-                    "TIME(3)",
-                    tapTimeValue.getValue(),
-                    "value is outside the TIME range");
-        }
+        return LocalTime.ofSecondOfDay(seconds).withNano(nanos);
     }
 
     private static PaimonFatalWriteException temporalConversionFailure(

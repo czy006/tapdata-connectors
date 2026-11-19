@@ -120,6 +120,9 @@ public final class PaimonMicroBatchCoordinator {
                 state.commitIntervalBaseTimeMs = nowMs;
             }
             for (String sourceLane : sourceLanes) {
+                if (recoveryCommitTrigger != null) {
+                    lanes.computeIfAbsent(sourceLane, ignored -> new LaneOffsetState()).hasCdcRecords = true;
+                }
                 state.lastAcceptedGenerationBySource.put(
                         sourceLane, state.acceptedGeneration);
             }
@@ -299,6 +302,12 @@ public final class PaimonMicroBatchCoordinator {
         }
         synchronized (lock) {
             LaneOffsetState lane = lanes.computeIfAbsent(sourceLane, ignored -> new LaneOffsetState());
+            // Only the first stream-only INITIAL control can carry the source's opening position.
+            // A duplicate or late INITIAL must never replace a pending or acknowledged CDC position.
+            if ("INITIAL_SYNC".equals(payload.get(TapCallbackOffset.KEY_SYNC_STAGE))
+                    && (lane.lastVersion != 0 || lane.hasCdcRecords)) {
+                return null;
+            }
             Map<String, Long> required = new LinkedHashMap<>();
             for (Map.Entry<String, MutableTableState> entry : tables.entrySet()) {
                 MutableTableState table = entry.getValue();
@@ -760,6 +769,7 @@ public final class PaimonMicroBatchCoordinator {
     }
 
     private static final class LaneOffsetState {
+        private boolean hasCdcRecords;
         private long lastVersion;
         private HeartbeatState pending;
         private InFlightHeartbeat inFlight;

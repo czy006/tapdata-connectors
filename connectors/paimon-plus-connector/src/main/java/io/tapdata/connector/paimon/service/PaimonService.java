@@ -352,6 +352,11 @@ public class PaimonService implements AutoCloseable {
         }
     }
 
+    /** Check engine admission after pending target commits have had a chance to finish, including on an idle node. */
+    public void requireFreshSourceSession() {
+        recoveryStore.requireFreshSourceSession();
+    }
+
     private FileStoreTable recoveryWriteTable(Identifier id) throws Exception {
         // A cached schema could still identify the old table after replacement or ALTER TABLE.
         Table current = stopController.call("load recovery table", () -> {
@@ -1542,14 +1547,16 @@ public class PaimonService implements AutoCloseable {
                         ? null
                         : info.get(TapCallbackOffset.KEY_SYNC_STAGE);
                 String stage = normalizeSyncStage(rawStage, "Paimon Heartbeat");
-                if ("INITIAL_SYNC".equals(stage)) {
+                boolean initial = "INITIAL_SYNC".equals(stage);
+                Object streamOffset = info.get(TapCallbackOffset.KEY_STREAM_OFFSET);
+                if (initial && (!config.isLocalRecoveryEnabled() || streamOffset == null
+                        || info.get(TapCallbackOffset.KEY_BATCH_OFFSET) != null)) {
                     return;
                 }
                 if (flushOffsetCallback == null) {
                     throw new PaimonFatalWriteException(
-                            "CDC Heartbeat requires flushOffsetCallback");
+                            stage + " Heartbeat requires flushOffsetCallback");
                 }
-                Object streamOffset = info.get(TapCallbackOffset.KEY_STREAM_OFFSET);
                 if (streamOffset == null) {
                     throw new PaimonFatalWriteException(
                             "CDC Heartbeat requires streamOffset");
@@ -1557,13 +1564,13 @@ public class PaimonService implements AutoCloseable {
                 Object sourceTime = info.get(TapCallbackOffset.KEY_SOURCE_TIME);
                 if (!(sourceTime instanceof Long)) {
                     throw new PaimonFatalWriteException(
-                            "CDC Heartbeat requires a Long sourceTime");
+                            stage + " Heartbeat requires a Long sourceTime");
                 }
                 Object nodeIds = info.get(TapCallbackOffset.KEY_NODE_IDS);
-                String sourceLane = firstSourceLane(nodeIds, "CDC Heartbeat");
+                String sourceLane = firstSourceLane(nodeIds, stage + " Heartbeat");
                 TapCallbackOffset payload = new TapCallbackOffset()
                         .streamOffset(streamOffset)
-                        .syncStage("CDC")
+                        .syncStage(stage)
                         .sourceTime((Long) sourceTime)
                         .nodeIds(nodeIds);
                 payload.put(TapCallbackOffset.KEY_EVENT_TIME, heartbeat.getReferenceTime());
@@ -2047,6 +2054,7 @@ public class PaimonService implements AutoCloseable {
             FileStoreTable writerTable = existingContext == null
                     ? fileStoreTable : recoveryTables.get(tableKey).writerTable();
             PaimonRecoveryAdmission.validateInput(config, tapTable, writerTable);
+            PaimonDmlImageValidator.validateRecoveryInsertDefaults(tableKey, contract, recordEvents);
         }
         PaimonGeneratedFieldDependencies generatedFields =
                 generatedFieldDependencies(tapTable);
@@ -2480,6 +2488,8 @@ public class PaimonService implements AutoCloseable {
 
         GenericRow genericRow = new GenericRow(paimonFields.size());
         boolean useHashKey = Boolean.TRUE.equals(computeHashKey.get(table.getName()));
+        Collection<String> recoveryKeys = config.isLocalRecoveryEnabled()
+                ? recoveryTables.get(cacheKey).writerTable().primaryKeys() : Collections.emptyList();
         for (int i = 0; i < paimonFields.size(); i++) {
             DataField dataField = paimonFields.get(i);
             String fieldName = dataField.name();
@@ -2493,7 +2503,9 @@ public class PaimonService implements AutoCloseable {
             // Get corresponding Paimon field type from cache
             DataType paimonType = dataField.type();
 
-            genericRow.setField(i, convertValueToPaimonType(fieldName, value, paimonType));
+            genericRow.setField(i, recoveryKeys.contains(fieldName)
+                    ? PaimonDataTypeConverter.toInternalRecoveryKey(fieldName, value, paimonType)
+                    : PaimonDataTypeConverter.toInternalValue(fieldName, value, paimonType));
         }
 
         return genericRow;
@@ -2501,19 +2513,6 @@ public class PaimonService implements AutoCloseable {
 
     protected String toHash(Collection<String> orderedKeys, Map<String, Object> data) {
         return PaimonSyntheticHashKey.encode(orderedKeys, data);
-    }
-
-    /**
-     * Convert value to Paimon-compatible type
-     *
-     * @param fieldName  target field name
-     * @param value      original value
-     * @param paimonType target Paimon data type
-     * @return converted value
-     */
-    private Object convertValueToPaimonType(
-            String fieldName, Object value, DataType paimonType) {
-        return PaimonDataTypeConverter.toInternalValue(fieldName, value, paimonType);
     }
 
     private List<PaimonMicroBatchCoordinator.CallbackReservation> flushTableInternal(

@@ -3,6 +3,7 @@ package io.tapdata.connector.paimon.service;
 import io.tapdata.connector.paimon.PaimonConnector;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.event.TapCallbackOffset;
+import io.tapdata.entity.event.control.HeartbeatEvent;
 import io.tapdata.entity.event.ddl.table.TapCreateTableEvent;
 import io.tapdata.entity.event.dml.TapInsertRecordEvent;
 import io.tapdata.entity.event.dml.TapRecordEvent;
@@ -46,6 +47,104 @@ import static org.mockito.Mockito.when;
 
 class PaimonRecoveryHeartbeatIntegrationTest {
     @TempDir Path directory;
+
+    @Test
+    void firstDeliveredInitialStreamPositionIsForwardedOnceAndCannotRegressCdc() throws Throwable {
+        Path warehouse = Files.createDirectories(directory.resolve("warehouse"));
+        TapConnectorContext context = context(warehouse, new ArrayList<>());
+        List<TapCallbackOffset> acknowledged = new ArrayList<>();
+        when(context.getFlushOffsetCallback()).thenReturn(value -> acknowledged.add((TapCallbackOffset) value));
+        ConnectorFunctions functions = new ConnectorFunctions();
+        PaimonConnector connector = new PaimonConnector();
+        connector.registerCapabilities(functions, new TapCodecsRegistry());
+        connector.onStart(context);
+        try {
+            HeartbeatEvent batch = initialPosition("ignored", "x");
+            batch.addInfo(TapCallbackOffset.KEY_BATCH_OFFSET, "batch");
+            functions.getProcessControlFunction().processControl(context, batch);
+            functions.getProcessControlFunction().processControl(context, initialPosition(null, "x"));
+            functions.getProcessControlFunction().processControl(context, initialPosition("P0", "x"));
+            functions.getProcessControlFunction().processControl(context, initialPosition("duplicate", "x"));
+            functions.getProcessControlFunction().processControl(context, heartbeat("P1", "x", 20L));
+            functions.getProcessControlFunction().processControl(context, initialPosition("late", "x"));
+            assertEquals(2, acknowledged.size());
+            TapCallbackOffset first = acknowledged.get(0);
+            assertEquals("INITIAL_SYNC", first.get(TapCallbackOffset.KEY_SYNC_STAGE));
+            assertEquals("P0", first.get(TapCallbackOffset.KEY_STREAM_OFFSET));
+            assertEquals(Collections.singletonList("x"), first.get(TapCallbackOffset.KEY_NODE_IDS));
+            assertEquals(10L, first.get(TapCallbackOffset.KEY_SOURCE_TIME));
+            assertEquals(10L, first.get(TapCallbackOffset.KEY_EVENT_TIME));
+            assertNull(first.get(TapCallbackOffset.KEY_BATCH_OFFSET));
+            assertEquals("CDC", acknowledged.get(1).get(TapCallbackOffset.KEY_SYNC_STAGE));
+            assertEquals("P1", acknowledged.get(1).get(TapCallbackOffset.KEY_STREAM_OFFSET));
+
+            TapTable table = table("cdc_before_first_control");
+            functions.getCreateTableV2Function().createTable(context, new TapCreateTableEvent().table(table));
+            functions.getWriteRecordFunction().writeRecord(context,
+                    Collections.singletonList(event(table.getName(), 1, "y")), table, result -> {});
+            functions.getProcessControlFunction().processControl(context, initialPosition("late-y", "y"));
+            functions.getProcessControlFunction().processControl(context, initialPosition("P0-z", "z"));
+            assertEquals(3, acknowledged.size());
+            assertEquals("P0-z", acknowledged.get(2).get(TapCallbackOffset.KEY_STREAM_OFFSET));
+        } finally {
+            connector.onStop(context);
+        }
+    }
+
+    private static HeartbeatEvent initialPosition(String offset, String lane) {
+        HeartbeatEvent event = heartbeat(offset, lane, 10L);
+        event.addInfo(TapCallbackOffset.KEY_SYNC_STAGE, "INITIAL_SYNC");
+        return event;
+    }
+
+    @Test
+    void initialPositionAfterFullLoadDataWaitsForItsTablePublication() throws Throwable {
+        Path warehouse = Files.createDirectories(directory.resolve("warehouse"));
+        List<String> callbacks = new ArrayList<>();
+        TapConnectorContext context = context(warehouse, callbacks);
+        ConnectorFunctions functions = new ConnectorFunctions();
+        PaimonConnector connector = new PaimonConnector();
+        connector.registerCapabilities(functions, new TapCodecsRegistry());
+        connector.onStart(context);
+        try {
+            TapTable table = table("deferred_initial_position");
+            functions.getCreateTableV2Function().createTable(context, new TapCreateTableEvent().table(table));
+            TapInsertRecordEvent row = event(table.getName(), 1, "x");
+            row.addInfo(TapRecordEvent.INFO_KEY_SYNC_STAGE, "INITIAL_SYNC");
+            functions.getWriteRecordFunction().writeRecord(context, Collections.singletonList(row), table, result -> {});
+            functions.getProcessControlFunction().processControl(context, initialPosition("P0", "x"));
+            functions.getProcessControlFunction().processControl(context, initialPosition("later-initial", "x"));
+            assertTrue(callbacks.isEmpty());
+
+            functions.getAfterInitialSyncFunction().afterInitialSync(context, table);
+            assertEquals(Collections.singletonList("P0"), callbacks);
+        } finally {
+            connector.onStop(context);
+        }
+    }
+
+    @Test
+    void evenAnEmptyPreviouslyBoundNodeRefusesSilentResumeAndReleasesItsDirectory() throws Throwable {
+        Path warehouse = Files.createDirectories(directory.resolve("warehouse"));
+        List<String> callbacks = new ArrayList<>();
+        TapConnectorContext context = context(warehouse, callbacks);
+        PaimonConnector initial = new PaimonConnector();
+        initial.onStart(context);
+        initial.onStop(context);
+
+        for (int attempt = 0; attempt < 2; attempt++) {
+            PaimonConnector restarted = new PaimonConnector();
+            ConnectorFunctions functions = new ConnectorFunctions();
+            restarted.registerCapabilities(functions, new TapCodecsRegistry());
+            IllegalStateException failure = assertThrows(IllegalStateException.class, () -> restarted.onStart(context));
+            assertTrue(failure.getMessage().contains("PAIMON_RECOVERY_SOURCE_POSITION_UNVERIFIED"), failure::toString);
+            functions.getProcessControlFunction().processControl(context, heartbeat("current", "x", 20L));
+            assertSame(failure, assertThrows(IllegalStateException.class, () -> functions.getWriteRecordFunction()
+                    .writeRecord(context, Collections.emptyList(), table("orders"), result -> {})).getCause());
+            restarted.onStop(context);
+        }
+        assertTrue(callbacks.isEmpty());
+    }
 
     @Test
     void fullLoadWithoutSourceHoldsFutureLanesUntilEachDependentTableIsVisible() throws Throwable {

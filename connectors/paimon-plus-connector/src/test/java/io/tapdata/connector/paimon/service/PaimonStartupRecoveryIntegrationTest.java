@@ -18,6 +18,7 @@ import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.junit.jupiter.api.Test;
@@ -79,6 +80,20 @@ public class PaimonStartupRecoveryIntegrationTest {
     }
 
     @Test
+    void startupRefusesFallbackAddedToTablesWithPendingFullLoad() throws Exception {
+        runChild("crash", 42);
+        try (Catalog catalog = catalog(directory)) {
+            for (String name : TABLES) {
+                physical(catalog, name).createBranch("history");
+                catalog.alterTable(Identifier.create("default", name),
+                        Collections.singletonList(SchemaChange.setOption("scan.fallback-branch", "history")), false);
+            }
+        }
+        runChild("reject-fallback", 0);
+        assertTables(false);
+    }
+
+    @Test
     void replayOfKeyChangesAndDeletesConvergesAfterEvictingTheFieldCache() throws Exception {
         runChild("crash", 42);
         runChild("cdc", 0);
@@ -134,11 +149,12 @@ public class PaimonStartupRecoveryIntegrationTest {
         PaimonService service = new PaimonService(config, log);
         service.setFlushOffsetCallback(offset -> { throw new AssertionError("Invented source callback: " + offset); });
         service.init();
-        if ("reject".equals(mode)) {
+        if ("reject".equals(mode) || "reject-fallback".equals(mode)) {
             Exception failure = assertThrows(Exception.class, () -> service.startLocalRecovery(context));
             StringBuilder causes = new StringBuilder();
             for (Throwable t = failure; t != null; t = t.getCause()) { causes.append(t).append('\n'); }
-            assertTrue(causes.toString().contains("length"), causes.toString());
+            String expected = "reject-fallback".equals(mode) ? "scan.fallback-branch" : "length";
+            assertTrue(causes.toString().contains(expected), causes.toString());
             return;
         }
         service.startLocalRecovery(context);

@@ -74,6 +74,30 @@ public final class PaimonDmlImageValidator {
         }
     }
 
+    /** Check the original INSERT map before row construction turns absence and explicit null into one value. */
+    public static void validateRecoveryInsertDefaults(
+            String tableKey, PaimonWriteSemanticContract contract, List<TapRecordEvent> events) {
+        if (contract.defaultedTargetFields().isEmpty()) {
+            return;
+        }
+        // TableWriteImpl wraps each row with DefaultValueRow, including an explicit source null.
+        // https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/table/sink/TableWriteImpl.java#L183-L192
+        for (TapRecordEvent event : events) {
+            if (event instanceof TapInsertRecordEvent) {
+                Map<String, Object> after = ((TapInsertRecordEvent) event).getAfter();
+                if (after == null) {
+                    continue;
+                }
+                for (String field : contract.defaultedTargetFields()) {
+                    if (after.containsKey(field) && after.get(field) == null) {
+                        throw new PaimonFatalWriteException("PAIMON_LOCAL_RECOVERY_DEFAULTED_NULL: table="
+                                + tableKey + ", operation=INSERT, field=" + field);
+                    }
+                }
+            }
+        }
+    }
+
     public static void validateInsert(
             String tableKey,
             PaimonWriteSemanticContract contract,

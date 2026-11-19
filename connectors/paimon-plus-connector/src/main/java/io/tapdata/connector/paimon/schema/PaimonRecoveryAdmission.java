@@ -2,15 +2,21 @@ package io.tapdata.connector.paimon.schema;
 
 import io.tapdata.connector.paimon.config.PaimonConfig;
 import io.tapdata.connector.paimon.exception.PaimonFatalWriteException;
+import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.TapTable;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypeRoot;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.StringUtils;
 
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.Map;
 
 /**
  * Checks the effective physical table on initial write and on recovery. Source replayability,
@@ -27,7 +33,7 @@ public final class PaimonRecoveryAdmission {
         TableSchema schema = TableSchema.create(0L, effectiveSchema);
         BucketMode mode = PaimonWriteSemanticContractResolver.deriveBucketMode(schema, options.bucket());
         validateSemantics(config, source.getName(), schema, options, mode);
-        validateMappedKeys(source, schema);
+        validateMappedFields(source, schema);
     }
 
     public static void validateInput(PaimonConfig config, TapTable source, FileStoreTable target) {
@@ -35,13 +41,51 @@ public final class PaimonRecoveryAdmission {
             return;
         }
         validateTable(config, source.getName(), target);
-        validateMappedKeys(source, target.schema());
+        validateMappedFields(source, target.schema());
     }
 
-    private static void validateMappedKeys(TapTable source, TableSchema schema) {
+    private static void validateMappedFields(TapTable source, TableSchema schema) {
         Collection<String> mappedKeys = source.primaryKeys(true);
         require(mappedKeys != null && new HashSet<>(mappedKeys).equals(new HashSet<>(schema.primaryKeys())),
                 source.getName(), "the mapped TapData primary key must match the physical primary key");
+        RowType physical = schema.logicalRowType();
+        Map<String, TapField> mapped = source.getNameFieldMap();
+        require(mapped != null && mapped.keySet().containsAll(mappedKeys), source.getName(),
+                "the mapped primary key requires field definitions");
+        for (Map.Entry<String, TapField> entry : mapped.entrySet()) {
+            String name = entry.getKey();
+            require(physical.containsField(name), source.getName(), "mapped field is missing from the target: " + name);
+            TapField field = entry.getValue();
+            require(field != null && field.getDataType() != null, source.getName(), "mapped field has no type: " + name);
+            DataType expected = PaimonDataTypeConverter.toPaimonDataType(field);
+            DataType actual = physical.getField(name).type();
+            // Compatible cast rules ignore precision and scale; even INT -> FLOAT can merge keys.
+            // https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-api/src/main/java/org/apache/paimon/types/DataTypeCasts.java#L199-L219
+            require(isLosslessMapping(expected, actual), source.getName(),
+                    "mapped field " + name + " has type " + expected + " but the target has " + actual);
+        }
+    }
+
+    private static boolean isLosslessMapping(DataType expected, DataType actual) {
+        if (expected.equalsIgnoreNullable(actual)) {
+            return true;
+        }
+        // IEEE-754 FLOAT and DOUBLE have 24 and 53 significant bits respectively.
+        DataTypeRoot target = actual.getTypeRoot();
+        switch (expected.getTypeRoot()) {
+            case TINYINT:
+                return target == DataTypeRoot.SMALLINT || target == DataTypeRoot.INTEGER || target == DataTypeRoot.BIGINT
+                        || target == DataTypeRoot.FLOAT || target == DataTypeRoot.DOUBLE;
+            case SMALLINT:
+                return target == DataTypeRoot.INTEGER || target == DataTypeRoot.BIGINT
+                        || target == DataTypeRoot.FLOAT || target == DataTypeRoot.DOUBLE;
+            case INTEGER:
+                return target == DataTypeRoot.BIGINT || target == DataTypeRoot.DOUBLE;
+            case FLOAT:
+                return target == DataTypeRoot.DOUBLE;
+            default:
+                return false;
+        }
     }
 
     public static void validateTable(PaimonConfig config, String tableName, FileStoreTable table) {
@@ -84,6 +128,11 @@ public final class PaimonRecoveryAdmission {
         require(!options.rowkindField().isPresent(), tableName, "rowkind.field changes the mapped business row");
         require(options.recordLevelExpireTime() == null && options.partitionExpireTime() == null, tableName,
                 "record-level.expire-time and partition.expiration-time must be unset");
+        // A main-branch write makes the entire partition shadow matching fallback rows.
+        // https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/docs/content/maintenance/manage-branches.md#batch-reading-from-fallback-branch
+        require(StringUtils.isNullOrWhitespaceOnly(
+                options.toConfiguration().get(CoreOptions.SCAN_FALLBACK_BRANCH)), tableName,
+                "scan.fallback-branch must be unset");
         require(options.startupMode() == CoreOptions.StartupMode.LATEST_FULL, tableName,
                 "the effective scan.mode must read the latest full snapshot");
     }

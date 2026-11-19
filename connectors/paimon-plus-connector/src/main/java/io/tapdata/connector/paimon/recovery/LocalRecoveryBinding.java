@@ -23,8 +23,10 @@ final class LocalRecoveryBinding implements AutoCloseable {
     static final String STATE_KEY = "paimonPlusLocalRecoveryBindingV1";
     private final FileChannel channel;
     final Path directory;
+    final boolean createdDuringOpen;
 
-    private LocalRecoveryBinding(Path directory, FileChannel channel) {
+    private LocalRecoveryBinding(Path directory, FileChannel channel, boolean createdDuringOpen) {
+        this.createdDuringOpen = createdDuringOpen;
         this.directory = directory;
         this.channel = channel;
     }
@@ -52,7 +54,6 @@ final class LocalRecoveryBinding implements AutoCloseable {
         }
         FileChannel channel = FileChannel.open(root.resolve("owner.lock"), StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
-        LocalRecoveryBinding binding = new LocalRecoveryBinding(root, channel);
         try {
             FileLock lock;
             try {
@@ -64,11 +65,11 @@ final class LocalRecoveryBinding implements AutoCloseable {
                 throw new IOException("Recovery directory is already locked: " + root);
             }
             LocalRecoveryFiles.syncDirectory(root);
-            binding.bind(map);
-            return binding;
+            boolean created = bind(root, map);
+            return new LocalRecoveryBinding(root, channel, created);
         } catch (IOException | RuntimeException | Error failure) {
             try {
-                binding.close();
+                channel.close();
             } catch (IOException closeFailure) {
                 failure.addSuppressed(closeFailure);
             }
@@ -76,7 +77,7 @@ final class LocalRecoveryBinding implements AutoCloseable {
         }
     }
 
-    private void bind(KVMap<Object> map) throws IOException {
+    private static boolean bind(Path directory, KVMap<Object> map) throws IOException {
         Path marker = directory.resolve("binding");
         Path registry = directory.resolve("tables");
         Object stored = map.get(STATE_KEY);
@@ -89,6 +90,7 @@ final class LocalRecoveryBinding implements AutoCloseable {
         }
         String location = InetAddress.getLocalHost().getHostName() + "\n" + directory + "\n" + fileKey + "\n" + lockKey;
         String place = LocalRecoveryFiles.hex(LocalRecoveryFiles.digest(location.getBytes(StandardCharsets.UTF_8)));
+        String candidate = null;
         if (stored == null) {
             try (DirectoryStream<Path> files = Files.newDirectoryStream(directory)) {
                 for (Path file : files) {
@@ -97,7 +99,7 @@ final class LocalRecoveryBinding implements AutoCloseable {
                     }
                 }
             }
-            String candidate = "pending/" + place + "/" + UUID.randomUUID();
+            candidate = "pending/" + place + "/" + UUID.randomUUID();
             map.putIfAbsent(STATE_KEY, candidate);
             stored = map.get(STATE_KEY);
         }
@@ -147,7 +149,9 @@ final class LocalRecoveryBinding implements AutoCloseable {
         } else {
             verifyMarker(marker, identity);
         }
-        // Caller reads the checksummed registry even when no table is pending.
+        // Only the opener that installed this exact intent has a new session. An existing
+        // pending intent can come from a previous process, even when its inventory is empty.
+        return value.equals(candidate);
     }
 
     private static void verifyMarker(Path marker, String identity) throws IOException {

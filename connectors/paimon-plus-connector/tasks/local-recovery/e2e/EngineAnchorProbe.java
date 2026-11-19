@@ -17,6 +17,7 @@ import com.tapdata.mongo.ClientMongoOperator;
 import com.tapdata.tm.commons.dag.nodes.TableNode;
 import com.tapdata.tm.commons.task.dto.TaskDto;
 import io.tapdata.entity.event.TapCallbackOffset;
+import io.tapdata.entity.utils.DataMap;
 import io.tapdata.flow.engine.V2.node.hazelcast.data.pdk.concurrent.PartitionConcurrentProcessor;
 import io.tapdata.flow.engine.V2.util.SyncTypeEnum;
 import io.tapdata.observable.logging.ObsLogger;
@@ -67,6 +68,12 @@ public final class EngineAnchorProbe {
     }
 
     private static void run(MongoCollection<Document> collection) throws Exception {
+        Map<String, Object> settings = Map.of("localRecoveryDir", "/example/target");
+        DataMap initialSettings = targetNodeConfig(settings, SyncTypeEnum.INITIAL_SYNC);
+        check(initialSettings.equals(targetNodeConfig(settings, SyncTypeEnum.INITIAL_SYNC_CDC))
+                        && initialSettings.equals(targetNodeConfig(settings, SyncTypeEnum.CDC)),
+                "PDK node configuration is identical across the three task sync types");
+        System.out.println("PASS engine produces the same target node configuration for initial, CDC and combined tasks");
         ProgressSink sink = new ProgressSink(collection);
         try {
             TaskDto task = new TaskDto();
@@ -79,12 +86,8 @@ public final class EngineAnchorProbe {
 
             HazelcastTargetPdkBaseNode target = mock(HazelcastTargetPdkBaseNode.class);
             configureTarget(target, processor, sink);
-            Method serialIngress = HazelcastTargetPdkBaseNode.class.getDeclaredMethod(
-                    "flushOffsetByTapdataEventForNoConcurrent", AtomicReference.class);
-            serialIngress.setAccessible(true);
-
             TapdataEvent initial = heartbeat(SyncStage.INITIAL_SYNC, "P0");
-            serialIngress.invoke(target, new AtomicReference<>(initial));
+            dispatchSerial(target, initial);
             verify(target, never()).flushSyncProgressMap(any());
             PartitionConcurrentProcessor workers = mock(PartitionConcurrentProcessor.class, CALLS_REAL_METHODS);
             Method selectOffset = PartitionConcurrentProcessor.class.getDeclaredMethod(
@@ -97,7 +100,7 @@ public final class EngineAnchorProbe {
             over.setSyncStage(SyncStage.INITIAL_SYNC);
             over.setNodeIds(SOURCE);
             over.setBatchOffset(Map.of(BatchOffsetUtil.BATCH_READ_CONNECTOR_STATUS, "OVER"));
-            serialIngress.invoke(target, new AtomicReference<>(over));
+            dispatchSerial(target, over);
             check(target.saveToSnapshot(), "save OVER");
             SyncProgress restarted = restore(sink.read(), SyncTypeEnum.INITIAL_SYNC_CDC, null);
             check(BatchOffsetUtil.batchIsOverOfTable(restarted, "A"), "durable A=OVER");
@@ -107,14 +110,14 @@ public final class EngineAnchorProbe {
             System.out.println("PASS serial empty A=OVER without P0; source recovery requested current");
             System.out.println("PASS initial-only restart needs no stream cursor; concurrent selector selected P0");
 
-            serialIngress.invoke(target, new AtomicReference<>(heartbeat(SyncStage.CDC, "P1")));
+            dispatchSerial(target, heartbeat(SyncStage.CDC, "P1"));
             verify(target).flushSyncProgressMap(argThat(event -> event.getSyncStage() == SyncStage.CDC));
             check("P1".equals(target.syncProgressMap.get(EDGE).getStreamOffsetObj()), "engine accepted CDC P1");
             check(sink.lastWriteSucceeded, "safe CDC callback saved");
             restore(sink.read(), SyncTypeEnum.CDC, "P1");
 
             sink.rejectNext = true;
-            serialIngress.invoke(target, new AtomicReference<>(heartbeat(SyncStage.CDC, "P2")));
+            dispatchSerial(target, heartbeat(SyncStage.CDC, "P2"));
             check(!sink.lastWriteSucceeded, "manager write failure injected");
             check(sink.sourceFlushes.equals(List.of("P1", "P2")), "source ACK precedes rejected Mongo write");
             restore(sink.read(), SyncTypeEnum.CDC, "P1");
@@ -124,15 +127,37 @@ public final class EngineAnchorProbe {
         }
     }
 
-    private static TapdataEvent heartbeat(SyncStage stage, String offset) {
+    static TapdataEvent heartbeat(SyncStage stage, String offset) {
         TapdataEvent event = TapdataHeartbeatEvent.create(42L, offset);
         event.setSyncStage(stage);
         event.setNodeIds(SOURCE);
         return event;
     }
 
-    private static void configureTarget(HazelcastTargetPdkBaseNode target, DataProcessorContext processor,
-                                        ProgressSink sink) throws Exception {
+    static void dispatchSerial(HazelcastTargetPdkBaseNode target, TapdataEvent event) throws Exception {
+        Method ingress = HazelcastTargetPdkBaseNode.class.getDeclaredMethod(
+                "flushOffsetByTapdataEventForNoConcurrent", AtomicReference.class);
+        ingress.setAccessible(true);
+        ingress.invoke(target, new AtomicReference<>(event));
+    }
+
+    static DataMap targetNodeConfig(Map<String, Object> settings, SyncTypeEnum type) {
+        TableNode node = new TableNode();
+        node.setNodeConfig(new HashMap<>(settings));
+        TaskDto task = new TaskDto();
+        task.setSyncType(type.getSyncType());
+        HazelcastTargetPdkBaseNode target = mock(HazelcastTargetPdkBaseNode.class);
+        doCallRealMethod().when(target).generateNodeConfig(any(), any());
+        return DataMap.create(target.generateNodeConfig(node, task));
+    }
+
+    static void configureTarget(HazelcastTargetPdkBaseNode target, DataProcessorContext processor,
+                                ProgressSink sink) throws Exception {
+        configureTarget(target, processor, sink, sink.sourceFlushes::add);
+    }
+
+    static void configureTarget(HazelcastTargetPdkBaseNode target, DataProcessorContext processor,
+                                ProgressSink sink, java.util.function.Consumer<Object> sourceFlush) throws Exception {
         setField(target, "fromConcurrentProcessor", ThreadLocal.withInitial(() -> false));
         setField(target, "processorBaseContext", processor);
         setField(target, "dataProcessorContext", processor);
@@ -166,7 +191,7 @@ public final class EngineAnchorProbe {
 
         ConnectorNode sourcePdk = mock(ConnectorNode.class, RETURNS_DEEP_STUBS);
         when(sourcePdk.getConnectorFunctions().getFlushOffsetFunction())
-                .thenReturn((ctx, pos) -> sink.sourceFlushes.add(pos));
+                .thenReturn((ctx, pos) -> sourceFlush.accept(pos));
         setField(target, "sourceConnectorNodeMap", Map.of("source", sourcePdk));
         ClientMongoOperator manager = mock(ClientMongoOperator.class);
         doAnswer(invocation -> {
@@ -178,7 +203,7 @@ public final class EngineAnchorProbe {
         setField(target, "clientMongoOperator", manager);
     }
 
-    private static SyncProgress restore(Map<String, Object> attrs, SyncTypeEnum type, String expected)
+    static SyncProgress restore(Map<String, Object> attrs, SyncTypeEnum type, String expected)
             throws Exception {
         HazelcastSourcePdkDataNode source = mock(HazelcastSourcePdkDataNode.class, CALLS_REAL_METHODS);
         doNothing().when(source).initStreamOffsetFromTime(any());
@@ -215,23 +240,28 @@ public final class EngineAnchorProbe {
         throw new NoSuchFieldException(name);
     }
 
-    private static void check(boolean value, String message) {
+    static void check(boolean value, String message) {
         if (!value) throw new AssertionError(message);
     }
 
     // TaskServiceImpl#updateSyncProgress stores each edge JSON under attrs.syncProgress.<edge>.
     // Only a fresh ObjectId in a fixed test namespace is written, and only that ID is cleaned.
-    private static final class ProgressSink {
-        final ObjectId id = new ObjectId();
-        final List<Object> sourceFlushes = new ArrayList<>();
+    static class ProgressSink {
+        final ObjectId id;
+        final List<Object> sourceFlushes = new java.util.concurrent.CopyOnWriteArrayList<>();
         final Map<String, String> memory = new HashMap<>();
         final MongoCollection<Document> collection;
-        boolean rejectNext;
-        boolean lastWriteSucceeded;
+        volatile boolean rejectNext;
+        volatile boolean lastWriteSucceeded;
 
         ProgressSink(MongoCollection<Document> collection) {
+            this(collection, new ObjectId(), true);
+        }
+
+        ProgressSink(MongoCollection<Document> collection, ObjectId id, boolean create) {
+            this.id = id;
             this.collection = collection;
-            if (collection != null) collection.insertOne(new Document("_id", id));
+            if (collection != null && create) collection.insertOne(new Document("_id", id));
         }
 
         void write(Map<String, String> payload) {

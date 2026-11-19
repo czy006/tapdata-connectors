@@ -27,9 +27,10 @@ bash run-anchor-probe.sh
 
 ### 当前实测
 
-2026-11-19 使用本地引擎构建及 JDK 17，在进程内 Manager 边界得到四行 PASS，独立 JVM 退出码为 0：
+在本地引擎构建及 JDK 17 上运行，进程内 Manager 对照的断言如下。
 
 ```text
+PASS engine produces the same target node configuration for initial, CDC and combined tasks
 PASS serial empty A=OVER without P0; source recovery requested current
 PASS initial-only restart needs no stream cursor; concurrent selector selected P0
 PASS CDC P1 restored; ACK P2 precedes failed persistence leaving P1 durable
@@ -38,8 +39,37 @@ PASS engine + in-memory Manager boundary; real Mongo NOT RUN
 
 用真实 Mongo 模式在相同环境发起了独立测试。TapData 管理 Java 进程有连接至本机 27017 的既有会话；此执行环境新建该连接返回 `Operation not permitted`，driver 在 `ping` 阶段抛出 `MongoTimeoutException`。浏览器端口和 Manager 端口的新连接也被系统拒绝；没有读取或修改当前业务任务。该次真实 Mongo 运行未执行任何写入，不能计入 T01/T15 的真实持久化和源端重放验收。
 
-## 对上线结论的约束
+## 当前分支的运行边界
 
-新部署应对实际源连接器、有效任务配置和全量到 CDC 的切换时机验证旧位置能在重启后被传回源端。单独保存目标原生清单只能恢复已交付的输入。另建隔离任务时可在 A 全量结束、首次成功 CDC 心跳前更新或删除 A，并在初始空表插入一行。对照 Mongo 保存的实际起点、源端收到的恢复起点、Paimon 普通查询逐主键结果后，再对该任务组合签署验收。
+开启本机恢复后，目标连接器能在连续运行期间接受全量和 CDC；全量在结束回调发布，CDC 在满足提交条件时发布。已有绑定再次启动时先补交本机可恢复的批次，再以 `PAIMON_RECOVERY_SOURCE_POSITION_UNVERIFIED` 停止。该判断也适用于正常停机、空表以及没有新事件的任务。目标 PDK 没有获得源端实际重启位置。只给已有任务换一个目录无法建立正确的源基线。
 
-固定桶全量、CDC 定时提交以及同机静默恢复的容量实测和重跑命令见 [固定桶容量样本](CAPACITY.md)。
+设置上文环境变量，并先在连接器模块运行 `PaimonStartupRecoveryIntegrationTest`，使 Maven 生成联动测试的 classpath。以下命令都在本目录执行。每次运行均新建独立 warehouse 和本机恢复目录。
+
+### 多表提交、源位点与进程重启
+
+```sh
+bash run-anchor-probe.sh --coupled
+bash run-anchor-probe.sh --concurrent
+```
+
+`--coupled` 运行两个独立任务，每个任务各使用两个 JVM。DML 经引擎的 `handleTapdataEventDML` 生成元数据并交给正式注册的 PDK 写入口；心跳经真实引擎筛选、连接器 control、引擎位点回调和源恢复方法。目标使用真实 Paimon 表并通过普通批读核对。源变更和源端 flush 由夹具提供，节点 KV 与 Manager 默认采用文件持久化。设置 `PROBE_MONGO_URI` 可尝试用真实 Mongo 替代进度文件。
+
+| 任务 | 首次运行 | 重启断言 |
+| --- | --- | --- |
+| 全量中断 | 两表各两行。串行引擎筛掉只有流位点的 INITIAL 心跳。A 的 OVER 已保存，两表都没有可见快照，随后强退。 | 没有新输入也补回全部四行，再拒绝启动。晚到心跳无法推进位点，随后写入的新键也被拒绝。 |
+| 连续运行与重放 | 全量末尾发布两表，之后移动 A 的主键、删除旧行并更新 B。B 未提交时扣住 P2；B 发布后，模拟 Manager 写入失败，持久进度仍为 P1。同一进程重复交付 P2，逐键得到 A=`{3:moved}`、B=`{7:changed,8:keep}`，进度可解码为 P2。 | 即使夹具可以从 Manager 解码 P2，正式目标 PDK 仍得不到源端实际采用的起点。连接器拒绝启动，已有快照和键值正确。 |
+
+`--concurrent` 用两个实际分区 worker 和可控的 Manager 请求顺序验证三个边界。并发路径将首个带 P0 的 INITIAL 心跳交给连接器，回调保持 INITIAL 阶段；较早的全量进度晚于 P1 保存时可以将 P1 回退到 P0。串行路径可在目标之前滤掉同一 P0，迟到的全量进度能清空 P1。在纯 CDC 段，较早的 P1 请求晚于 P2 完成仍可覆盖 P2。目标提交不会改变 Manager 的保存顺序。默认的 `--anchor` 探针另通过引擎 `generateNodeConfig` 比较纯全量、纯 CDC 与组合任务的目标节点配置。
+
+### 物理表、默认值与时间主键
+
+```sh
+bash run-review-probe.sh LocalRecoveryImageAudit
+bash run-review-probe.sh FallbackBranchReviewProbe
+bash run-review-probe.sh TemporalPrimaryKeyProbe fixed
+bash run-review-probe.sh TemporalPrimaryKeyProbe dynamic
+```
+
+四次运行都应成功退出。映射探针检查缺列、INT 主键写入 FLOAT 目标、带默认值列的显式 NULL 以及普通 NULL 对照。分支探针比较普通表与按分区使用 fallback 的表。时间探针通过实际 PDK codec 验证固定桶和动态桶中的插入、更新和删除，并读取原有已提交键以检查误覆盖。
+
+同机固定桶的容量测量见[固定桶样本](CAPACITY.md)。旧版发现与源码定位见[审查报告](../../../src/doc/reviews/REVIEW-paimon-local-recovery-engine-2026-11-19.md)。

@@ -49,6 +49,16 @@ public final class PreparedMessageStore implements AutoCloseable {
         return nodeState.get(LocalRecoveryBinding.STATE_KEY) != null;
     }
 
+    /** TapData exposes the target KV, but not the source position actually chosen at restart. */
+    public void requireFreshSourceSession() {
+        if (!binding.createdDuringOpen) {
+            throw new IllegalStateException("PAIMON_RECOVERY_SOURCE_POSITION_UNVERIFIED: recovered the target's "
+                    + "prepared changes. TapData does not expose the source restart position to the target. "
+                    + "Continuing from this existing task could skip changes. Reconcile source and target "
+                    + "and establish a new consistent baseline before starting a new task.");
+        }
+    }
+
     public static PreparedMessageStore open(Path directory, KVMap<Object> nodeState) throws IOException {
         return open(directory, nodeState, (phase, target) -> {});
     }

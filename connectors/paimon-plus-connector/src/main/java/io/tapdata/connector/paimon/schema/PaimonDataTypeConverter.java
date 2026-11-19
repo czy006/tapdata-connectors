@@ -90,6 +90,36 @@ public final class PaimonDataTypeConverter {
         }
     }
 
+    /** Reject key conversions that would make two distinct mapped values indistinguishable. */
+    public static Object toInternalRecoveryKey(String field, Object value, DataType type) {
+        boolean uncheckedTimeKey = type instanceof TimeType && value != null && !(value instanceof PaimonRecoveryTime);
+        if (uncheckedTimeKey || (value instanceof PaimonRecoveryTime && !((PaimonRecoveryTime) value).isMillisecondAligned())) {
+            // TIME is always an integer in InternalRow, including schemas declaring precision > 3.
+            // https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-common/src/main/java/org/apache/paimon/data/InternalRow.java#L134-L139
+            throw conversionError(field, value, type, "TIME primary key requires a lossless millisecond-aligned source value");
+        }
+        Object internal = toInternalValue(field, value, type);
+        if (internal instanceof Timestamp) {
+            Timestamp timestamp = (Timestamp) internal;
+            int precision = DataTypes.getPrecision(type).getAsInt();
+            int nanoUnit = (int) Math.pow(10, 9 - precision);
+            if (timestamp.toLocalDateTime().getNano() % nanoUnit != 0) {
+                // A compact timestamp writer drops its nano-of-millisecond value.
+                // https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-common/src/main/java/org/apache/paimon/data/AbstractBinaryWriter.java#L160-L175
+                throw conversionError(field, value, type, "timestamp primary key exceeds the declared precision");
+            }
+        }
+        if ((internal instanceof Float || internal instanceof Double) && value.getClass() != internal.getClass()) {
+            Number input = value instanceof PaimonRecoveryTime ? ((PaimonRecoveryTime) value).millisOfDay() : (Number) value;
+            BigDecimal original = input instanceof Float || input instanceof Double
+                    ? new BigDecimal(input.doubleValue()) : numberAsBigDecimal(input);
+            if (original.compareTo(new BigDecimal(((Number) internal).doubleValue())) != 0) {
+                throw conversionError(field, value, type, "floating-point primary key conversion loses precision");
+            }
+        }
+        return internal;
+    }
+
     /** Converts an external CDC value to the Java class required by Paimon InternalRow. */
     public static Object toInternalValue(String fieldName, Object value, DataType targetType) {
         if (targetType == null) {
@@ -106,6 +136,9 @@ public final class PaimonDataTypeConverter {
             return null;
         }
 
+        if (value instanceof PaimonRecoveryTime) {
+            value = ((PaimonRecoveryTime) value).millisOfDay();
+        }
         try {
             switch (targetType.getTypeRoot()) {
                 case CHAR:

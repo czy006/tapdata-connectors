@@ -38,6 +38,7 @@ class PaimonRecoveryAdmissionTest {
             "rowkind.field,value,rowkind.field",
             "record-level.expire-time,1 d,record-level.expire-time",
             "partition.expiration-time,1 d,partition.expiration-time",
+            "scan.fallback-branch,history,scan.fallback-branch",
             "scan.mode,from-snapshot-full,scan.mode"
     })
     void excludesTableOptionsWithDifferentBusinessOrPublicationSemantics(String key, String value, String reason) {
@@ -75,6 +76,31 @@ class PaimonRecoveryAdmissionTest {
     }
 
     @Test
+    void checksEveryMappedFieldAndItsPhysicalTypeAtCreationAndOnTakeover() {
+        TapTable input = new TapTable("events").add(new TapField("id", "INT").primaryKeyPos(1))
+                .add(new TapField("payload", "STRING"));
+        Schema.Builder lossy = Schema.newBuilder().column("id", DataTypes.FLOAT())
+                .column("payload", DataTypes.STRING()).primaryKey("id");
+        Schema.Builder missing = Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id");
+        for (Schema.Builder incompatible : new Schema.Builder[]{lossy, missing}) {
+            assertThrows(PaimonFatalWriteException.class,
+                    () -> PaimonRecoveryAdmission.validateNewTable(config, input, incompatible.build()));
+            FileStoreTable existing = table(BucketMode.HASH_DYNAMIC, incompatible);
+            assertThrows(PaimonFatalWriteException.class,
+                    () -> PaimonRecoveryAdmission.validateInput(config, input, existing));
+            assertDoesNotThrow(() -> PaimonRecoveryAdmission.validateInput(new PaimonConfig(), input, existing));
+        }
+        FileStoreTable wider = table(BucketMode.HASH_FIXED, Schema.newBuilder().column("id", DataTypes.BIGINT())
+                .column("low", DataTypes.DOUBLE()).primaryKey("id"));
+        TapTable narrow = new TapTable("events").add(new TapField("id", "INT").primaryKeyPos(1))
+                .add(new TapField("low", "FLOAT"));
+        assertDoesNotThrow(() -> PaimonRecoveryAdmission.validateInput(config, narrow, wider));
+        Schema reordered = Schema.newBuilder().column("payload", DataTypes.STRING())
+                .column("id", DataTypes.INT()).primaryKey("id").build();
+        assertDoesNotThrow(() -> PaimonRecoveryAdmission.validateNewTable(config, input, reordered));
+    }
+
+    @Test
     void checksTheFinalNewTableSchemaBeforeCatalogCreation() {
         TapTable input = new TapTable("events").add(new TapField("id", "INT").primaryKeyPos(1));
         assertDoesNotThrow(() -> PaimonRecoveryAdmission.validateNewTable(config, input,
@@ -85,6 +111,18 @@ class PaimonRecoveryAdmissionTest {
         assertTrue(assertThrows(PaimonFatalWriteException.class, () ->
                 PaimonRecoveryAdmission.validateNewTable(config, input, schema().primaryKey("id").option("bucket", "-2").build()))
                 .getMessage().contains("bucket mode"));
+    }
+
+    @Test
+    void checksFallbackBeforeCreatingTableAndAllowsAnInactiveOption() {
+        TapTable input = new TapTable("events").add(new TapField("id", "INT").primaryKeyPos(1));
+        Schema.Builder builder = schema().primaryKey("id");
+        PaimonFatalWriteException error = assertThrows(PaimonFatalWriteException.class, () ->
+                PaimonRecoveryAdmission.validateNewTable(config, input,
+                        builder.option("scan.fallback-branch", "history").build()));
+        assertTrue(error.getMessage().contains("scan.fallback-branch"));
+        assertDoesNotThrow(() -> PaimonRecoveryAdmission.validateNewTable(config, input,
+                builder.option("scan.fallback-branch", "  ").build()));
     }
 
     private static Schema.Builder schema() {

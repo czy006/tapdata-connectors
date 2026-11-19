@@ -150,6 +150,7 @@ class PreparedMessageStoreTest {
         String pending = (String) node.value;
         assertTrue(pending.startsWith("pending/"));
         try (PreparedMessageStore retried = open()) {
+            assertThrows(IllegalStateException.class, retried::requireFreshSourceSession);
             assertEquals(pending.replace("pending/", "ready/"), node.value);
             assertTrue(retried.tables().isEmpty());
         }
