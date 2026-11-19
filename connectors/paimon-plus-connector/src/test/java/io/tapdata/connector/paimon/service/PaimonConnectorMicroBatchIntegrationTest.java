@@ -194,13 +194,13 @@ class PaimonConnectorMicroBatchIntegrationTest {
         return config;
     }
 
-    private static TapTable table(String name) {
+    static TapTable table(String name) {
         return new TapTable(name)
                 .add(new TapField("id", "INT").primaryKeyPos(1))
                 .add(new TapField("value", "STRING"));
     }
 
-    private static TapInsertRecordEvent event(String table, int id, String sourceLane) {
+    static TapInsertRecordEvent event(String table, int id, String sourceLane) {
         Map<String, Object> after = new java.util.LinkedHashMap<>();
         after.put("id", id);
         after.put("value", "v" + id);
@@ -216,7 +216,7 @@ class PaimonConnectorMicroBatchIntegrationTest {
         return event;
     }
 
-    private static HeartbeatEvent heartbeat(Object offset, String sourceLane, Long eventTime) {
+    static HeartbeatEvent heartbeat(Object offset, String sourceLane, Long eventTime) {
         HeartbeatEvent heartbeat = new HeartbeatEvent().init().referenceTime(eventTime);
         heartbeat.addInfo(TapCallbackOffset.KEY_SYNC_STAGE, "CDC");
         heartbeat.addInfo(TapCallbackOffset.KEY_STREAM_OFFSET, offset);
@@ -227,7 +227,7 @@ class PaimonConnectorMicroBatchIntegrationTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static TapConnectorContext connectorContext() {
+    static TapConnectorContext connectorContext() {
         Map<String, Object> values = new ConcurrentHashMap<>();
         KVMap<Object> stateMap = mock(KVMap.class);
         when(stateMap.get(anyString()))

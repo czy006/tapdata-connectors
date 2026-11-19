@@ -2,10 +2,12 @@ package io.tapdata.connector.paimon.config;
 
 import io.tapdata.common.CommonDbConfig;
 import io.tapdata.connector.paimon.util.PaimonSpillDirCleaner;
+import io.tapdata.entity.utils.DataMap;
 import io.tapdata.kit.EmptyKit;
 import org.apache.paimon.table.BucketMode;
 
 import java.io.Serializable;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -95,6 +97,71 @@ public class PaimonConfig extends CommonDbConfig implements Serializable {
 
     // CDC commit interval in milliseconds (default: 30000)
     private Integer commitIntervalMs = 30000;
+
+    // Recovery is selected by a target node only. A shared connection may serve several tasks.
+    private String localRecoveryDir;
+    private String cdcCommitTrigger = "time";
+
+    public String getLocalRecoveryDir() {
+        return localRecoveryDir;
+    }
+
+    public boolean isLocalRecoveryEnabled() {
+        return localRecoveryDir != null;
+    }
+
+    public String getCdcCommitTrigger() {
+        return cdcCommitTrigger;
+    }
+
+    /** Explicit source of the two node-only options; an absent or blank directory disables recovery. */
+    public PaimonConfig loadNodeConfig(Map<String, Object> node) {
+        load(node);
+        localRecoveryDir = nodeString(node, "localRecoveryDir");
+        String trigger = nodeString(node, "cdcCommitTrigger");
+        cdcCommitTrigger = trigger == null ? "time" : trigger;
+        return this;
+    }
+
+    private static String nodeString(Map<String, Object> node, String key) {
+        Object value = node.get(key);
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof String)) {
+            throw new IllegalArgumentException(key + " must be a string");
+        }
+        String text = ((String) value).trim();
+        return text.isEmpty() ? null : text;
+    }
+
+    private void validateRecoverySettings() {
+        if (getTableConfig() != null) {
+            for (Map.Entry<String, DataMap> entry : getTableConfig().entrySet()) {
+                Map<String, Object> values = entry.getValue();
+                if (values != null && (values.containsKey("localRecoveryDir") || values.containsKey("cdcCommitTrigger"))) {
+                    throw new IllegalArgumentException("Table " + entry.getKey()
+                            + ": localRecoveryDir and cdcCommitTrigger must be configured on the target node");
+                }
+            }
+        }
+        if (!isLocalRecoveryEnabled()) {
+            return;
+        }
+        if (localRecoveryDir.chars().anyMatch(Character::isISOControl)
+                || !Paths.get(localRecoveryDir).isAbsolute()) {
+            throw new IllegalArgumentException("localRecoveryDir must be an absolute local directory");
+        }
+        if (!getEnableAsyncCommit() || getCommitIntervalMs() <= 0) {
+            throw new IllegalArgumentException("Local recovery requires enableAsyncCommit=true and commitIntervalMs > 0");
+        }
+        if (!"time".equals(cdcCommitTrigger) && !"timeOrRows".equals(cdcCommitTrigger)) {
+            throw new IllegalArgumentException("cdcCommitTrigger must be time or timeOrRows");
+        }
+        if ("timeOrRows".equals(cdcCommitTrigger) && getBatchAccumulationSize() <= 0) {
+            throw new IllegalArgumentException("timeOrRows requires batchAccumulationSize > 0");
+        }
+    }
 
     // Enable background deadline commits for low-traffic CDC tables (default: true)
     private Boolean enableAsyncCommit = true;
@@ -568,6 +635,8 @@ public class PaimonConfig extends CommonDbConfig implements Serializable {
     @Override
     public PaimonConfig load(Map<String, Object> map) {
         Map<String, Object> normalized = new java.util.HashMap<>(map);
+        normalized.remove("localRecoveryDir");
+        normalized.remove("cdcCommitTrigger");
         for (String key : java.util.Arrays.asList("stopTimeoutSeconds", "finalCompactionTimeoutSeconds", "compactionCancelGraceSeconds")) {
             Object raw = normalized.get(key);
             if (raw == null) { continue; }
@@ -730,6 +799,7 @@ public class PaimonConfig extends CommonDbConfig implements Serializable {
      * @throws IllegalArgumentException if configuration is invalid
      */
     public void validate() {
+        validateRecoverySettings();
         validateExpireMode();
         validateStopBudgets();
         validateTmpDirs();

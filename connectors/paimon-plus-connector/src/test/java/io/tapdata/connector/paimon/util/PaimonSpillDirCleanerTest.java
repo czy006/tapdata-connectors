@@ -22,6 +22,18 @@ class PaimonSpillDirCleanerTest {
     java.nio.file.Path tempDir;
 
     @Test
+    void recoveryDirectoryMustSurviveSpillCleanup() throws Exception {
+        Path root = tempDir.resolve("spill");
+        String configuration = root.toString();
+        PaimonSpillDirCleaner.validateRecoveryLocation(tempDir.resolve("recovery").toString(), configuration);
+        for (Path recovery : java.util.Arrays.asList(root, tempDir, root.resolve("paimon-io-old/state"),
+                root.resolve(PaimonSpillLease.SUBROOT).resolve("owner/state"))) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> PaimonSpillDirCleaner.validateRecoveryLocation(recovery.toString(), configuration));
+        }
+    }
+
+    @Test
     void withConfinedTempDirsMustRedirectTempDirsButDelegateChannels() throws Exception {
         org.apache.paimon.disk.IOManager delegate =
                 org.mockito.Mockito.mock(org.apache.paimon.disk.IOManager.class);

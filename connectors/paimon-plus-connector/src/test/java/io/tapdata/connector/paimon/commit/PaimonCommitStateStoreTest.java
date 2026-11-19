@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
@@ -22,6 +23,52 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class PaimonCommitStateStoreTest {
+
+    @Test
+    void readingMissingRecoveryBindingMustNotInventAnIdentity() throws Exception {
+        StateMapFixture stateMap = new StateMapFixture();
+        FileStoreTable table = tableWithoutSnapshot();
+        assertNull(PaimonCommitStateStore.lookup(stateMap.kvMap, "file:///warehouse", table, null));
+        assertEquals(0, stateMap.values.size());
+    }
+
+    @Test
+    void durableRecoveryInspectsUncertainSnapshotBeforeAdvancingKv() throws Exception {
+        StateMapFixture stateMap = new StateMapFixture();
+        FileStoreTable table = tableWithSnapshot("stable-user", 9L);
+        String key = stateKey(table);
+        String existing = "{\"version\":1,\"commitUser\":\"stable-user\",\"nextCommitIdentifier\":5}";
+        stateMap.values.put(key, existing);
+
+        PaimonCommitStateStore.Binding recovered =
+                PaimonCommitStateStore.bindForRecovery(stateMap.kvMap, "file:///warehouse", table, null);
+        assertEquals(5, recovered.nextCommitIdentifier());
+        assertEquals(existing, stateMap.values.get(key));
+        recovered.store().save(10L);
+        assertEquals(10L, PaimonCommitStateStore.parse(stateMap.values.get(key)).nextCommitIdentifier());
+    }
+
+    @Test
+    void newRecoveryLedgerCannotAdoptAnAheadOfKvSnapshot() throws Exception {
+        StateMapFixture stateMap = new StateMapFixture();
+        FileStoreTable table = tableWithSnapshot("stable-user", 5L);
+        String key = stateKey(table);
+        String kv = "{\"version\":1,\"commitUser\":\"stable-user\",\"nextCommitIdentifier\":5}";
+        stateMap.values.put(key, kv);
+        assertThrows(IllegalStateException.class, () -> PaimonCommitStateStore.bindForNewRecoveryTable(
+                stateMap.kvMap, "file:///warehouse", table, null));
+        assertEquals(kv, stateMap.values.get(key));
+    }
+
+    @Test
+    void newRecoveryLedgerAcceptsAnAlreadyConfirmedSnapshot() throws Exception {
+        StateMapFixture stateMap = new StateMapFixture();
+        FileStoreTable table = tableWithSnapshot("stable-user", 5L);
+        String key = stateKey(table);
+        stateMap.values.put(key, "{\"version\":1,\"commitUser\":\"stable-user\",\"nextCommitIdentifier\":6}");
+        assertEquals(6L, PaimonCommitStateStore.bindForNewRecoveryTable(
+                stateMap.kvMap, "file:///warehouse", table, null).nextCommitIdentifier());
+    }
 
     @Test
     void absentStateShouldAtomicallyPublishAndReuseWinner() throws Exception {

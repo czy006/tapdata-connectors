@@ -29,14 +29,28 @@ public final class PaimonMicroBatchCoordinator {
     private final Object lock = new Object();
     private final int batchAccumulationSize;
     private final long commitIntervalMs;
+    private final String recoveryCommitTrigger;
     private final Map<String, MutableTableState> tables = new LinkedHashMap<>();
     private final Map<String, LaneOffsetState> lanes = new LinkedHashMap<>();
     private long nextCommitTargetId;
     private long nextCallbackToken;
 
     public PaimonMicroBatchCoordinator(int batchAccumulationSize, long commitIntervalMs) {
+        this(batchAccumulationSize, commitIntervalMs, null);
+    }
+
+    /** A null trigger preserves the legacy size/time policy and its interval baseline. */
+    public PaimonMicroBatchCoordinator(
+            int batchAccumulationSize, long commitIntervalMs, String recoveryCommitTrigger) {
+        if (recoveryCommitTrigger != null
+                && (!"time".equals(recoveryCommitTrigger) && !"timeOrRows".equals(recoveryCommitTrigger)
+                    || commitIntervalMs <= 0
+                    || "timeOrRows".equals(recoveryCommitTrigger) && batchAccumulationSize <= 0)) {
+            throw new IllegalArgumentException("Invalid local recovery CDC commit policy");
+        }
         this.batchAccumulationSize = batchAccumulationSize;
         this.commitIntervalMs = commitIntervalMs;
+        this.recoveryCommitTrigger = recoveryCommitTrigger;
     }
 
     public void acceptInitial(String tableKey, int recordCount) {
@@ -44,6 +58,41 @@ public final class PaimonMicroBatchCoordinator {
         requireRecordCount(recordCount);
         synchronized (lock) {
             table(tableKey).bufferedRecordCount += recordCount;
+        }
+    }
+
+    /** Called after a complete initial batch and its ordered native messages are durable. */
+    public void acceptInitial(String tableKey, int recordCount, Set<String> sourceLanes) {
+        requireNonBlank(tableKey, "Table key");
+        requireRecordCount(recordCount);
+        if (recordCount == 0) {
+            return;
+        }
+        if (sourceLanes == null) {
+            throw new IllegalArgumentException("Initial sources must be a set; use an empty set for unknown sources");
+        }
+        for (String lane : sourceLanes) {
+            requireNonBlank(lane, "Source lane");
+        }
+        synchronized (lock) {
+            MutableTableState state = table(tableKey);
+            state.bufferedRecordCount += recordCount;
+            state.initialGeneration = ++state.acceptedGeneration;
+            if (sourceLanes.isEmpty()) {
+                // A source-less batch is a dependency even for lanes first seen after this call.
+                state.allSourceGeneration = state.initialGeneration;
+            } else {
+                for (String lane : sourceLanes) {
+                    state.lastAcceptedGenerationBySource.put(lane, state.initialGeneration);
+                }
+            }
+        }
+    }
+
+    public boolean hasOpenInitial(String tableKey) {
+        synchronized (lock) {
+            MutableTableState state = tables.get(tableKey);
+            return state != null && state.hasOpenInitial();
         }
     }
 
@@ -75,11 +124,11 @@ public final class PaimonMicroBatchCoordinator {
                         sourceLane, state.acceptedGeneration);
             }
 
-            boolean bySize =
-                    batchAccumulationSize <= 0
-                            || state.accumulatedRecordCount >= batchAccumulationSize;
+            boolean bySize = !state.hasOpenInitial() && !"time".equals(recoveryCommitTrigger)
+                    && (batchAccumulationSize <= 0
+                            || state.accumulatedRecordCount >= batchAccumulationSize);
             boolean byTime =
-                    commitIntervalMs > 0
+                    !state.hasOpenInitial() && commitIntervalMs > 0
                             && nowMs - state.commitIntervalBaseTimeMs >= commitIntervalMs;
             return new BatchDecision(
                     state.acceptedGeneration,
@@ -139,7 +188,11 @@ public final class PaimonMicroBatchCoordinator {
                     Math.max(0L, state.bufferedRecordCount - target.bufferedRecordCount);
             state.accumulatedRecordCount =
                     Math.max(0L, state.accumulatedRecordCount - target.accumulatedRecordCount);
-            state.commitIntervalBaseTimeMs = completedAtMs;
+            if (recoveryCommitTrigger == null) {
+                state.commitIntervalBaseTimeMs = completedAtMs;
+            } else if (state.accumulatedRecordCount == 0) {
+                state.commitIntervalBaseTimeMs = null;
+            }
             if (state.pendingCommitTarget != null
                     && state.pendingCommitTarget.id == target.id) {
                 state.pendingCommitTarget = null;
@@ -248,9 +301,10 @@ public final class PaimonMicroBatchCoordinator {
             LaneOffsetState lane = lanes.computeIfAbsent(sourceLane, ignored -> new LaneOffsetState());
             Map<String, Long> required = new LinkedHashMap<>();
             for (Map.Entry<String, MutableTableState> entry : tables.entrySet()) {
-                Long generation =
-                        entry.getValue().lastAcceptedGenerationBySource.get(sourceLane);
-                if (generation != null) {
+                MutableTableState table = entry.getValue();
+                long generation = Math.max(table.allSourceGeneration,
+                        table.lastAcceptedGenerationBySource.getOrDefault(sourceLane, 0L));
+                if (generation > 0) {
                     required.put(entry.getKey(), generation);
                 }
             }
@@ -384,6 +438,7 @@ public final class PaimonMicroBatchCoordinator {
 
     private boolean schedulerEligible(MutableTableState state) {
         return state.cdcEligible
+                && !state.hasOpenInitial()
                 && (state.accumulatedRecordCount > 0
                         || (state.pendingCommitTarget != null
                                 && state.pendingCommitTarget.accumulatedRecordCount > 0));
@@ -664,8 +719,14 @@ public final class PaimonMicroBatchCoordinator {
         private long committedGeneration;
         private CommitTarget pendingCommitTarget;
         private boolean cdcEligible;
+        private long initialGeneration;
+        private long allSourceGeneration;
         private final Map<String, Long> lastAcceptedGenerationBySource =
                 new LinkedHashMap<>();
+
+        private boolean hasOpenInitial() {
+            return initialGeneration > committedGeneration;
+        }
     }
 
     private static final class HeartbeatState {

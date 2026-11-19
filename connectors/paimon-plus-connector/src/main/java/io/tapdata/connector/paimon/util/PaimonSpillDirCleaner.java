@@ -101,6 +101,20 @@ public final class PaimonSpillDirCleaner {
         return IOManagerImpl.splitPaths(resolvedTmpDirs);
     }
 
+    /** Checks canonical paths before any startup reclaim can traverse the configured scratch roots. */
+    public static void validateRecoveryLocation(String recoveryDirectory, String configuredTmpDirs) throws IOException {
+        Path recovery = new File(recoveryDirectory).getCanonicalFile().toPath();
+        for (String rootName : splitTmpDirRoots(resolveTmpDirs(configuredTmpDirs))) {
+            Path root = new File(rootName).getCanonicalFile().toPath();
+            boolean managedChild = recovery.startsWith(root) && !recovery.equals(root)
+                    && root.relativize(recovery).getName(0).toString().startsWith(SPILL_DIR_PREFIX);
+            if (root.startsWith(recovery) || recovery.startsWith(root.resolve(PaimonSpillLease.SUBROOT))
+                    || managedChild) {
+                throw new IllegalArgumentException("Local recovery directory overlaps Paimon spill storage: " + recovery);
+            }
+        }
+    }
+
     /** 独立调用者（测试、诊断）使用的版本：以独立 scope 记账。 */
     public static IOManagerBuildResult resolveAndCreateIOManager(String configuredTmpDirs, String ownerLabel) {
         try {

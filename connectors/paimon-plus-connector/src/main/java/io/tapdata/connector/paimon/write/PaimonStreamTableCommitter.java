@@ -26,7 +26,7 @@ public final class PaimonStreamTableCommitter implements PaimonTableCommitter {
         this(delegate, io.tapdata.connector.paimon.service.PaimonStopResources.Scope.standalone("committer"));
     }
 
-    PaimonStreamTableCommitter(StreamTableCommit delegate,
+    public PaimonStreamTableCommitter(StreamTableCommit delegate,
             io.tapdata.connector.paimon.service.PaimonStopResources.Scope scope) {
         this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.nativeClose = new PaimonNativeCommitterClose(delegate, scope);

@@ -26,6 +26,42 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class PaimonMicroBatchCoordinatorTest {
 
     @Test
+    void timeOnlyRecoveryStartsANewWindowAtFirstRecordAfterIdle() {
+        PaimonMicroBatchCoordinator c = new PaimonMicroBatchCoordinator(2, 100L, "time");
+        Set<String> lane = Collections.singleton("S");
+        assertFalse(c.acceptCdc("A", 100, lane, 10L).shouldCommit());
+        assertTrue(c.isDue("A", 110L));
+        c.publishCommit(c.captureCommitTarget("A"), 111L);
+        assertFalse(c.acceptCdc("A", 2, lane, 9999L).shouldCommit());
+        assertEquals(10099L, c.nextDeadlineMs().getAsLong());
+        PaimonMicroBatchCoordinator byRows = new PaimonMicroBatchCoordinator(2, 100L, "timeOrRows");
+        assertTrue(byRows.acceptCdc("A", 2, lane, 10L).shouldCommitBySize());
+    }
+
+    @Test
+    void initialWithoutSourceBlocksEvenFutureLanesAndHoldsMixedCdcUntilCompletion() {
+        PaimonMicroBatchCoordinator c = new PaimonMicroBatchCoordinator(1, 100L, "timeOrRows");
+        c.acceptInitial("A", 2, Collections.emptySet());
+        assertTrue(c.hasOpenInitial("A"));
+        assertFalse(c.acceptCdc("A", 3, Collections.singleton("sourceB"), 10L).shouldCommit());
+        assertFalse(c.nextDeadlineMs().isPresent());
+        assertNull(c.registerHeartbeat("newSource", new TapCallbackOffset()));
+        assertNull(c.registerHeartbeat("sourceB", new TapCallbackOffset()));
+        assertEquals(2, c.publishCommit(c.captureCommitTarget("A"), 300L).size());
+        assertFalse(c.hasOpenInitial("A"));
+        assertTrue(c.acceptCdc("A", 1, Collections.singleton("sourceB"), 400L).shouldCommit());
+    }
+
+    @Test
+    void initialWithKnownSourceOnlyDelaysThatLane() {
+        PaimonMicroBatchCoordinator c = new PaimonMicroBatchCoordinator(1, 100L, "time");
+        c.acceptInitial("A", 2, Collections.singleton("S"));
+        assertNull(c.registerHeartbeat("S", new TapCallbackOffset()));
+        assertTrue(c.registerHeartbeat("other", new TapCallbackOffset()) != null);
+        assertEquals(1, c.publishCommit(c.captureCommitTarget("A"), 10L).size());
+    }
+
+    @Test
     void initialAndCdcMustUseIndependentCountersAndGenerations() {
         PaimonMicroBatchCoordinator coordinator =
                 new PaimonMicroBatchCoordinator(3, 1000L);

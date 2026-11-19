@@ -9,6 +9,10 @@ import io.tapdata.connector.paimon.commit.PaimonCommitStateStore;
 import io.tapdata.connector.paimon.commit.PaimonMicroBatchCoordinator;
 import io.tapdata.connector.paimon.commit.PaimonServiceLifecycle;
 
+import io.tapdata.connector.paimon.recovery.LocalRecoveryTable;
+import io.tapdata.connector.paimon.recovery.PreparedMessageStore;
+import io.tapdata.connector.paimon.recovery.PublicationVerifier;
+import io.tapdata.connector.paimon.schema.PaimonRecoveryAdmission;
 import io.tapdata.connector.paimon.write.PaimonTableWriteContext;
 import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterStrategyFactory;
 import io.tapdata.connector.paimon.schema.PaimonWriteSemanticContract;
@@ -181,6 +185,7 @@ public class PaimonService implements AutoCloseable {
             new AtomicReference<>();
     /** Connector 注入的 offset 回调；只允许在 NEW 状态绑定，运行后不可替换。 */
     private Consumer<Object> flushOffsetCallback;
+    private Consumer<Throwable> recoveryFailureListener;
     /** 最近一次执行写入的任务上下文，供兼容的异步线程取得任务日志；跨线程读取需要 volatile。 */
     private volatile TapConnectorContext activeConnectorContext;
     /**
@@ -188,6 +193,9 @@ public class PaimonService implements AutoCloseable {
      * 一个 Service 生命周期内禁止切换到另一个任务状态 Map。
      */
     private volatile KVMap<Object> boundTaskStateMap;
+    private PreparedMessageStore recoveryStore;
+    private volatile boolean recoveryReady;
+    private final Map<String, LocalRecoveryTable> recoveryTables = new ConcurrentHashMap<>();
     /**
      * 写入侧粘滞故障栅栏。首次不可安全继续的异常会保存在这里，后续写入统一失败并要求重启，
      * 防止复用已经部分推进的 writer、router 或提交状态。
@@ -226,7 +234,9 @@ public class PaimonService implements AutoCloseable {
     private Log log;
 
     public PaimonService(PaimonConfig config, Log log) {
-        this(config, log, System::currentTimeMillis, RetryWaiter.INTERRUPTIBLE_ONE_SECOND);
+        this(config, log, config.isLocalRecoveryEnabled()
+                        ? () -> TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) : System::currentTimeMillis,
+                RetryWaiter.INTERRUPTIBLE_ONE_SECOND);
     }
 
     PaimonService(
@@ -267,7 +277,8 @@ public class PaimonService implements AutoCloseable {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.retryWaiter = Objects.requireNonNull(retryWaiter, "retryWaiter");
         this.microBatchCoordinator = new PaimonMicroBatchCoordinator(
-                config.getBatchAccumulationSize(), config.getCommitIntervalMs());
+                config.getBatchAccumulationSize(), config.getCommitIntervalMs(),
+                config.isLocalRecoveryEnabled() ? config.getCdcCommitTrigger() : null);
         this.asyncCommitScheduler = new PaimonAsyncCommitScheduler(
                 Boolean.TRUE.equals(config.getEnableAsyncCommit()) && config.getCommitIntervalMs() > 0,
                 config.getAsyncCommitConcurrency(),
@@ -275,7 +286,7 @@ public class PaimonService implements AutoCloseable {
                 clock::getAsLong,
                 schedulerExecutorFactory,
                 this::flushScheduledTable,
-                this::recordStickyFailure);
+                this::reportScheduledFailure);
     }
 
     /**
@@ -293,13 +304,90 @@ public class PaimonService implements AutoCloseable {
         }
     }
 
+    /** Called by the initialized target node before exposing its service to PDK callbacks. */
+    public synchronized void startLocalRecovery(TapConnectorContext context) throws Exception {
+        if (!config.isLocalRecoveryEnabled()) {
+            return;
+        }
+        bindTaskState(context);
+        if (recoveryReady) {
+            return;
+        }
+        try (PaimonServiceLifecycle.Ingress ignored = enterIngress("recover Paimon prepared files")) {
+            if (flushOffsetCallback == null) {
+                throw new IllegalStateException("Local recovery requires FLUSH_OFFSET_CALLBACK on the target node");
+            }
+            if (recoveryStore != null) {
+                throw new IllegalStateException("Failed recovery requires a new connector instance");
+            }
+            recoveryStore = PreparedMessageStore.open(java.nio.file.Paths.get(config.getLocalRecoveryDir()), boundTaskStateMap);
+            for (PreparedMessageStore.Table stored : recoveryStore.tables()) {
+                if (!config.getDatabase().equals(stored.database())) {
+                    throw new IllegalStateException("Recovery directory is bound to a different database");
+                }
+                Identifier id = Identifier.create(stored.database(), stored.name());
+                FileStoreTable table = recoveryWriteTable(id);
+                PaimonRecoveryAdmission.validateTable(config, stored.name(), table);
+                registerPhysicalTableOwner(id.getFullName(), table);
+                PaimonCommitStateStore.Binding binding = PaimonCommitStateStore.lookup(
+                        boundTaskStateMap, config.getFullWarehousePath(), table, stopController);
+                if (binding == null) {
+                    throw new IllegalStateException("Missing Paimon task-state binding for " + id.getFullName());
+                }
+                LocalRecoveryTable recovery = new LocalRecoveryTable(stored, binding,
+                        () -> recoveryWriteTable(id), stopController, table);
+                long pending = stored.prepared() - stored.published();
+                long started = System.nanoTime();
+                recovery.recover(stopResources);
+                if (pending > 0) {
+                    PaimonStopLog.offer(log, "Recovered Paimon prepared batches: table=" + id.getFullName()
+                            + ", batches=" + pending + ", published=" + stored.published()
+                            + ", elapsedMs=" + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), null);
+                }
+            }
+            recoveryReady = true;
+        } catch (Exception | Error failure) {
+            recordStickyFailure(failure);
+            throw failure;
+        }
+    }
+
+    private FileStoreTable recoveryWriteTable(Identifier id) throws Exception {
+        // A cached schema could still identify the old table after replacement or ALTER TABLE.
+        Table current = stopController.call("load recovery table", () -> {
+            catalog.invalidateTable(id);
+            return catalog.getTable(id);
+        });
+        return PaimonWriteOptions.runtimeWriteTable(requireWriteTable(id, current), config);
+    }
+
+    private void requireRecoveryReady() {
+        if (config.isLocalRecoveryEnabled() && !recoveryReady) {
+            throw new IllegalStateException("Paimon local recovery has not completed");
+        }
+    }
+
+    public void failLocalRecovery(Throwable failure) {
+        if (config.isLocalRecoveryEnabled()) {
+            recordStickyFailure(failure);
+        }
+    }
+
     private synchronized void initializeCatalog() throws Exception {
         if (lifecycle.state() != PaimonServiceLifecycle.State.NEW) {
             throw new IllegalStateException(
                     "Paimon service cannot initialize while lifecycle is "
                             + lifecycle.state());
         }
-            config.validate();
+        config.validate();
+        if (config.isLocalRecoveryEnabled()) {
+            PaimonSpillDirCleaner.validateRecoveryLocation(config.getLocalRecoveryDir(), config.getDiskTmpDir());
+            if (config.getTableConfig() != null) {
+                for (String table : config.getTableConfig().keySet()) {
+                    PaimonSpillDirCleaner.validateRecoveryLocation(config.getLocalRecoveryDir(), config.getDiskTmpDir(table));
+                }
+            }
+        }
 
         // 回收其他 JVM 异常终止（OOM/crash/SIGKILL）后遗留的 Spill 租约，避免本地磁盘耗尽。本 JVM 的
         // 命名空间按名称跳过、不打开任何文件；外部租约只在 OS 锁可取得时回收（SPEC-paimon-spill-owner-isolation §4.5）。
@@ -698,7 +786,19 @@ public class PaimonService implements AutoCloseable {
      */
     public boolean createTable(TapTable tapTable) throws Exception {
         try (PaimonServiceLifecycle.Ingress ignored = enterIngress("createTable")) {
-            return createTableInternal(tapTable);
+            requireRecoveryReady();
+            if (!config.isLocalRecoveryEnabled()) {
+                return createTableInternal(tapTable);
+            }
+            String key = config.getDatabase() + "." + tapTable.getName();
+            synchronized (commitLocks.computeIfAbsent(key, unused -> new Object())) {
+                try {
+                    return createTableInternal(tapTable);
+                } catch (Exception | Error failure) {
+                    recordStickyFailure(failure);
+                    throw failure;
+                }
+            }
         }
     }
 
@@ -721,6 +821,9 @@ public class PaimonService implements AutoCloseable {
             Table existingTable = stopController.call("catalog getTable", () -> catalog.getTable(identifier));
             if (existingTable instanceof FileStoreTable) {
                 FileStoreTable existingFileStoreTable = requireWriteTable(identifier, existingTable);
+                if (config.isLocalRecoveryEnabled()) {
+                    PaimonRecoveryAdmission.validateInput(config, tapTable, existingFileStoreTable);
+                }
                 BucketMode existingMode = existingFileStoreTable.bucketMode();
                 BucketMode configuredMode =
                         PaimonWriteSemanticContractResolver.deriveBucketMode(
@@ -735,9 +838,15 @@ public class PaimonService implements AutoCloseable {
                             tableName, existingMode, configuredMode);
                 }
             }
+            if (config.isLocalRecoveryEnabled() && !(existingTable instanceof FileStoreTable)) {
+                throw new IllegalArgumentException("Local recovery requires a Paimon FileStoreTable: " + identifier);
+            }
             // Table exists, no need to recreate
             return false;
         } catch (Catalog.TableNotExistException e) {
+            if (config.isLocalRecoveryEnabled() && recoveryStore.find(database, tableName) != null) {
+                throw new IllegalStateException("Registered recovery table disappeared: " + identifier.getFullName(), e);
+            }
             // Table does not exist, continue to create
         }
 
@@ -903,6 +1012,8 @@ public class PaimonService implements AutoCloseable {
         PaimonWriteSemanticContractResolver.validateNewTable(
                 identifier.getFullName(), finalSchema);
 
+        PaimonRecoveryAdmission.validateNewTable(config, tapTable, finalSchema);
+
         // Create only after the final Paimon write contract has passed validation.
         final Schema schemaToCreate = finalSchema;
         stopController.run("catalog createTable", () -> catalog.createTable(identifier, schemaToCreate, false));
@@ -1004,7 +1115,14 @@ public class PaimonService implements AutoCloseable {
     private void runTableDdl(String tableKey, String tableName, TableDdlAction action)
             throws Exception {
         try (PaimonServiceLifecycle.Ingress ignored = enterIngress("DDL")) {
+            requireRecoveryReady();
             throwIfStickyWriteFailure();
+            if (config.isLocalRecoveryEnabled()) {
+                PaimonFatalWriteException unsupported = new PaimonFatalWriteException(
+                        "Recovery needs a controlled new generation for drop/truncate: " + tableKey);
+                recordStickyFailure(unsupported);
+                throw unsupported;
+            }
             List<PaimonMicroBatchCoordinator.CallbackReservation> ready = new ArrayList<>();
             Throwable ddlFailure = null;
             boolean drainSucceeded = false;
@@ -1124,6 +1242,7 @@ public class PaimonService implements AutoCloseable {
     public WriteListResult<TapRecordEvent> writeRecords(List<TapRecordEvent> recordEvents,
                                                 TapTable table,
                                                 TapConnectorContext connectorContext) throws Exception {
+        requireRecoveryReady();
         throwIfConcurrentIngressStickyFailure();
         try (PaimonServiceLifecycle.Ingress ignored = enterIngress("writeRecords")) {
             if (recordEvents == null || recordEvents.isEmpty()) {
@@ -1190,12 +1309,14 @@ public class PaimonService implements AutoCloseable {
     }
 
     public void afterInitialSync(TapConnectorContext connectorContext, TapTable tapTable) throws Exception {
+        requireRecoveryReady();
         try (PaimonServiceLifecycle.Ingress ignored = enterIngress("afterInitialSync")) {
             String tableName = tapTable.getName();
             String database = config.getDatabase();
             String tableKey = database + "." + tableName;
             DynamicIngressGuard ingressGuard = dynamicSourceIngressGuard(tableKey, tableName);
             beginSourceIngress(ingressGuard, "afterInitialSync", tableKey);
+            List<PaimonMicroBatchCoordinator.CallbackReservation> ready;
             boolean successful = false;
             try {
                 bindTaskState(connectorContext);
@@ -1205,12 +1326,15 @@ public class PaimonService implements AutoCloseable {
                     cacheSourceDerivedState(tableName, tapTable);
                     PaimonTableWriteContext writeContext =
                             getOrCreateTableWriteContext(tableKey, tableName, identifier, connectorContext);
+                    if (config.isLocalRecoveryEnabled()) {
+                        PaimonRecoveryAdmission.validateInput(config, tapTable, recoveryTables.get(tableKey).writerTable());
+                    }
                     if (writeContext.hasPendingCommit()) {
-                        confirmPendingCommitLocked(writeContext, tableKey, "initial-pending");
+                        ready = confirmPendingCommitLocked(writeContext, tableKey, "initial-pending");
                     } else {
                         // afterInitialSync is a per-table completion boundary. Preserve the
                         // existing forced commit even when this table received no rows.
-                        commitTableLocked(writeContext, tableKey, "initial");
+                        ready = commitTableLocked(writeContext, tableKey, "initial");
                     }
                 }
                 successful = true;
@@ -1219,6 +1343,9 @@ public class PaimonService implements AutoCloseable {
                 throw failure;
             } finally {
                 endSourceIngress(ingressGuard, successful);
+            }
+            if (config.isLocalRecoveryEnabled()) {
+                executeCallbacks(ready, false);
             }
             asyncCommitScheduler.stateChanged();
         }
@@ -1283,6 +1410,9 @@ public class PaimonService implements AutoCloseable {
                     }
                 }
 
+                if (config.isLocalRecoveryEnabled()) {
+                    writeContext.stageRecoveryBatch(!metadata.cdc, metadata.sourceLanes);
+                }
                 if (metadata.cdc) {
                     PaimonMicroBatchCoordinator.BatchDecision decision =
                             microBatchCoordinator.acceptCdc(
@@ -1296,12 +1426,14 @@ public class PaimonService implements AutoCloseable {
                                 tableKey,
                                 decision.shouldCommitBySize() ? "size" : "time"));
                     }
+                } else if (config.isLocalRecoveryEnabled()) {
+                    microBatchCoordinator.acceptInitial(tableKey, recordEvents.size(), metadata.sourceLanes);
                 } else {
                     microBatchCoordinator.acceptInitial(tableKey, recordEvents.size());
                 }
             }
         } catch (Exception | Error failure) {
-            if (failure instanceof PaimonDynamicBucketPollutedException
+            if (config.isLocalRecoveryEnabled() || failure instanceof PaimonDynamicBucketPollutedException
                     || failure instanceof PaimonFatalWriteException
                     || failure instanceof Error
                     || writerIngressStarted) {
@@ -1318,7 +1450,12 @@ public class PaimonService implements AutoCloseable {
     private DmlMetadata validateDmlMetadata(List<TapRecordEvent> recordEvents) {
         Boolean cdc = null;
         Set<String> sourceLanes = new LinkedHashSet<>();
+        boolean unknownInitialSource = false;
         for (TapRecordEvent event : recordEvents) {
+            if (config.isLocalRecoveryEnabled() && !(event instanceof TapInsertRecordEvent)
+                    && !(event instanceof TapUpdateRecordEvent) && !(event instanceof TapDeleteRecordEvent)) {
+                throw new PaimonFatalWriteException("Unsupported record kind in Paimon recovery batch");
+            }
             Map<String, Object> info = event.getInfo();
             Object rawStage = info == null ? null : info.get(TapRecordEvent.INFO_KEY_SYNC_STAGE);
             String stage = normalizeSyncStage(rawStage);
@@ -1329,6 +1466,14 @@ public class PaimonService implements AutoCloseable {
             }
             cdc = eventCdc;
             if (!eventCdc) {
+                if (config.isLocalRecoveryEnabled()) {
+                    Object nodes = info.get(TapCallbackOffset.KEY_NODE_IDS);
+                    if (nodes == null || nodes instanceof List && ((List<?>) nodes).isEmpty()) {
+                        unknownInitialSource = true;
+                    } else {
+                        sourceLanes.add(firstSourceLane(nodes, "INITIAL DML"));
+                    }
+                }
                 continue;
             }
 
@@ -1347,7 +1492,8 @@ public class PaimonService implements AutoCloseable {
                 }
             }
         }
-        return new DmlMetadata(Boolean.TRUE.equals(cdc), sourceLanes);
+        return new DmlMetadata(Boolean.TRUE.equals(cdc),
+                unknownInitialSource ? Collections.emptySet() : sourceLanes);
     }
 
     private static String normalizeSyncStage(Object rawStage) {
@@ -1385,6 +1531,7 @@ public class PaimonService implements AutoCloseable {
     }
 
     public void processHeartbeat(HeartbeatEvent heartbeat) throws Exception {
+        requireRecoveryReady();
         try (PaimonServiceLifecycle.Ingress ignored = enterIngress("heartbeat")) {
             try {
                 if (heartbeat == null) {
@@ -1627,6 +1774,20 @@ public class PaimonService implements AutoCloseable {
         }
     }
 
+    public synchronized void setRecoveryFailureListener(Consumer<Throwable> listener) {
+        if (lifecycle.state() != PaimonServiceLifecycle.State.NEW) {
+            throw new IllegalStateException("Bind the recovery failure listener before service initialization");
+        }
+        this.recoveryFailureListener = Objects.requireNonNull(listener, "listener");
+    }
+
+    private void reportScheduledFailure(Throwable failure) {
+        recordStickyFailure(failure);
+        if (recoveryFailureListener != null) {
+            recoveryFailureListener.accept(stickyWriteFailure.get());
+        }
+    }
+
     private void recordStickyFailure(Throwable failure) {
         if (failure == null) {
             return;
@@ -1765,13 +1926,42 @@ public class PaimonService implements AutoCloseable {
                             ? PaimonWriteSemanticContractResolver.resolve(
                                     tableKey, fileStoreTable)
                             : preResolvedContract;
+            if (config.isLocalRecoveryEnabled()) {
+                PaimonRecoveryAdmission.validateTable(config, tableName, fileStoreTable);
+            }
             registerPhysicalTableOwner(tableKey, fileStoreTable);
             PaimonStopResources.Scope construction = stopResources.scope("writer " + tableKey, stopController);
             try {
-                PaimonCommitStateStore.Binding binding = PaimonCommitStateStore.bind(
-                        boundTaskStateMap,
-                        config.getFullWarehousePath(),
-                        fileStoreTable, stopController);
+                PreparedMessageStore.Table stored = config.isLocalRecoveryEnabled()
+                        ? recoveryStore.find(config.getDatabase(), tableName) : null;
+                PaimonCommitStateStore.Binding binding;
+                if (stored != null) {
+                    binding = PaimonCommitStateStore.lookup(boundTaskStateMap, config.getFullWarehousePath(),
+                            fileStoreTable, stopController);
+                    if (binding == null) {
+                        throw new IllegalStateException("Missing existing task-state identity for " + tableKey);
+                    }
+                } else if (config.isLocalRecoveryEnabled()) {
+                    binding = PaimonCommitStateStore.bindForNewRecoveryTable(boundTaskStateMap,
+                            config.getFullWarehousePath(), fileStoreTable, stopController);
+                } else {
+                    binding = PaimonCommitStateStore.bind(boundTaskStateMap, config.getFullWarehousePath(),
+                            fileStoreTable, stopController);
+                }
+                LocalRecoveryTable recovery = null;
+                if (config.isLocalRecoveryEnabled()) {
+                    String anchor = PublicationVerifier.fingerprint(fileStoreTable);
+                    if (stored == null) {
+                        stored = recoveryStore.register(config.getDatabase(), tableName,
+                                LocalRecoveryTable.identity(fileStoreTable), binding.commitUser(),
+                                binding.nextCommitIdentifier(), anchor);
+                    } else if (!stored.anchor().equals(anchor) || stored.prepared() != stored.published()
+                            || stored.confirmedNextIdentifier() != binding.nextCommitIdentifier()) {
+                        throw new IllegalStateException("Table changed after startup recovery: " + tableKey);
+                    }
+                    recovery = new LocalRecoveryTable(stored, binding, () -> recoveryWriteTable(identifier),
+                            stopController, fileStoreTable);
+                }
                 if (fileStoreTable.bucketMode() == BucketMode.HASH_DYNAMIC) {
                     PaimonDynamicBucketPreflight.ensureHashDynamicValidated(
                             boundTaskStateMap,
@@ -1798,6 +1988,10 @@ public class PaimonService implements AutoCloseable {
                         binding.store(),
                         io.tapdata.connector.paimon.write.bucket.DefaultPaimonBucketWriterRuntimeFactory.INSTANCE,
                         writeSemanticContract, construction);
+                if (recovery != null) {
+                    writeContext.attachRecovery(recovery);
+                    recoveryTables.put(tableKey, recovery);
+                }
                 // 已持有表级锁；短控制门禁中只安装内存引用，不进入 Factory 或 Context。
                 stopController.publish("install write context", () -> {
                     tableWriteContexts.put(tableKey, writeContext);
@@ -1849,6 +2043,11 @@ public class PaimonService implements AutoCloseable {
                             tableKey, fileStoreTable);
         }
 
+        if (config.isLocalRecoveryEnabled()) {
+            FileStoreTable writerTable = existingContext == null
+                    ? fileStoreTable : recoveryTables.get(tableKey).writerTable();
+            PaimonRecoveryAdmission.validateInput(config, tapTable, writerTable);
+        }
         PaimonGeneratedFieldDependencies generatedFields =
                 generatedFieldDependencies(tapTable);
         PaimonDmlImageValidator.validateBatch(
@@ -2032,7 +2231,7 @@ public class PaimonService implements AutoCloseable {
         }
 
         String tableKey = config.getDatabase() + "." + table.getName();
-        List<DataField> targetFields = paimonFieldCache.get(tableKey);
+        List<DataField> targetFields = writerFields(tableKey);
         if (targetFields == null) {
             throw new PaimonFatalWriteException(
                     "Paimon target RowType is not cached for primary-key comparison on " + tableKey);
@@ -2249,6 +2448,13 @@ public class PaimonService implements AutoCloseable {
                 + "{referenceTime=" + event.getReferenceTime() + '}';
     }
 
+    private List<DataField> writerFields(String tableKey) {
+        if (config.isLocalRecoveryEnabled()) {
+            return recoveryTables.get(tableKey).writerTable().rowType().getFields();
+        }
+        return paimonFieldCache.get(tableKey);
+    }
+
     /**
      * Convert map to GenericRow
      *
@@ -2261,7 +2467,7 @@ public class PaimonService implements AutoCloseable {
     private GenericRow convertToGenericRow(Map<String, Object> data, TapTable table, Identifier identifier) throws Exception {
         // Get or build field type mapping from cache
         String cacheKey = identifier.getFullName();
-        List<DataField> paimonFields = paimonFieldCache.get(cacheKey);
+        List<DataField> paimonFields = writerFields(cacheKey);
 
         if (paimonFields == null) {
             // Cache miss - build field type mapping
@@ -2369,6 +2575,9 @@ public class PaimonService implements AutoCloseable {
     }
 
     private DynamicIngressGuard dynamicSourceIngressGuard(String tableKey, String tableName) throws Exception {
+        if (config.isLocalRecoveryEnabled()) {
+            return dynamicSourceIngressGuards.computeIfAbsent(tableKey, ignored -> new DynamicIngressGuard());
+        }
         PaimonTableWriteContext existing = tableWriteContexts.get(tableKey);
         BucketMode mode;
         if (existing != null) {
@@ -3500,13 +3709,21 @@ public class PaimonService implements AutoCloseable {
         }
     }
 
+    private boolean hasUnfinishedRecoveryInitial(String tableKey, PaimonTableWriteContext writer) {
+        // A prepare can become durable before its in-memory coordinator update returns.
+        return config.isLocalRecoveryEnabled() && (microBatchCoordinator.hasOpenInitial(tableKey)
+                || (writer != null && writer.hasOpenRecoveryInitial()));
+    }
+
     private void performDrainAndCleanup(PaimonStopController operation) {
         try {
             for (String tableKey : new ArrayList<>(tableWriteContexts.keySet())) {
                 try {
                     setClosePhase(operation, tableKey, "DRAIN");
                     operation.checkAction("drain table");
-                    flushTableInternal(tableKey, "stop", true);
+                    if (!hasUnfinishedRecoveryInitial(tableKey, tableWriteContexts.get(tableKey))) {
+                        flushTableInternal(tableKey, "stop", true);
+                    }
                 } catch (Throwable drainFailure) {
                     recordCloseFailure(operation, drainFailure);
                 }
@@ -3559,7 +3776,8 @@ public class PaimonService implements AutoCloseable {
                 // Compaction，因此不能像旧协议一样预先 broadcast shutdown。
                 // https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/mergetree/MergeTreeWriter.java#L252
                 PaimonTableWriteContext.StopOutcome result = context.closeForStop(
-                        businessBarrier && closeFailure(operation) == null,
+                        businessBarrier && closeFailure(operation) == null
+                                && !hasUnfinishedRecoveryInitial(tableKey, context),
                         new PaimonTableWriteContext.CloseObserver() {
                             @Override
                             public void phase(String phase) { setClosePhase(operation, tableKey, phase); }
@@ -3616,6 +3834,17 @@ public class PaimonService implements AutoCloseable {
             } catch (Throwable catalogFailure) {
                 failure = appendFailure(failure, catalogFailure);
                 retainClose(operation, failure);
+            }
+        }
+        if (!operation.isRetained() && recoveryStore != null) {
+            try {
+                operation.run("close Paimon recovery directory", recoveryStore::close);
+                recoveryStore = null;
+                recoveryReady = false;
+                recoveryTables.clear();
+            } catch (Throwable closeFailure) {
+                retainClose(operation, closeFailure);
+                failure = appendFailure(failure, closeFailure);
             }
         }
         if (failure != null) { rethrow(failure); }

@@ -69,43 +69,72 @@ public final class PaimonCommitStateStore implements PaimonTableWriteContext.Com
             KVMap<Object> stateMap,
             String warehouse,
             FileStoreTable table, PaimonStopController controller) throws Exception {
+        Binding binding = bindForRecovery(stateMap, warehouse, table, controller);
+        Optional<Snapshot> latest =
+                call(controller, "reconcile latest user snapshot", () -> table.snapshotManager()
+                        .latestSnapshotOfUserFromFilesystem(binding.commitUser));
+        // The legacy path repairs a lost KV update using the latest same-user snapshot. In local
+        // recovery mode this would erase evidence of a partly published APPEND / COMPACT pair.
+        long snapshotNext = latest.map(PaimonCommitStateStore::nextIdentifier).orElse(0L);
+        if (snapshotNext > binding.nextCommitIdentifier) {
+            binding.store.save(snapshotNext);
+            return new Binding(binding.commitUser, snapshotNext, binding.store, binding.stateKey);
+        }
+        return binding;
+    }
+
+    /** Reads the task binding without changing either its identity or its high watermark. */
+    public static Binding lookup(KVMap<Object> stateMap, String warehouse, FileStoreTable table,
+            PaimonStopController controller) {
         if (stateMap == null) {
             throw new IllegalStateException("Tap task state map is required for stable Paimon commits");
         }
-
         String key = stateKey(warehouse, table.location().toUri().toString());
-        State candidate =
-                new State(
-                        VERSION,
-                        "tapdata-paimon-" + UUID.randomUUID().toString().replace("-", ""),
-                        0L);
         Object stored = call(controller, "read commit identity", () -> stateMap.get(key));
         if (stored == null) {
-            String candidateJson = encode(candidate);
-            Object raced = call(controller, "create commit identity", () -> stateMap.putIfAbsent(key, candidateJson));
-            stored = raced == null ? call(controller, "verify commit identity", () -> stateMap.get(key)) : raced;
-            if (stored == null) {
+            return null;
+        }
+        State state = parse(stored);
+        return new Binding(state.commitUser, state.nextCommitIdentifier,
+                new PaimonCommitStateStore(stateMap, key, state.commitUser, controller), key);
+    }
+
+    /**
+     * Obtains a binding for new ingress, without inferring publication from a Paimon snapshot id.
+     * Recovery of an existing local ledger must use lookup first and require the exact commitUser.
+     * https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/operation/FileStoreCommitImpl.java#L323
+     */
+    public static Binding bindForRecovery(KVMap<Object> stateMap, String warehouse, FileStoreTable table,
+            PaimonStopController controller) {
+        Binding binding = lookup(stateMap, warehouse, table, controller);
+        if (binding == null) {
+            String key = stateKey(warehouse, table.location().toUri().toString());
+            State candidate = new State(VERSION,
+                    "tapdata-paimon-" + UUID.randomUUID().toString().replace("-", ""), 0L);
+            call(controller, "create commit identity", () -> stateMap.putIfAbsent(key, encode(candidate)));
+            binding = lookup(stateMap, warehouse, table, controller);
+            if (binding == null) {
                 throw new IllegalStateException("Paimon commit state was not visible after putIfAbsent");
             }
         }
+        return binding;
+    }
 
-        State winner = parse(stored);
-        PaimonCommitStateStore store =
-                new PaimonCommitStateStore(stateMap, key, winner.commitUser, controller);
-
-        Optional<Snapshot> latest =
-                call(controller, "reconcile latest user snapshot", () -> table.snapshotManager()
-                        .latestSnapshotOfUserFromFilesystem(winner.commitUser));
-        // Reconciliation repairs "snapshot committed, task-state update failed" while that
-        // same-user snapshot is still retained. It cannot recreate an expired snapshot's pending
-        // CommitMessages or determine whether the source offset advanced with that snapshot.
-        long snapshotNext = latest.map(PaimonCommitStateStore::nextIdentifier).orElse(0L);
-        long reconciledNext = Math.max(winner.nextCommitIdentifier, snapshotNext);
-        if (reconciledNext != winner.nextCommitIdentifier) {
-            // Persist reconciliation before any writer/router using this state can be published.
-            store.save(reconciledNext);
+    /**
+     * First enrollment at an independently verified baseline. With no local publication history,
+     * an ahead-of-KV snapshot could be the APPEND half of an uncertain legacy commit. The new
+     * ledger may not silently adopt that prefix.
+     */
+    public static Binding bindForNewRecoveryTable(KVMap<Object> stateMap, String warehouse,
+            FileStoreTable table, PaimonStopController controller) {
+        Binding binding = bindForRecovery(stateMap, warehouse, table, controller);
+        Optional<Snapshot> latest = call(controller, "check initial recovery baseline",
+                () -> table.snapshotManager().latestSnapshotOfUserFromFilesystem(binding.commitUser));
+        if (latest.isPresent() && nextIdentifier(latest.get()) > binding.nextCommitIdentifier) {
+            throw new IllegalStateException("Cannot enroll Paimon table in local recovery: "
+                    + "snapshot for the task commit user is ahead of its confirmed identifier");
         }
-        return new Binding(winner.commitUser, reconciledNext, store, key);
+        return binding;
     }
 
     @Override

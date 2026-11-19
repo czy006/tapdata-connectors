@@ -15,12 +15,15 @@ import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.table.sink.CommitMessageImpl;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Owns the connector transaction state for one physical Paimon table.
@@ -28,12 +31,9 @@ import java.util.Objects;
  * <p>Bucket-specific routing and raw writer ownership belong exclusively to {@link
  * PaimonBucketWriterStrategy}; raw commit ownership belongs exclusively to {@link
  * PaimonTableCommitter}. This context only coordinates prepare, pending retry and task-state commit
- * identity. {@link #pendingCommits} is deliberately the in-process retry envelope for one table;
- * unlike Paimon's Flink sink it is not operator state and cannot restore CommitMessages after a
- * process crash. Paimon's Flink integration persists those committables as operator state; this
- * connector does not. Source: {@code paimon-flink/paimon-flink-common/src/main/java/org/apache/
- * paimon/flink/sink/RestoreCommittableStateManager.java}, lines 36-87. Baseline: {@code
- * apache/paimon@5c59e6cb01ed0b29563371f56e14fcade4597a2e}.
+ * identity. The default mode retains the in-process retry envelope in {@link #pendingCommits}.
+ * In local recovery mode the table instead stages native messages before acknowledging a batch
+ * and publishes the retained prefix at the service's existing commit boundaries.
  */
 public final class PaimonTableWriteContext implements AutoCloseable {
 
@@ -69,6 +69,12 @@ public final class PaimonTableWriteContext implements AutoCloseable {
     private final Map<Long, List<CommitMessage>> pendingCommits = new LinkedHashMap<>();
 
     private long nextCommitIdentifier;
+    private PaimonRecoveryTable recovery;
+    private long lastStagedIdentifier = -1;
+    private long lastPublishedRecoveryIdentifier = -1;
+    private boolean recoveryPublishPending;
+    private boolean openRecoveryInitial;
+    private boolean recoveryRowsAwaitingPrepare;
     private volatile CloseState closeState = CloseState.ACTIVE;
     private volatile boolean failed;
 
@@ -230,11 +236,122 @@ public final class PaimonTableWriteContext implements AutoCloseable {
     }
 
     public synchronized boolean hasPendingCommit() {
-        return !pendingCommits.isEmpty();
+        return recoveryPublishPending || !pendingCommits.isEmpty();
+    }
+
+    /** Installed when building a fresh writer, before the service opens it to ingress. */
+    public synchronized void attachRecovery(PaimonRecoveryTable recovery) {
+        ensureOpen();
+        if (this.recovery != null || !pendingCommits.isEmpty()) {
+            throw new IllegalStateException("Paimon recovery already bound or commit in progress: " + tableKey);
+        }
+        this.recovery = Objects.requireNonNull(recovery, "recovery");
+    }
+
+    /** True while an unsealed full-load prefix is owned by this writer. */
+    public synchronized boolean hasOpenRecoveryInitial() {
+        return openRecoveryInitial;
+    }
+
+    /**
+     * Called exactly once after all rows of a nonempty TapData batch, before returning its result.
+     * The writer's prepare drains per-bucket increments. A failed persistence attempt therefore
+     * poisons this writer; retrying prepare on it could acknowledge a different (empty) increment.
+     * https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/mergetree/MergeTreeWriter.java#L252
+     */
+    public synchronized void stageRecoveryBatch(boolean initial, Set<String> sourceLanes) throws Exception {
+        if (recovery == null) {
+            return;
+        }
+        ensureWritable();
+        try {
+            long id = availableRecoveryIdentifier();
+            List<CommitMessage> messages = stopScope.call("prepare recovery batch",
+                    () -> writerStrategy.prepareCommit(id));
+            compactionLifecycle.auditControlFailure();
+            if (!containsBusinessIncrement(messages)) {
+                throw new IllegalStateException("No business files or indexes for nonempty Paimon batch: " + tableKey);
+            }
+            stagePreparedRecovery(id, messages, initial, sourceLanes);
+        } catch (Exception | Error failure) {
+            failed = true;
+            throw failure;
+        }
+    }
+
+    private long availableRecoveryIdentifier() {
+        if (nextCommitIdentifier < 0 || nextCommitIdentifier == Long.MAX_VALUE) {
+            throw new IllegalStateException("Paimon commit identifier is exhausted for " + tableKey);
+        }
+        return nextCommitIdentifier;
+    }
+
+    private static boolean containsBusinessIncrement(List<CommitMessage> messages) {
+        for (CommitMessage message : messages) {
+            if (!(message instanceof CommitMessageImpl)) {
+                throw new IllegalStateException("Unexpected Paimon commit message for local recovery");
+            }
+            if (!((CommitMessageImpl) message).newFilesIncrement().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void stagePreparedRecovery(long id, List<CommitMessage> messages, boolean initial,
+            Set<String> sourceLanes) throws Exception {
+        stopScope.run("persist prepared batch", () -> recovery.stage(id, messages, initial, sourceLanes));
+        stopScope.controller().publish("accept prepared batch", () -> {
+            lastStagedIdentifier = id;
+            nextCommitIdentifier = id + 1;
+            openRecoveryInitial |= initial;
+            recoveryRowsAwaitingPrepare = false;
+            return null;
+        });
+    }
+
+    private long publishRecoveryPrefix() throws Exception {
+        if (recoveryRowsAwaitingPrepare) {
+            failed = true;
+            throw new IllegalStateException("Paimon batch has unprepared rows for " + tableKey);
+        }
+        recoveryPublishPending = true;
+        // A retry resumes the durable publication intent. Never call native prepare again here.
+        long published = stopScope.call("publish prepared prefix", () -> recovery.publish(tableCommitter));
+        try {
+            if (published < lastStagedIdentifier || published < lastPublishedRecoveryIdentifier
+                    || published == Long.MAX_VALUE) {
+                throw new IllegalStateException("Invalid published Paimon identifier " + published
+                        + " for staged identifier " + lastStagedIdentifier + " of " + tableKey);
+            }
+            long confirmedNext = Math.max(nextCommitIdentifier, published + 1L);
+            if (published >= 0) {
+                stopScope.run("save recovery commit identity", () -> commitStateStore.save(confirmedNext));
+                stopScope.run("reclaim confirmed commit messages", recovery::discardConfirmed);
+            }
+            stopScope.controller().publish("confirm recovery prefix", () -> {
+                nextCommitIdentifier = confirmedNext;
+                lastStagedIdentifier = -1;
+                lastPublishedRecoveryIdentifier = published;
+                recoveryPublishPending = false;
+                openRecoveryInitial = false;
+                return null;
+            });
+            return published;
+        } catch (Exception | Error failure) {
+            // Publication has already returned a local confirmation. On a KV or cleanup failure,
+            // restart from the durable state before permitting a callback or another writer.
+            recoveryPublishPending = false;
+            failed = true;
+            throw failure;
+        }
     }
 
     public synchronized long commit() throws Exception {
         ensureOpen();
+        if (recovery != null) {
+            return publishRecoveryPrefix();
+        }
         if (!pendingCommits.isEmpty()) {
             // A previous direct attempt has an unknown outcome. Never issue another direct commit
             // and never prepare new messages until Paimon confirms this exact pending envelope.
@@ -297,6 +414,9 @@ public final class PaimonTableWriteContext implements AutoCloseable {
 
     public synchronized long retryPendingCommit() throws Exception {
         ensureOpen();
+        if (recovery != null) {
+            return recoveryPublishPending ? publishRecoveryPrefix() : lastPublishedRecoveryIdentifier;
+        }
         return confirmPendingCommit();
     }
 
@@ -371,28 +491,42 @@ public final class PaimonTableWriteContext implements AutoCloseable {
         PaimonStopController.FinalAttempt attempt = null;
         List<CommitMessage> messages = null;
         boolean hasFinalCompaction = false;
+        boolean stagedFinalBusiness = false;
+        long finalIdentifier = nextCommitIdentifier;
         try {
-            if (finalizeCompaction) {
-                if (failed || !pendingCommits.isEmpty()) {
+            if (finalizeCompaction && !openRecoveryInitial) {
+                if (failed || hasPendingCommit() || lastStagedIdentifier >= 0 || recoveryRowsAwaitingPrepare) {
                     throw new IllegalStateException("Final Compaction requires a confirmed business barrier for " + tableKey);
                 }
                 if (!controller.isStarted()) { controller.start(); }
-                attempt = controller.beginFinal(tableKey, nextCommitIdentifier, compactionLifecycle);
+                attempt = controller.beginFinal(tableKey, finalIdentifier, compactionLifecycle);
                 phase(progress, "FINAL_PREPARE");
                 if (attempt.permitsPrepare()) {
                     try {
                         PaimonStopController.FinalAttempt preparing = attempt;
                         messages = Objects.requireNonNull(stopScope.call("final prepare", () -> {
-                            try { return writerStrategy.prepareFinalCommit(nextCommitIdentifier); }
+                            try { return writerStrategy.prepareFinalCommit(finalIdentifier); }
                             finally { preparing.markPrepareReturned(); }
                         }));
-                        hasFinalCompaction = PaimonNativeWriteAccess.hasFinalCompaction(messages);
+                        if (recovery == null) {
+                            hasFinalCompaction = PaimonNativeWriteAccess.hasFinalCompaction(messages);
+                        }
                     } catch (Exception | Error caught) {
                         if (compactionLifecycle.isStopCancellation(caught, attempt)
                                 || PaimonCompactionExecutor.isNativeCompactionFailure(caught)) {
                             discarded = true;
-                            discardedPhase(progress, nextCommitIdentifier, caught);
+                            discardedPhase(progress, finalIdentifier, caught);
                         } else { failure = caught; interrupted |= caught instanceof InterruptedException; }
+                    }
+                    if (recovery != null && messages != null) {
+                        if (containsBusinessIncrement(messages)) {
+                            // Only maintenance may be discarded by the final-compaction timeout.
+                            // Preserve any native business delta before waiting for that decision.
+                            stagePreparedRecovery(availableRecoveryIdentifier(), messages, false, Collections.emptySet());
+                            stagedFinalBusiness = true;
+                        } else {
+                            hasFinalCompaction = PaimonNativeWriteAccess.hasFinalCompaction(messages);
+                        }
                     }
                 } else {
                     PaimonStopController.FinalAttempt cancelled = controller.pollCancellation();
@@ -427,26 +561,36 @@ public final class PaimonTableWriteContext implements AutoCloseable {
             for (Throwable syncFailure : nativeWriteAccess.syncAll(stopScope)) {
                 if (attempt != null && (compactionLifecycle.isStopCancellation(syncFailure, attempt)
                         || (discarded && PaimonCompactionExecutor.isNativeCompactionFailure(syncFailure)))) {
-                    discardedPhase(progress, nextCommitIdentifier, syncFailure);
+                    discardedPhase(progress, finalIdentifier, syncFailure);
                 } else { failure = appendFailure(failure, syncFailure); }
             }
             compactionLifecycle.auditControlFailure();
-            if (attempt != null && failure == null && !discarded && hasFinalCompaction) {
+            if (attempt != null && failure == null && !discarded && (hasFinalCompaction || stagedFinalBusiness)) {
                 if (controller.admitFinalCommit(attempt)) {
-                    if (nextCommitIdentifier == Long.MAX_VALUE) {
+                    if (finalIdentifier == Long.MAX_VALUE) {
                         throw new IllegalStateException("Paimon commit identifier is exhausted for " + tableKey);
                     }
                     phase(progress, "FINAL_COMMIT");
                     final List<CommitMessage> prepared = messages;
-                    controller.publish("retain final pending", () -> {
-                        pendingCommits.put(nextCommitIdentifier, prepared); return null;
-                    });
-                    commitPrepared(nextCommitIdentifier, messages);
+                    if (recovery != null) {
+                        if (!stagedFinalBusiness) {
+                            stagePreparedRecovery(availableRecoveryIdentifier(), prepared, false, Collections.emptySet());
+                        }
+                        publishRecoveryPrefix();
+                    } else {
+                        controller.publish("retain final pending", () -> {
+                            pendingCommits.put(nextCommitIdentifier, prepared); return null;
+                        });
+                        commitPrepared(nextCommitIdentifier, messages);
+                    }
                 } else {
                     observe(progress::compactionCancellationRequested);
                     attempt.requestCancellation();
                     discarded = true;
                 }
+            }
+            if (stagedFinalBusiness && discarded) {
+                throw new IllegalStateException("Final Paimon business files retained for startup recovery: " + tableKey);
             }
         } catch (Exception | Error caught) {
             interrupted |= caught instanceof InterruptedException;
@@ -534,6 +678,9 @@ public final class PaimonTableWriteContext implements AutoCloseable {
             // 原生 assigner 与 TableWriteImpl.write 各自准入，Context 不重复登记整行。
             // https://github.com/apache/paimon/blob/c05f7d1f1b1e5d37e64edab0f2978124d90b64f7/paimon-core/src/main/java/org/apache/paimon/table/sink/TableWriteImpl.java#L163
             writerStrategy.write(row);
+            if (recovery != null) {
+                recoveryRowsAwaitingPrepare = true;
+            }
         } catch (Exception | Error e) {
             failed = true;
             throw e;
@@ -561,7 +708,7 @@ public final class PaimonTableWriteContext implements AutoCloseable {
 
     private void ensureWritable() {
         ensureOpen();
-        if (!pendingCommits.isEmpty()) {
+        if (recoveryPublishPending || !pendingCommits.isEmpty()) {
             throw new IllegalStateException(
                     "Cannot write while a Paimon commit outcome is pending for table " + tableKey);
         }

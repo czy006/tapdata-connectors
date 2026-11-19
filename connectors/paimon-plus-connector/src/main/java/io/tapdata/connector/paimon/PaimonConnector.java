@@ -2,6 +2,7 @@ package io.tapdata.connector.paimon;
 
 import io.tapdata.base.ConnectorBase;
 import io.tapdata.connector.paimon.config.PaimonConfig;
+import io.tapdata.connector.paimon.recovery.PreparedMessageStore;
 import io.tapdata.connector.paimon.exception.PaimonFatalWriteException;
 import io.tapdata.connector.paimon.service.PaimonService;
 import io.tapdata.entity.codec.TapCodecsRegistry;
@@ -16,6 +17,7 @@ import io.tapdata.entity.logger.Log;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.schema.value.*;
 import io.tapdata.entity.utils.DataMap;
+import io.tapdata.entity.utils.cache.KVMap;
 import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
@@ -40,6 +42,7 @@ import java.util.Map;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -59,8 +62,21 @@ public class PaimonConnector extends ConnectorBase {
                     + "(?:[Tt]\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d{1,9})?)?"
                     + "(?:[Zz]|[+-]\\d{2}:\\d{2}(?::\\d{2})?)?)?)");
     
-    private PaimonConfig paimonConfig;
-    private PaimonService paimonService;
+    private volatile PaimonService paimonService;
+    private volatile RecoverySession recoverySession;
+
+    private static final class RecoverySession {
+        final TapConnectorContext context;
+        final PaimonService service;
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        volatile boolean ready;
+        volatile boolean stopping;
+
+        RecoverySession(TapConnectorContext context, PaimonService service) {
+            this.context = context;
+            this.service = service;
+        }
+    }
 
     /**
      * Initialize connection when connector starts
@@ -70,25 +86,110 @@ public class PaimonConnector extends ConnectorBase {
      */
     @Override
     public void onStart(TapConnectionContext connectionContext) throws Throwable {
-        DataMap connectionConfig = connectionContext.getConnectionConfig();
-        DataMap nodeConfig = connectionContext.getNodeConfig();
-        if (MapUtils.isEmpty(connectionConfig)) {
-            throw new RuntimeException("Connection config cannot be empty");
+        start(connectionContext, connectionContext instanceof TapConnectorContext);
+    }
+
+    @Override
+    public void onLightStart(TapConnectionContext connectionContext) throws Throwable {
+        start(connectionContext, false);
+    }
+
+    private static PaimonConfig configuration(TapConnectionContext context, boolean task) {
+        if (MapUtils.isEmpty(context.getConnectionConfig())) {
+            throw new IllegalArgumentException("Connection config cannot be empty");
         }
-        
-        // Load configuration
-        paimonConfig = new PaimonConfig().load(connectionConfig);
-        if (MapUtils.isNotEmpty(nodeConfig)) {
-            nodeConfig.remove("database");
-            paimonConfig.load(nodeConfig);
-            paimonConfig.setTableConfig(connectionContext.getTableNodeConfig());
+        PaimonConfig config = new PaimonConfig().load(context.getConnectionConfig());
+        if (MapUtils.isNotEmpty(context.getNodeConfig())) {
+            DataMap node = DataMap.create(context.getNodeConfig());
+            node.remove("database");
+            if (task) {
+                config.loadNodeConfig(node);
+            } else {
+                config.load(node);
+            }
         }
-        // Initialize Paimon service
-        paimonService = new PaimonService(paimonConfig, connectionContext.getLog());
-        paimonService.setFlushOffsetCallback(connectionContext.getFlushOffsetCallback());
-        paimonService.init();
-        
-        connectionContext.getLog().info("Paimon connector started successfully");
+        if (task || MapUtils.isNotEmpty(context.getNodeConfig())) {
+            config.setTableConfig(context.getTableNodeConfig());
+        }
+        return config;
+    }
+
+    private void start(TapConnectionContext context, boolean task) throws Throwable {
+        PaimonConfig config = configuration(context, task);
+        boolean recovery = task && config.isLocalRecoveryEnabled();
+        Consumer<Object> callback = context.getFlushOffsetCallback();
+        // HazelcastTargetPdkBaseNode#createPdkAndInit installs this sink callback before onStart.
+        if (recovery && callback == null) {
+            throw new IllegalStateException("Local recovery requires an active FLUSH_OFFSET_CALLBACK target");
+        }
+        KVMap<Object> stateMap = task ? ((TapConnectorContext) context).getStateMap() : null;
+        PaimonService service = new PaimonService(config, context.getLog());
+        // A formerly bound target can lose both the safety option and the sink callback.
+        // An ordinary source has its own node KV and only reads this key.
+        RecoverySession session = task && (callback != null || stateMap != null)
+                ? new RecoverySession((TapConnectorContext) context, service) : null;
+        synchronized (this) {
+            if (paimonService != null) {
+                throw new IllegalStateException("Paimon connector already started");
+            }
+            recoverySession = session;
+            paimonService = service;
+        }
+        try {
+            if (session != null && !recovery) {
+                if (stateMap == null) {
+                    throw new IllegalStateException("Paimon target needs its node state map to check for an existing local recovery binding");
+                }
+                if (PreparedMessageStore.hasBinding(stateMap)) {
+                    throw new IllegalStateException("This target node is bound to local recovery. Restore its original localRecoveryDir.");
+                }
+            }
+            service.setFlushOffsetCallback(callback);
+            if (recovery) {
+                service.setRecoveryFailureListener(failure -> reportRecoveryFailure(session, session.context, failure));
+            }
+            service.init();
+            if (session != null) {
+                if (recovery) {
+                    service.startLocalRecovery(session.context);
+                }
+                synchronized (this) {
+                    if (paimonService != service || session.stopping) {
+                        throw new IllegalStateException("Paimon connector stopped during recovery");
+                    }
+                    if (session.failure.get() != null) {
+                        throw session.failure.get();
+                    }
+                    session.ready = true;
+                    if (!recovery) {
+                        recoverySession = null;
+                    }
+                }
+            }
+            context.getLog().info("Paimon connector started successfully");
+        } catch (Throwable failure) {
+            if (session != null) {
+                session.failure.compareAndSet(null, failure);
+                session.ready = false;
+            }
+            boolean ownsService;
+            synchronized (this) {
+                ownsService = paimonService == service && (session == null || !session.stopping);
+                if (ownsService) {
+                    paimonService = null;
+                }
+            }
+            if (ownsService) {
+                try {
+                    service.close();
+                } catch (Throwable closeFailure) {
+                    if (failure != closeFailure) {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+            }
+            throw failure;
+        }
     }
 
     /**
@@ -98,17 +199,34 @@ public class PaimonConnector extends ConnectorBase {
     */
     @Override
     public void onStop(TapConnectionContext connectionContext) throws Throwable {
-        if (paimonService != null) {
+        PaimonService service;
+        RecoverySession session;
+        synchronized (this) {
+            session = recoverySession;
+            if (session != null && session.context != connectionContext) {
+                return;
+            }
+            service = paimonService;
+            if (session == null) {
+                paimonService = null;
+            } else {
+                session.stopping = true;
+                session.ready = false;
+            }
+        }
+        if (service != null) {
             try {
-                paimonService.close();
+                service.close();
             } catch (Exception e) {
                 io.tapdata.connector.paimon.service.PaimonStopLog.offer(connectionContext.getLog(),
                         "[paimon-stop] event=connector-stop-failed", e);
-                // A close failure can mean buffered rows were not committed. Propagate it through
-                // the PDK stop-failure channel so shutdown is never reported as successful.
                 throw e;
             } finally {
-                paimonService = null;
+                synchronized (this) {
+                    if (paimonService == service) {
+                        paimonService = null;
+                    }
+                }
             }
         }
     }
@@ -124,11 +242,14 @@ public class PaimonConnector extends ConnectorBase {
     @Override
     public ConnectionOptions connectionTest(TapConnectionContext connectionContext, Consumer<TestItem> consumer) throws Throwable {
         ConnectionOptions connectionOptions = ConnectionOptions.create();
+        PaimonService probe = null;
         try {
-            onStart(connectionContext);
-            connectionOptions.connectionString(paimonConfig.getConnectionString());
+            PaimonConfig config = configuration(connectionContext, false);
+            probe = new PaimonService(config, connectionContext.getLog());
+            probe.init();
+            connectionOptions.connectionString(config.getConnectionString());
             // Test warehouse accessibility
-            boolean warehouseAccessible = paimonService.testWarehouseAccess();
+            boolean warehouseAccessible = probe.testWarehouseAccess();
             if (warehouseAccessible) {
                 consumer.accept(testItem(TestItem.ITEM_CONNECTION, TestItem.RESULT_SUCCESSFULLY, 
                     "Warehouse is accessible"));
@@ -139,7 +260,7 @@ public class PaimonConnector extends ConnectorBase {
             }
             
             // Test write permission
-            boolean canWrite = paimonService.testWritePermission();
+            boolean canWrite = probe.testWritePermission();
             if (canWrite) {
                 consumer.accept(testItem(TestItem.ITEM_WRITE, TestItem.RESULT_SUCCESSFULLY, 
                     "Write permission verified"));
@@ -153,7 +274,9 @@ public class PaimonConnector extends ConnectorBase {
                 "Connection test failed: " + throwable.getMessage()));
             throw throwable;
         } finally {
-            onStop(connectionContext);
+            if (probe != null) {
+                probe.close();
+            }
         }
         
         return connectionOptions;
@@ -388,7 +511,7 @@ public class PaimonConnector extends ConnectorBase {
         TapTable table = createTableEvent.getTable();
         log.info("Creating Paimon table: " + table.getName());
         
-        boolean created = paimonService.createTable(table);
+        boolean created = targetService(connectorContext).createTable(table);
         if (created) {
             log.info("Table created successfully: " + table.getName());
         } else {
@@ -411,7 +534,7 @@ public class PaimonConnector extends ConnectorBase {
         String tableName = dropTableEvent.getTableId();
         
         log.info("Dropping Paimon table: " + tableName);
-        paimonService.dropTable(tableName);
+        targetService(connectorContext).dropTable(tableName);
         log.info("Table dropped successfully: " + tableName);
     }
 
@@ -428,7 +551,7 @@ public class PaimonConnector extends ConnectorBase {
         String tableName = tapClearTableEvent.getTableId();
         
         log.info("Clearing Paimon table: " + tableName);
-        paimonService.clearTable(tableName);
+        targetService(connectorContext).clearTable(tableName);
         log.info("Table cleared successfully: " + tableName);
     }
 
@@ -443,9 +566,10 @@ public class PaimonConnector extends ConnectorBase {
                             TapCreateIndexEvent createIndexEvent) {
         final Log log = connectorContext.getLog();
         
+        PaimonService service = targetService(connectorContext);
         log.info("Creating index on table: " + table.getName());
         try {
-            paimonService.createIndex(table, createIndexEvent.getIndexList());
+            service.createIndex(table, createIndexEvent.getIndexList());
             log.info("Index created successfully on table: " + table.getName());
         } catch (Exception e) {
             log.warn("Failed to create index on table " + table.getName() + ": " + e.getMessage(), e);
@@ -509,8 +633,8 @@ public class PaimonConnector extends ConnectorBase {
     }
 
     protected void afterInitialSync(TapConnectorContext connectorContext, TapTable tapTable) throws Throwable {
-        if (paimonService != null) {
-            paimonService.afterInitialSync(connectorContext, tapTable);
+        if (paimonService != null || recoveryRequested(connectorContext)) {
+            targetService(connectorContext).afterInitialSync(connectorContext, tapTable);
         }
     }
 
@@ -527,15 +651,20 @@ public class PaimonConnector extends ConnectorBase {
                             TapTable table, Consumer<WriteListResult<TapRecordEvent>> writeListResultConsumer) throws Throwable {
         final Log log = connectorContext.getLog();
 
+        RecoverySession session = recoverySession;
         try {
             // Write records using Paimon service
-            WriteListResult<TapRecordEvent> result = paimonService.writeRecords(
+            WriteListResult<TapRecordEvent> result = targetService(connectorContext).writeRecords(
                 tapRecordEvents, table, connectorContext);
 
             writeListResultConsumer.accept(result);
 
         } catch (Exception e) {
-            log.error("Error writing records to table " + table.getName() + ": " + e.getMessage(), e);
+            if (session == null) {
+                log.error("Error writing records to table " + table.getName() + ": " + e.getMessage(), e);
+            } else {
+                reportRecoveryFailure(session, connectorContext, e);
+            }
             throw e;
         }
     }
@@ -661,13 +790,77 @@ public class PaimonConnector extends ConnectorBase {
 
     protected void processControl(TapConnectorContext tapConnectorContext, ControlEvent controlEvent)
             throws Throwable {
-        if (controlEvent instanceof HeartbeatEvent) {
-            PaimonService service = paimonService;
-            if (service == null) {
-                throw new IllegalStateException(
-                        "Paimon service is unavailable while processing a Heartbeat");
+        if (!(controlEvent instanceof HeartbeatEvent)) {
+            return;
+        }
+        RecoverySession session = recoverySession;
+        if (session == null && !recoveryRequested(tapConnectorContext)) {
+            targetService(tapConnectorContext).processHeartbeat((HeartbeatEvent) controlEvent);
+            return;
+        }
+        // The engine falls back to saving the incoming heartbeat when processControl throws
+        // (TapData 65add935fdee, HazelcastTargetPdkBaseNode#flushSyncProgressMap).
+        // An early or late heartbeat can be redelivered; no callback may run outside this session.
+        if (session == null || session.context != tapConnectorContext || !session.ready || session.failure.get() != null) {
+            return;
+        }
+        try {
+            session.service.processHeartbeat((HeartbeatEvent) controlEvent);
+        } catch (Throwable failure) {
+            reportRecoveryFailure(session, tapConnectorContext, failure);
+        }
+    }
+
+    private boolean recoveryRequested(TapConnectorContext context) {
+        if (recoverySession != null) {
+            return true;
+        }
+        DataMap node = context == null ? null : context.getNodeConfig();
+        Object location = node == null ? null : node.get("localRecoveryDir");
+        return location instanceof String && !((String) location).trim().isEmpty();
+    }
+
+    private PaimonService targetService(TapConnectorContext context) {
+        RecoverySession session = recoverySession;
+        PaimonService service = paimonService;
+        if (session != null) {
+            if (session.context != context) {
+                throw new IllegalStateException("Local recovery target belongs to another task context");
             }
-            service.processHeartbeat((HeartbeatEvent) controlEvent);
+            Throwable failure = session.failure.get();
+            if (failure != null) {
+                throw new IllegalStateException("Local recovery target has failed", failure);
+            }
+            if (!session.ready || session.service != service) {
+                throw new IllegalStateException("Local recovery target is not ready");
+            }
+        } else if (recoveryRequested(context)) {
+            throw new IllegalStateException("Local recovery target has not been initialized");
+        }
+        if (service == null) {
+            throw new IllegalStateException("Paimon target service is unavailable");
+        }
+        return service;
+    }
+
+    private static void reportRecoveryFailure(
+            RecoverySession session, TapConnectorContext context, Throwable failure) {
+        if (session.context != context || session.stopping || !session.failure.compareAndSet(null, failure)) {
+            return;
+        }
+        try {
+            session.service.failLocalRecovery(failure);
+        } catch (Throwable fenceFailure) {
+            if (failure != fenceFailure) {
+                failure.addSuppressed(fenceFailure);
+            }
+        }
+        try {
+            context.getLog().error("Paimon local recovery target failed", failure);
+        } catch (Throwable reportFailure) {
+            if (failure != reportFailure) {
+                failure.addSuppressed(reportFailure);
+            }
         }
     }
 }

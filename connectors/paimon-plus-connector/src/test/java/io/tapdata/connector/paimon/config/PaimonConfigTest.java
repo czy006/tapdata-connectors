@@ -21,6 +21,54 @@ import static org.junit.jupiter.api.Assertions.*;
 class PaimonConfigTest {
 
     @Test
+    void recoveryDirectoryCanOnlyBeSelectedOnTargetNode() {
+        Map<String, Object> options = new LinkedHashMap<>();
+        options.put("localRecoveryDir", "/local/recovery/orders");
+        options.put("cdcCommitTrigger", "timeOrRows");
+        PaimonConfig config = new PaimonConfig().load(options);
+        config.setWarehouse("/local/warehouse");
+        assertFalse(config.isLocalRecoveryEnabled());
+        assertNull(config.getLocalRecoveryDir());
+        assertEquals("time", config.getCdcCommitTrigger());
+
+        config.loadNodeConfig(options);
+        assertEquals("/local/recovery/orders", config.getLocalRecoveryDir());
+        assertEquals("timeOrRows", config.getCdcCommitTrigger());
+        assertDoesNotThrow(config::validate);
+        config.setTableConfig(Collections.singletonMap("orders", DataMap.create().kv("localRecoveryDir", "/other")));
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.setTableConfig(Collections.emptyMap());
+        config.loadNodeConfig(Collections.singletonMap("localRecoveryDir", "   "));
+        assertFalse(config.isLocalRecoveryEnabled());
+    }
+
+    @Test
+    void enabledRecoveryMustHaveLocalDirectoryAndActiveDeadline() {
+        PaimonConfig config = new PaimonConfig();
+        config.setWarehouse("/local/warehouse");
+        for (String dir : Arrays.asList("relative/path", "s3://bucket/state")) {
+            config.loadNodeConfig(Collections.singletonMap("localRecoveryDir", dir));
+            assertThrows(IllegalArgumentException.class, config::validate);
+        }
+        config.loadNodeConfig(Collections.singletonMap("localRecoveryDir", "/local/recovery"));
+        config.setCommitIntervalMs(0);
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.setCommitIntervalMs(1000);
+        config.setEnableAsyncCommit(false);
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.setEnableAsyncCommit(true);
+        config.setBatchAccumulationSize(0);
+        assertDoesNotThrow(config::validate); // time-only ignores the row limit
+        for (String trigger : Arrays.asList("timeOrRows", "immediate")) {
+            config.loadNodeConfig(DataMap.create().kv("localRecoveryDir", "/local/recovery").kv("cdcCommitTrigger", trigger));
+            assertThrows(IllegalArgumentException.class, config::validate);
+        }
+        config.loadNodeConfig(Collections.emptyMap());
+        config.setCommitIntervalMs(0);
+        assertDoesNotThrow(config::validate);
+    }
+
+    @Test
     void deduplicateUpdateAfterCompletenessMustDefaultOnAndSupportPerTableOverride() {
         PaimonConfig config = new PaimonConfig();
         assertTrue(config.getEnableDeduplicateUpdateAfterCompletenessCheck());

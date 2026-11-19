@@ -5,8 +5,10 @@ import io.tapdata.connector.paimon.write.bucket.PaimonBucketWriterStrategy;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.io.DataIncrement;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -14,6 +16,7 @@ import org.mockito.InOrder;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -26,6 +29,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -35,6 +39,147 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class PaimonTableWriteContextTest {
+
+    @Test
+    void recoveryStagesBatchesInOrderAndDefersPublicationUntilRequested() throws Exception {
+        PaimonTableWriteContext.CommitStateStore kv = mock(PaimonTableWriteContext.CommitStateStore.class);
+        Fixture fixture = new Fixture(7, kv);
+        PaimonRecoveryTable recovery = mock(PaimonRecoveryTable.class);
+        fixture.context.attachRecovery(recovery);
+        List<CommitMessage> first = businessMessages();
+        List<CommitMessage> second = businessMessages();
+        Set<String> sources = Collections.singleton("A");
+        when(fixture.strategy.prepareCommit(7)).thenReturn(first);
+        when(fixture.strategy.prepareCommit(8)).thenReturn(second);
+        when(recovery.publish(fixture.committer)).thenReturn(8L);
+
+        fixture.context.write(GenericRow.of(1));
+        fixture.context.stageRecoveryBatch(true, sources);
+        fixture.context.write(GenericRow.of(2));
+        fixture.context.stageRecoveryBatch(false, sources);
+
+        assertFalse(fixture.context.hasPendingCommit());
+        assertTrue(fixture.context.hasOpenRecoveryInitial());
+        assertEquals(-1, fixture.context.retryPendingCommit());
+        verify(recovery, never()).publish(fixture.committer);
+        assertEquals(8, fixture.context.commit());
+        assertFalse(fixture.context.hasOpenRecoveryInitial());
+        InOrder order = inOrder(recovery, kv);
+        order.verify(recovery).stage(7, first, true, sources);
+        order.verify(recovery).stage(8, second, false, sources);
+        order.verify(recovery).publish(fixture.committer);
+        order.verify(kv).save(9);
+        order.verify(recovery).discardConfirmed();
+        verify(fixture.committer, never()).commit(anyLong(), anyList());
+        verify(fixture.committer, never()).filterAndCommit(anyMap());
+    }
+
+    @Test
+    void failedRecoveryStageCannotPrepareOrAcknowledgeSameWriterAgain() throws Exception {
+        Fixture fixture = new Fixture(1);
+        PaimonRecoveryTable recovery = mock(PaimonRecoveryTable.class);
+        fixture.context.attachRecovery(recovery);
+        Set<String> sources = Collections.singleton("A");
+        List<CommitMessage> batch = businessMessages();
+        when(fixture.strategy.prepareCommit(1)).thenReturn(batch);
+        doThrow(new java.io.IOException("simulated directory sync failure"))
+                .when(recovery).stage(1, batch, true, sources);
+
+        fixture.context.write(GenericRow.of(1));
+        assertThrows(java.io.IOException.class, () -> fixture.context.stageRecoveryBatch(true, sources));
+        assertThrows(IllegalStateException.class, () -> fixture.context.stageRecoveryBatch(true, sources));
+        assertThrows(IllegalStateException.class, () -> fixture.context.write(GenericRow.of(2)));
+        assertThrows(IllegalStateException.class, fixture.context::commit);
+        verify(fixture.strategy, times(1)).prepareCommit(1);
+        verify(recovery, never()).publish(fixture.committer);
+    }
+
+    @Test
+    void publicationFailureRetriesSameDurableGroupAndBlocksNewWrites() throws Exception {
+        Fixture fixture = new Fixture(1);
+        PaimonRecoveryTable recovery = mock(PaimonRecoveryTable.class);
+        fixture.context.attachRecovery(recovery);
+        doReturn(businessMessages()).when(fixture.strategy).prepareCommit(1);
+        when(recovery.publish(fixture.committer)).thenThrow(new java.io.IOException("uncertain")).thenReturn(1L);
+        fixture.context.stageRecoveryBatch(false, Collections.singleton("A"));
+        assertThrows(java.io.IOException.class, fixture.context::commit);
+        assertTrue(fixture.context.hasPendingCommit());
+        assertThrows(IllegalStateException.class, () -> fixture.context.write(GenericRow.of(2)));
+        assertEquals(1, fixture.context.retryPendingCommit());
+        assertFalse(fixture.context.hasPendingCommit());
+        verify(fixture.strategy, times(1)).prepareCommit(anyLong());
+        verify(recovery, times(2)).publish(fixture.committer);
+    }
+
+    @Test
+    void kvFailureLeavesDurableStateForRestartAndForbidsGc() throws Exception {
+        PaimonTableWriteContext.CommitStateStore kv = mock(PaimonTableWriteContext.CommitStateStore.class);
+        Fixture fixture = new Fixture(1, kv);
+        PaimonRecoveryTable recovery = mock(PaimonRecoveryTable.class);
+        fixture.context.attachRecovery(recovery);
+        doReturn(businessMessages()).when(fixture.strategy).prepareCommit(1);
+        when(recovery.publish(fixture.committer)).thenReturn(1L);
+        doThrow(new java.io.IOException("task store failed")).when(kv).save(2);
+        fixture.context.stageRecoveryBatch(true, Collections.singleton("A"));
+        assertThrows(java.io.IOException.class, fixture.context::commit);
+        assertThrows(IllegalStateException.class, fixture.context::retryPendingCommit);
+        verify(recovery, never()).discardConfirmed();
+    }
+
+    @Test
+    void stopLeavesUnsealedFullLoadForNextProcess() throws Exception {
+        Fixture fixture = new Fixture(1);
+        PaimonRecoveryTable recovery = mock(PaimonRecoveryTable.class);
+        fixture.context.attachRecovery(recovery);
+        doReturn(businessMessages()).when(fixture.strategy).prepareCommit(1);
+        fixture.context.stageRecoveryBatch(true, Collections.singleton("A"));
+        fixture.context.closeForStop(true, phase -> {});
+        verify(recovery, never()).publish(fixture.committer);
+        verify(fixture.strategy, never()).prepareFinalCommit(anyLong());
+        verify(fixture.strategy).close();
+    }
+
+    @Test
+    void cannotSealUnstagedRowsOrAcknowledgeMissingBusinessEffects() throws Exception {
+        Fixture unstaged = new Fixture(0);
+        PaimonRecoveryTable recovery = mock(PaimonRecoveryTable.class);
+        unstaged.context.attachRecovery(recovery);
+        unstaged.context.write(GenericRow.of(1));
+        assertThrows(IllegalStateException.class, unstaged.context::commit);
+        verify(recovery, never()).publish(unstaged.committer);
+
+        Fixture empty = new Fixture(0);
+        empty.context.attachRecovery(recovery);
+        when(empty.strategy.prepareCommit(0)).thenReturn(Collections.emptyList());
+        assertThrows(IllegalStateException.class,
+                () -> empty.context.stageRecoveryBatch(true, Collections.emptySet()));
+        assertThrows(IllegalStateException.class, empty.context::commit);
+    }
+
+    private static List<CommitMessage> businessMessages() {
+        CommitMessageImpl message = mock(CommitMessageImpl.class);
+        DataIncrement data = mock(DataIncrement.class);
+        when(message.newFilesIncrement()).thenReturn(data);
+        return Collections.singletonList(message);
+    }
+
+    @Test
+    void stopRoutesUnexpectedFinalBusinessIncrementThroughDurablePublication() throws Exception {
+        Fixture fixture = new Fixture(3);
+        PaimonRecoveryTable recovery = mock(PaimonRecoveryTable.class);
+        fixture.context.attachRecovery(recovery);
+        List<CommitMessage> batch = businessMessages();
+        when(fixture.strategy.prepareFinalCommit(3)).thenReturn(batch);
+        when(recovery.publish(fixture.committer)).thenReturn(3L);
+
+        fixture.context.closeForStop(true, phase -> {});
+        InOrder order = inOrder(recovery, fixture.strategy);
+        order.verify(recovery).stage(3, batch, false, Collections.emptySet());
+        order.verify(recovery).publish(fixture.committer);
+        order.verify(recovery).discardConfirmed();
+        order.verify(fixture.strategy).close();
+        verify(fixture.committer, never()).commit(anyLong(), anyList());
+    }
 
     @Test
     void writeMustOnlyCallStrategy() throws Exception {

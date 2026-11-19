@@ -502,6 +502,32 @@
             }
           ]
         },
+        "localRecoveryDir": {
+          "type": "string",
+          "title": "${localRecoveryDir}",
+          "description": "${localRecoveryDir_description}",
+          "x-decorator": "FormItem",
+          "x-component": "Input",
+          "x-reactions": {
+            "dependencies": ["$inputs"],
+            "fulfill": {"state": {"display": "{{$deps[0].length > 0 ? \"visible\" : \"hidden\"}}"}}
+          }
+        },
+        "cdcCommitTrigger": {
+          "type": "string",
+          "title": "${cdcCommitTrigger}",
+          "default": "time",
+          "enum": [
+            {"label": "${recoveryTime}", "value": "time"},
+            {"label": "${recoveryTimeOrRows}", "value": "timeOrRows"}
+          ],
+          "x-decorator": "FormItem",
+          "x-component": "Select",
+          "x-reactions": {
+            "dependencies": ["$inputs", ".localRecoveryDir"],
+            "fulfill": {"state": {"display": "{{$deps[0].length > 0 && $deps[1] ? \"visible\" : \"hidden\"}}"}}
+          }
+        },
         "batchAccumulationSize": {
           "type": "number",
           "title": "${batchAccumulationSize}",
@@ -779,6 +805,11 @@
       "diskOverflowWriteTip": "Maps to Paimon write-buffer-spillable. Applies to new tables and the current writer for existing tables; restart the task to apply. Native forced buffering and other temporary files may still use disk.",
       "diskMaxSize": "Disk overflow capacity (GB)",
       "diskTmpDir": "Disk temporary directory",
+      "localRecoveryDir": "Local recovery directory",
+      "localRecoveryDir_description": "Leave blank to disable. Set a persistent absolute directory exclusive to this target node only after verifying sole ownership of the table, retention of prepared files from their oldest modification time through restart, and delivery without skipped events. CDC also requires a durable, replayable source starting offset.",
+      "cdcCommitTrigger": "CDC commit trigger",
+      "recoveryTime": "Time interval",
+      "recoveryTimeOrRows": "Time interval or row threshold",
       "batchAccumulationSize": "Batch Accumulation Size",
       "batchAccumulationSize_placeholder": "Records to accumulate before commit (0=immediate, default: 100000)",
       "commitIntervalMs": "Commit Interval (ms)",
@@ -845,6 +876,11 @@
       "diskOverflowWriteTip": "对应 Paimon write-buffer-spillable。对新表和已有表当前写任务生效，重启任务后应用；原生强制缓冲及其他临时文件仍可能使用磁盘。",
       "diskMaxSize": "磁盘溢写容量(GB)",
       "diskTmpDir": "磁盘临时目录",
+      "localRecoveryDir": "本机恢复目录",
+      "localRecoveryDir_description": "留空关闭。请先确认该任务独占物理表、仓库从最早引用文件的修改时间起保留文件至恢复完毕、引擎不跳过有效事件。CDC 还须确认原始源位点已持久化且可重放，再设置此目标节点独占的本机持久绝对路径。",
+      "cdcCommitTrigger": "CDC 提交条件",
+      "recoveryTime": "按时间间隔",
+      "recoveryTimeOrRows": "按时间或行数阈值",
       "batchAccumulationSize": "批量累积大小",
       "batchAccumulationSize_placeholder": "提交前累积的记录数（0=立即提交，默认：100000）",
       "commitIntervalMs": "提交间隔（毫秒）",
@@ -911,6 +947,11 @@
       "diskOverflowWriteTip": "對應 Paimon write-buffer-spillable。對新表及已有表目前寫入任務生效，重新啟動任務後套用；原生強制緩衝及其他暫存檔案仍可能使用磁碟。",
       "diskMaxSize": "磁盤溢寫容量(GB)",
       "diskTmpDir": "磁盤臨時目錄",
+      "localRecoveryDir": "本機恢復目錄",
+      "localRecoveryDir_description": "留空關閉。請先確認此任務獨佔實體表、倉庫從最早引用檔案的修改時間起保留檔案至恢復完畢、引擎不跳過有效事件。CDC 還須確認原始來源位點已持久化且可重放，再設定此目標節點獨佔的本機持久絕對路徑。",
+      "cdcCommitTrigger": "CDC 提交條件",
+      "recoveryTime": "按時間間隔",
+      "recoveryTimeOrRows": "按時間或列數門檻",
       "batchAccumulationSize": "批量累積大小",
       "batchAccumulationSize_placeholder": "提交前累積的記錄數（0=立即提交，默認：100000）",
       "commitIntervalMs": "提交間隔（毫秒）",
