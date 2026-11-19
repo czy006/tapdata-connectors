@@ -11,12 +11,19 @@ import io.tapdata.pdk.apis.context.TapConnectionContext;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 import org.mockito.MockedConstruction;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.Collections;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -186,6 +193,66 @@ class PaimonConnectorControlTest {
             connector.processControl(second, heartbeat);
             verify(secondService).processHeartbeat(heartbeat);
             connector.onStop(second);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"configuration", "startup log"})
+    void stopOverlappingStartPreventsLateHeartbeatAdmission(String stopAt) throws Throwable {
+        PaimonConnector connector = new PaimonConnector();
+        TapConnectorContext first = recoveryContext();
+        TapConnectorContext second = recoveryContext();
+        HeartbeatEvent heartbeat = new HeartbeatEvent().init();
+        Consumer<Object> callback = value -> {};
+        when(second.getFlushOffsetCallback()).thenReturn(callback);
+        CountDownLatch reached = new CountDownLatch(1);
+        CountDownLatch stopReturned = new CountDownLatch(1);
+        ExecutorService stopper = Executors.newSingleThreadExecutor();
+        try (MockedConstruction<PaimonConfig> ignored = recoveryConfig();
+                MockedConstruction<PaimonService> services = mockConstruction(PaimonService.class)) {
+            if ("configuration".equals(stopAt)) {
+                when(first.getFlushOffsetCallback()).thenAnswer(call -> {
+                    reached.countDown();
+                    assertTrue(stopReturned.await(5, TimeUnit.SECONDS), "stop blocked on the configuration getter");
+                    return callback;
+                });
+            } else {
+                when(first.getFlushOffsetCallback()).thenReturn(callback);
+                Log startupLog = first.getLog();
+                doAnswer(call -> {
+                    reached.countDown();
+                    assertTrue(stopReturned.await(5, TimeUnit.SECONDS), "stop blocked on the startup logger");
+                    return null;
+                }).when(startupLog).info("Paimon connector initialized");
+            }
+            Future<?> stopped = stopper.submit(() -> {
+                try {
+                    assertTrue(reached.await(5, TimeUnit.SECONDS));
+                    connector.processControl(first, heartbeat);
+                    connector.onStop(first);
+                    return null;
+                } catch (Throwable failure) {
+                    throw new AssertionError(failure);
+                } finally {
+                    stopReturned.countDown();
+                }
+            });
+            IllegalStateException failure = assertThrows(IllegalStateException.class, () -> connector.onStart(first));
+            assertTrue(failure.getMessage().contains("stopped during"), failure::toString);
+            stopped.get(5, TimeUnit.SECONDS);
+            for (PaimonService cancelled : services.constructed()) {
+                verify(cancelled, never()).processHeartbeat(heartbeat);
+            }
+
+            connector.onStart(second);
+            PaimonService replacement = services.constructed().get(services.constructed().size() - 1);
+            connector.onStop(first);
+            verify(replacement, never()).close();
+            connector.processControl(second, heartbeat);
+            verify(replacement).processHeartbeat(heartbeat);
+            connector.onStop(second);
+        } finally {
+            stopper.shutdownNow();
         }
     }
 

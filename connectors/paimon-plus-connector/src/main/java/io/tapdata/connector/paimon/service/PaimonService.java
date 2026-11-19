@@ -2054,7 +2054,7 @@ public class PaimonService implements AutoCloseable {
             FileStoreTable writerTable = existingContext == null
                     ? fileStoreTable : recoveryTables.get(tableKey).writerTable();
             PaimonRecoveryAdmission.validateInput(config, tapTable, writerTable);
-            PaimonDmlImageValidator.validateRecoveryInsertDefaults(tableKey, contract, recordEvents);
+            PaimonDmlImageValidator.validateRecoveryImages(tableKey, contract, recordEvents);
         }
         PaimonGeneratedFieldDependencies generatedFields =
                 generatedFieldDependencies(tapTable);

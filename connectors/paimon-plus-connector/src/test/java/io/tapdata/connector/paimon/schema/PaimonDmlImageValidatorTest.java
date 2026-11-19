@@ -324,13 +324,31 @@ class PaimonDmlImageValidatorTest {
         TapInsertRecordEvent absent = new TapInsertRecordEvent().after(map("id", 1, "ordinary", null));
         TapInsertRecordEvent value = new TapInsertRecordEvent().after(map("id", 2, "defaulted", "mapped"));
         TapInsertRecordEvent explicit = new TapInsertRecordEvent().after(map("id", 3, "defaulted", null));
-        assertDoesNotThrow(() -> PaimonDmlImageValidator.validateRecoveryInsertDefaults(
+        assertDoesNotThrow(() -> PaimonDmlImageValidator.validateRecoveryImages(
                 "default.t", contract, Arrays.asList(absent, value)));
         PaimonFatalWriteException error = assertThrows(PaimonFatalWriteException.class, () ->
-                PaimonDmlImageValidator.validateRecoveryInsertDefaults(
+                PaimonDmlImageValidator.validateRecoveryImages(
                         "default.t", contract, Arrays.asList(absent, value, explicit)));
         assertTrue(error.getMessage().contains("PAIMON_LOCAL_RECOVERY_DEFAULTED_NULL"));
         assertTrue(error.getMessage().contains("field=defaulted"));
+    }
+
+    @Test
+    void aCompositeOldKeyMustContainEveryNonNullComponent() {
+        PaimonWriteSemanticContract contract = contract(
+                BucketMode.HASH_FIXED, MergeEngine.DEDUPLICATE, false,
+                Arrays.asList("part", "id", "v"), set("part", "id"), Collections.emptySet(),
+                set("part", "id"), set("part"), null, -1);
+        TapUpdateRecordEvent valid = new TapUpdateRecordEvent().before(map("id", 7, "part", 1));
+        assertDoesNotThrow(() -> PaimonDmlImageValidator.validateRecoveryImages(
+                "default.t", contract, Collections.singletonList(valid)));
+        for (Map<String, Object> partial : Arrays.asList(map("part", 1), map("part", 1, "id", null))) {
+            TapUpdateRecordEvent invalid = new TapUpdateRecordEvent().before(partial);
+            PaimonFatalWriteException failure = assertThrows(PaimonFatalWriteException.class, () ->
+                    PaimonDmlImageValidator.validateRecoveryImages("default.t", contract, Arrays.asList(valid, invalid)));
+            assertTrue(failure.getMessage().contains("PAIMON_LOCAL_RECOVERY_MISSING_OLD_KEY"), failure::getMessage);
+            assertTrue(failure.getMessage().contains("field=id"), failure::getMessage);
+        }
     }
 
     @Test

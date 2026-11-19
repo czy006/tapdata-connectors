@@ -66,6 +66,9 @@ public class PaimonConnector extends ConnectorBase {
     
     private volatile PaimonService paimonService;
     private volatile RecoverySession recoverySession;
+    // Guarded by this. Claim the context before any external PDK call can overlap onStop.
+    private TapConnectionContext ownerContext;
+    private boolean starting;
 
     private static final class RecoverySession {
         final TapConnectorContext context;
@@ -119,6 +122,28 @@ public class PaimonConnector extends ConnectorBase {
     }
 
     private void start(TapConnectionContext context, boolean task) throws Throwable {
+        synchronized (this) {
+            if (starting || paimonService != null) {
+                throw new IllegalStateException("Paimon connector already started");
+            }
+            ownerContext = context;
+            starting = true;
+        }
+        boolean initialized = false;
+        try {
+            initialize(context, task);
+            initialized = true;
+        } finally {
+            synchronized (this) {
+                starting = false;
+                if (!initialized) {
+                    ownerContext = null;
+                }
+            }
+        }
+    }
+
+    private void initialize(TapConnectionContext context, boolean task) throws Throwable {
         PaimonConfig config = configuration(context, task);
         boolean recovery = task && config.isLocalRecoveryEnabled();
         Consumer<Object> callback = context.getFlushOffsetCallback();
@@ -133,8 +158,8 @@ public class PaimonConnector extends ConnectorBase {
         RecoverySession session = task && (callback != null || stateMap != null)
                 ? new RecoverySession((TapConnectorContext) context, service, recovery) : null;
         synchronized (this) {
-            if (paimonService != null) {
-                throw new IllegalStateException("Paimon connector already started");
+            if (ownerContext != context) {
+                throw new IllegalStateException("Paimon connector stopped during startup");
             }
             recoverySession = session;
             paimonService = service;
@@ -153,19 +178,20 @@ public class PaimonConnector extends ConnectorBase {
                 service.setRecoveryFailureListener(failure -> reportRecoveryFailure(session, session.context, failure));
             }
             service.init();
-            if (session != null) {
-                if (recovery) {
-                    service.startLocalRecovery(session.context);
-                    // TapData 65add935fdee: readNormalAndLogCollectorTaskStreamOffset may take the
-                    // current position after an older saveToSnapshot overwrites a newer progress record.
-                    // The PDK cannot verify which position the source actually resumed from.
-                    // https://github.com/tapdata/tapdata/blob/65add935fdee/iengine/iengine-app/src/main/java/io/tapdata/flow/engine/V2/node/hazelcast/data/pdk/HazelcastSourcePdkBaseNode.java#L792-L800
-                    service.requireFreshSourceSession();
+            if (recovery) {
+                service.startLocalRecovery(session.context);
+                // TapData 65add935fdee: readNormalAndLogCollectorTaskStreamOffset may take the
+                // current position after an older saveToSnapshot overwrites a newer progress record.
+                // The PDK cannot verify which position the source actually resumed from.
+                // https://github.com/tapdata/tapdata/blob/65add935fdee/iengine/iengine-app/src/main/java/io/tapdata/flow/engine/V2/node/hazelcast/data/pdk/HazelcastSourcePdkBaseNode.java#L792-L800
+                service.requireFreshSourceSession();
+            }
+            context.getLog().info("Paimon connector initialized");
+            synchronized (this) {
+                if (ownerContext != context || paimonService != service) {
+                    throw new IllegalStateException("Paimon connector stopped during startup");
                 }
-                synchronized (this) {
-                    if (paimonService != service || session.stopping) {
-                        throw new IllegalStateException("Paimon connector stopped during recovery");
-                    }
+                if (session != null) {
                     if (session.failure.get() != null) {
                         throw session.failure.get();
                     }
@@ -175,7 +201,6 @@ public class PaimonConnector extends ConnectorBase {
                     }
                 }
             }
-            context.getLog().info("Paimon connector started successfully");
         } catch (Throwable failure) {
             if (session != null) {
                 session.failure.compareAndSet(null, failure);
@@ -211,6 +236,10 @@ public class PaimonConnector extends ConnectorBase {
         PaimonService service;
         RecoverySession session;
         synchronized (this) {
+            if (ownerContext != null && ownerContext != connectionContext) {
+                return;
+            }
+            ownerContext = null;
             session = recoverySession;
             if (session != null && session.context != connectionContext) {
                 return;

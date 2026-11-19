@@ -73,3 +73,5 @@ bash run-review-probe.sh TemporalPrimaryKeyProbe dynamic
 四次运行都应成功退出。映射探针检查缺列、INT 主键写入 FLOAT 目标、带默认值列的显式 NULL 以及普通 NULL 对照。分支探针比较普通表与按分区使用 fallback 的表。时间探针通过实际 PDK codec 验证固定桶和动态桶中的插入、更新和删除，并读取原有已提交键以检查误覆盖。
 
 同机固定桶的容量测量见[固定桶样本](CAPACITY.md)。旧版发现与源码定位见[审查报告](../../../src/doc/reviews/REVIEW-paimon-local-recovery-engine-2026-11-19.md)。
+
+按运行阶段、桶模式和故障位置查阅保证范围，见[写入与恢复流程图](../../../src/doc/specs/FLOW-paimon-data-consistency.md)。
